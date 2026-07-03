@@ -56,9 +56,35 @@ pub const Database = struct {
         /// Applies only to regular files
         hash: PathHashMap(network.FileHash),
         // TODO this should have `network.FileId` as a key
-        new_events: PathArrayHashMap(Event),
+        queued_events: PathOrFileIdHashMap,
         // TODO this should have `network.FileId` as a key
-        in_progress_events: PathArrayHashMap(Event),
+        in_progress_events: PathOrFileIdHashMap,
+
+        const PathOrFileIdHashMap = blk: {
+            const Key = union(enum) {
+                path: Path,
+                file_id: network.FileId,
+            };
+
+            const Context = struct {
+                pub fn hash(_: @This(), key: Key) u32 {
+                    switch (key) {
+                        .path => |path| return path.hash(),
+                        .file_id => |file_id| return std.hash.int(@intFromEnum(file_id)),
+                    }
+                }
+
+                pub fn eql(_: @This(), a: Key, b: Key, _: usize) bool {
+                    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+                    switch (a) {
+                        .path => return Path.eql(a.path, b.path),
+                        .file_id => return a.file_id == b.file_id,
+                    }
+                }
+            };
+
+            break :blk std.ArrayHashMapUnmanaged(Key, Event, Context, true);
+        };
 
         fn deinit(tree: *Tree, allocator: Allocator) void {
             var it = tree.children.valueIterator();
@@ -69,7 +95,7 @@ pub const Database = struct {
             tree.children.deinit(allocator);
             tree.meta.deinit(allocator);
             tree.hash.deinit(allocator);
-            tree.new_events.deinit(allocator);
+            tree.queued_events.deinit(allocator);
             tree.in_progress_events.deinit(allocator);
 
             tree.* = undefined;
@@ -119,7 +145,7 @@ pub const Database = struct {
 
         fn addFile(
             tree: *Tree,
-            comptime directory: bool,
+            directory: bool,
             comptime status: Status,
             allocator: Allocator,
             path: Path,
@@ -145,7 +171,7 @@ pub const Database = struct {
             } else null;
 
             switch (status) {
-                .new => try tree.new_events.ensureUnusedCapacity(allocator, 1),
+                .new => try tree.queued_events.ensureUnusedCapacity(allocator, 1), // TODO may clobber
                 .untracked => {},
                 .tracked, .pending_deletion => comptime unreachable,
             }
@@ -171,7 +197,7 @@ pub const Database = struct {
             }
             if (parent_children) |pc| pc.putAssumeCapacityNoClobber(path, {});
             switch (status) {
-                .new => tree.new_events.putAssumeCapacityNoClobber(path, .new),
+                .new => tree.queued_events.putAssumeCapacityNoClobber(.{ .path = path }, .new),
                 .untracked => {},
                 .tracked, .pending_deletion => comptime unreachable,
             }
@@ -197,8 +223,8 @@ pub const Database = struct {
         ) !void {
             const info = tree.files.getEntry(path).?;
 
-            assert(!tree.in_progress_events.contains(path));
-            try tree.new_events.putNoClobber(allocator, info.key_ptr.*, .new);
+            assert(!tree.in_progress_events.contains(.{ .path = path }));
+            try tree.queued_events.putNoClobber(allocator, .{ .path = info.key_ptr.* }, .new);
             errdefer comptime unreachable;
 
             info.value_ptr.status = .new;
@@ -222,8 +248,8 @@ pub const Database = struct {
                 meta_ptr.size == meta.size and
                 hash_ptr.eql(hash)) return;
 
-            if (tree.in_progress_events.contains(path)) std.debug.panic("TODO file was modified while having an event: {f}", .{path.formatUtf8()});
-            try tree.new_events.putNoClobber(allocator, info.key_ptr.*, .modified);
+            if (tree.in_progress_events.contains(.{ .file_id = info.value_ptr.global_file_id })) std.debug.panic("TODO file was modified while having an event: {f}", .{path.formatUtf8()});
+            try tree.queued_events.putNoClobber(allocator, .{ .file_id = info.value_ptr.global_file_id }, .modified); // TODO may clobber
             errdefer comptime unreachable;
 
             info.value_ptr.local_file_id = local_file_id;
@@ -249,8 +275,8 @@ pub const Database = struct {
         ) !void {
             const info = tree.files.getEntry(path).?;
 
-            if (tree.in_progress_events.contains(path)) std.debug.panic("TODO file was deleted while having an event: {f}", .{path.formatUtf8()});
-            try tree.new_events.putNoClobber(allocator, info.key_ptr.*, .deleted);
+            if (tree.in_progress_events.contains(.{ .file_id = info.value_ptr.global_file_id })) std.debug.panic("TODO file was deleted while having an event: {f}", .{path.formatUtf8()});
+            try tree.queued_events.putNoClobber(allocator, .{ .file_id = info.value_ptr.global_file_id }, .deleted); // TODO may clobber
             errdefer comptime unreachable;
 
             info.value_ptr.status = .pending_deletion;
@@ -278,7 +304,7 @@ pub const Database = struct {
                 .children = .empty,
                 .meta = .empty,
                 .hash = .empty,
-                .new_events = .empty,
+                .queued_events = .empty,
                 .in_progress_events = .empty,
             },
             .file_id_map = .empty,
@@ -343,53 +369,75 @@ pub const Database = struct {
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
-            if (db.tree.new_events.count() == 0) return error.NoEvents;
+            if (db.tree.queued_events.count() == 0) return error.NoEvents;
             try db.tree.in_progress_events.ensureUnusedCapacity(db.allocator, 1);
             db.acquireHostEvent() orelse return error.NoEvents;
             errdefer comptime unreachable;
 
-            const kv = db.tree.new_events.pop().?;
-            const info = db.tree.files.get(kv.key).?;
+            const kv = db.tree.queued_events.pop().?;
             db.tree.in_progress_events.putAssumeCapacityNoClobber(kv.key, kv.value);
             switch (kv.value) {
                 .new => {
+                    const path = switch (kv.key) {
+                        .file_id => unreachable,
+                        .path => |path| path,
+                    };
+                    const info = db.tree.files.get(path).?;
                     switch (info.status) {
                         .new => {},
                         .tracked, .pending_deletion, .untracked => unreachable,
                     }
-                    db.out_path = kv.key;
+                    db.out_path = path;
                     db.out_directory = info.directory;
                     break :blk .get_global_file_id;
                 },
                 .modified => {
+                    const file_id = switch (kv.key) {
+                        .file_id => |file_id| file_id,
+                        .path => unreachable,
+                    };
+                    const path = db.file_id_map.get(file_id).?;
+                    const info = db.tree.files.get(path).?;
                     switch (info.status) {
                         .tracked => {},
                         .new, .untracked, .pending_deletion => unreachable,
                     }
                     db.out_file_id = info.global_file_id;
-                    db.out_path = kv.key;
+                    db.out_path = path;
                     db.out_metadata = .{
-                        .size = db.tree.meta.get(kv.key).?.size,
-                        .hash = db.tree.hash.get(kv.key).?,
+                        .size = db.tree.meta.get(path).?.size,
+                        .hash = db.tree.hash.get(path).?,
                     };
                     break :blk .sync_file;
                 },
                 .create_dir => {
+                    const file_id = switch (kv.key) {
+                        .file_id => |file_id| file_id,
+                        .path => unreachable,
+                    };
+                    const path = db.file_id_map.get(file_id).?;
+                    const info = db.tree.files.get(path).?;
                     switch (info.status) {
                         .tracked => {},
                         .new, .untracked, .pending_deletion => unreachable,
                     }
                     db.out_file_id = info.global_file_id;
-                    db.out_path = kv.key;
+                    db.out_path = path;
                     break :blk .create_dir;
                 },
                 .deleted => {
+                    const file_id = switch (kv.key) {
+                        .file_id => |file_id| file_id,
+                        .path => unreachable,
+                    };
+                    const path = db.file_id_map.get(file_id).?;
+                    const info = db.tree.files.get(path).?;
                     switch (info.status) {
                         .pending_deletion => {},
                         .new, .tracked, .untracked => unreachable,
                     }
                     db.out_file_id = info.global_file_id;
-                    db.out_path = kv.key;
+                    db.out_path = path;
                     break :blk .delete_file;
                 },
             }
@@ -432,7 +480,7 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        assert(db.tree.in_progress_events.fetchSwapRemove(path).?.value == .new);
+        assert(db.tree.in_progress_events.fetchSwapRemove(.{ .path = path }).?.value == .new);
 
         const info = db.tree.files.getPtr(path) orelse
             std.debug.panic("received file id for unknown file: {f}", .{path.formatUtf8()});
@@ -465,7 +513,7 @@ pub const Database = struct {
             break :blk try computeFileHash(file, information.EndOfFile);
         } else undefined;
 
-        try db.tree.new_events.ensureUnusedCapacity(db.allocator, 1);
+        try db.tree.queued_events.ensureUnusedCapacity(db.allocator, 1);
         errdefer comptime unreachable;
 
         const Iterator = std.fs.path.ComponentIterator(.windows, u16);
@@ -494,7 +542,7 @@ pub const Database = struct {
 
         info.status = .tracked;
         if (!info.directory) db.tree.hash.getPtr(path).?.* = hash;
-        db.tree.new_events.putAssumeCapacityNoClobber(path, if (info.directory) .create_dir else .modified);
+        db.tree.queued_events.putAssumeCapacityNoClobber(.{ .file_id = file_id_list[0] }, if (info.directory) .create_dir else .modified);
         db.sendAlert(io);
     }
 
@@ -503,7 +551,7 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        assert(db.tree.in_progress_events.fetchSwapRemove(path).?.value == .deleted);
+        assert(db.tree.in_progress_events.fetchSwapRemove(.{ .file_id = file_id }).?.value == .deleted);
 
         const info = db.tree.files.getEntry(path) orelse
             std.debug.panic("TODO received delete confirmation for unknown file: {f}", .{path.formatUtf8()});
@@ -526,11 +574,11 @@ pub const Database = struct {
     }
 
     // called from Host
-    fn markFileAsSynced(db: *Database, path: Path, io: Io) !void {
+    fn markFileAsSynced(db: *Database, file_id: network.FileId, io: Io) !void {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        assert(db.tree.in_progress_events.fetchSwapRemove(path).?.value == .modified);
+        assert(db.tree.in_progress_events.fetchSwapRemove(.{ .file_id = file_id }).?.value == .modified);
     }
 
     fn openFileReadOnly(db: *const Database, path: Path) !w.HANDLE {
@@ -609,18 +657,19 @@ pub const Database = struct {
             }) |item| {
                 const status, const text = item;
                 try writer.writeAll(text);
-                {
-                    var it = db.tree.new_events.iterator();
+
+                inline for (.{
+                    .{ "queued_events", "Q" },
+                    .{ "in_progress_events", "P" },
+                }) |item2| {
+                    const field_name, const symbol = item2;
+                    var it = @field(db.tree, field_name).iterator();
                     while (it.next()) |entry| {
                         if (entry.value_ptr.* != status) continue;
-                        try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()});
-                    }
-                }
-                {
-                    var it = db.tree.in_progress_events.iterator();
-                    while (it.next()) |entry| {
-                        if (entry.value_ptr.* != status) continue;
-                        try writer.print("\t{f} (P)\n", .{entry.key_ptr.formatUtf8()});
+                        switch (entry.key_ptr.*) {
+                            .path => |path| try writer.print("\t{f} ({s})\n", .{ path.formatUtf8(), symbol }),
+                            .file_id => |file_id| try writer.print("\tfile_id({}) ({s})\n", .{ @intFromEnum(file_id), symbol }),
+                        }
                     }
                 }
             }
@@ -683,6 +732,8 @@ const scan = struct {
         ctx.* = undefined;
     }
 
+    // TODO: 128-bit file IDs also exist
+    // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_id_extd_both_dir_information
     const nt_query_information_class: w.FILE.INFORMATION_CLASS = .IdBothDirectory;
 
     // Corresponds to FILE_ID_BOTH_DIR_INFORMATION.
@@ -1669,12 +1720,12 @@ pub const TxData = union(enum) {
         ) !void {
             switch (action) {
                 .transfer_file_success => {
-                    try host.db.markFileAsSynced(out_file_contents.path, io);
+                    try host.db.markFileAsSynced(out_file_contents.file_id, io);
                     host.debugLog("successfully synced file: {f}\n", .{out_file_contents.path.formatUtf8()});
                 },
                 .transfer_file_failure => {
                     // TODO mark file as failed to sync
-                    try host.db.markFileAsSynced(out_file_contents.path, io);
+                    try host.db.markFileAsSynced(out_file_contents.file_id, io);
                     host.debugLog("failed to sync file: {f}\n", .{out_file_contents.path.formatUtf8()});
                 },
                 else => return error.InvalidAction,

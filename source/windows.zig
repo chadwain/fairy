@@ -63,7 +63,7 @@ pub const Path = struct {
 
     // TODO: Unicode case mappings???
 
-    fn hash(path: Path) u32 {
+    pub fn hash(path: Path) u32 {
         // TODO: more efficient hashing
         var hasher = std.hash.Wyhash.init(0);
         for (path.slice) |c| {
@@ -73,7 +73,7 @@ pub const Path = struct {
         return @truncate(hasher.final());
     }
 
-    fn eql(a: Path, b: Path) bool {
+    pub fn eql(a: Path, b: Path) bool {
         return w.ntdll.RtlEqualUnicodeString(&.init(a.slice), &.init(b.slice), .TRUE).toBool();
     }
 };
