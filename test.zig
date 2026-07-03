@@ -78,15 +78,21 @@ fn runCli(io: Io, cdb: *fairy.client.Database, sdb: *fairy.server.Database) !voi
         switch (commands.get(line) orelse continue) {
             .quit => break,
             .client_print_files => {
-                try cdb.debug.printFileEntries(stdout, io);
+                const locked = try cdb.lock(io);
+                defer locked.unlock(io);
+                try locked.debug.printFileEntries(stdout);
                 try stdout.flush();
             },
             .client_print_file_events => {
-                try cdb.debug.printFileEvents(stdout, io);
+                const locked = try cdb.lock(io);
+                defer locked.unlock(io);
+                try locked.debug.printFileEvents(stdout);
                 try stdout.flush();
             },
             .client_scan => {
-                try cdb.manualScan(io);
+                const locked = try cdb.lock(io);
+                defer locked.unlock(io);
+                try locked.manualScan();
                 try stdout.writeAll("scan complete\n");
                 try stdout.flush();
             },
