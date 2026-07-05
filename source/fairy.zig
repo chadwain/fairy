@@ -17,8 +17,8 @@ pub fn print(message: []const u8) void {
 pub const printf = @import("std").debug.print;
 
 comptime {
-    if (@import("builtin").cpu.arch.endian() == .big) {
+    if (@import("builtin").cpu.arch.endian() != .little) {
         // In particular, the Windows and Unicode parts of the stdlib have poor big endian support.
-        @compileError("big endian CPUs are not supported");
+        @compileError("non-little endian CPUs are not supported");
     }
 }

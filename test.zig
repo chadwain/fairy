@@ -92,7 +92,7 @@ fn runCli(io: Io, cdb: *fairy.client.Database, sdb: *fairy.server.Database) !voi
             .client_scan => {
                 const locked = try cdb.lock(io);
                 defer locked.unlock(io);
-                try locked.manualScan();
+                try locked.manualScan(io);
                 try stdout.writeAll("scan complete\n");
                 try stdout.flush();
             },

@@ -27,6 +27,9 @@ pub const Database = struct {
     scan_arena: std.heap.ArenaAllocator.State,
     tree: Tree,
     file_id_map: std.AutoHashMapUnmanaged(network.FileId, Path),
+    /// The database periodically checks this map for new events and tries to move them to "in progress".
+    queued_events: Event.Map,
+    in_progress_events: Event.Map,
 
     // End fields protected by mutex
 
@@ -53,19 +56,66 @@ pub const Database = struct {
         /// Applies only to regular files
         meta: PathHashMap(Metadata),
         /// Applies only to regular files
+        // TODO: Make the hash nullable, do not compute it until the file is being synced
         hash: PathHashMap(network.FileHash),
-        // TODO this should have `network.FileId` as a key
-        queued_events: PathOrFileIdHashMap,
-        // TODO this should have `network.FileId` as a key
-        in_progress_events: PathOrFileIdHashMap,
 
-        const PathOrFileIdHashMap = blk: {
-            const Key = union(enum) {
+        fn deinit(tree: *Tree, allocator: Allocator) void {
+            var it = tree.children.valueIterator();
+            while (it.next()) |list| list.deinit(allocator);
+
+            tree.files.deinit(allocator);
+            tree.parent.deinit(allocator);
+            tree.children.deinit(allocator);
+            tree.meta.deinit(allocator);
+            tree.hash.deinit(allocator);
+
+            tree.* = undefined;
+        }
+
+        pub const Info = struct {
+            directory: bool,
+            status: Status,
+            local_file_id: w.LARGE_INTEGER,
+            global_file_id: network.FileId,
+        };
+
+        pub const Status = enum {
+            /// A file which was previously untracked and is now known to exist.
+            ///
+            /// global_file_id may be `.unknown`
+            /// hash is undefined
+            new,
+            /// A file which is being tracked.
+            tracked,
+            /// A file whose existence is known, but will not be synced to the server for one or more reasons.
+            ///
+            /// global_file_id is `.unknown`
+            /// meta is undefined
+            /// hash is undefined
+            untracked,
+        };
+
+        pub const Metadata = struct {
+            modified_time: w.LARGE_INTEGER,
+            size: w.ULARGE_INTEGER,
+        };
+    };
+
+    pub const Event = enum {
+        new,
+        modified,
+        create_dir,
+        deleted,
+
+        pub const Map = struct {
+            map: std.ArrayHashMapUnmanaged(Key, Event, Context, true),
+
+            pub const Key = union(enum) {
                 path: Path,
                 file_id: network.FileId,
             };
 
-            const Context = struct {
+            pub const Context = struct {
                 pub fn hash(_: @This(), key: Key) u32 {
                     switch (key) {
                         .path => |path| return path.hash(),
@@ -81,65 +131,6 @@ pub const Database = struct {
                     }
                 }
             };
-
-            break :blk std.ArrayHashMapUnmanaged(Key, Event, Context, true);
-        };
-
-        fn deinit(tree: *Tree, allocator: Allocator) void {
-            var it = tree.children.valueIterator();
-            while (it.next()) |list| list.deinit(allocator);
-
-            tree.files.deinit(allocator);
-            tree.parent.deinit(allocator);
-            tree.children.deinit(allocator);
-            tree.meta.deinit(allocator);
-            tree.hash.deinit(allocator);
-            tree.queued_events.deinit(allocator);
-            tree.in_progress_events.deinit(allocator);
-
-            tree.* = undefined;
-        }
-
-        pub const Info = struct {
-            directory: bool,
-            status: Status,
-            local_file_id: w.LARGE_INTEGER,
-            global_file_id: network.FileId,
-        };
-
-        pub const Status = enum {
-            /// A file which was previously untracked and is now known to exist.
-            ///
-            /// global_file_id is undefined
-            /// hash is undefined
-            new,
-            /// A file which is being tracked.
-            tracked,
-            /// A file which is being tracked, and is now known to be deleted from the filesystem.
-            /// Deleting this file from the server will remove it from the database, but
-            /// if the file is found once again, it may return to the "tracked" state instead.
-            ///
-            /// meta is undefined
-            /// hash is undefined
-            pending_deletion,
-            /// A file whose existence is known, but will not be synced to the server for one or more reasons.
-            ///
-            /// meta is undefined
-            /// global_file_id is undefined
-            /// hash is undefined
-            untracked,
-        };
-
-        pub const Metadata = struct {
-            modified_time: w.LARGE_INTEGER,
-            size: w.ULARGE_INTEGER,
-        };
-
-        pub const Event = enum {
-            new,
-            modified,
-            create_dir,
-            deleted,
         };
     };
 
@@ -161,10 +152,10 @@ pub const Database = struct {
                 .children = .empty,
                 .meta = .empty,
                 .hash = .empty,
-                .queued_events = .empty,
-                .in_progress_events = .empty,
             },
             .file_id_map = .empty,
+            .queued_events = .{ .map = .empty },
+            .in_progress_events = .{ .map = .empty },
 
             .alert = .init(.off),
             .host_state = .init(.{}),
@@ -185,6 +176,8 @@ pub const Database = struct {
 
         db.tree.deinit(db.allocator);
         db.file_id_map.deinit(db.allocator);
+        db.queued_events.map.deinit(db.allocator);
+        db.in_progress_events.map.deinit(db.allocator);
 
         db.* = undefined;
     }
@@ -199,7 +192,7 @@ pub const Database = struct {
 
         while (true) {
             // If enough time has passed, do a scan
-            if (Io.Clock.Timestamp.now(io, .boot).compare(.gte, next_scan_time)) {
+            if (Io.Clock.Timestamp.now(io, clock).compare(.gte, next_scan_time)) {
                 const locked = try db.lock(io);
                 defer locked.unlock(io);
 
@@ -211,11 +204,8 @@ pub const Database = struct {
                 continue;
             }
 
-            if (db.sendHostEvents(io)) {
+            if (try db.sendHostEvents(io)) {
                 continue;
-            } else |err| switch (err) {
-                error.NoEvents => {},
-                error.OutOfMemory, error.Canceled => |e| return e,
             }
 
             db.alert.store(.off, .release);
@@ -223,19 +213,22 @@ pub const Database = struct {
         }
     }
 
-    fn sendHostEvents(db: *Database, io: Io) (error{NoEvents} || Allocator.Error || Io.Cancelable)!void {
+    /// Returns true if an event was sent.
+    fn sendHostEvents(db: *Database, io: Io) (Allocator.Error || Io.Cancelable)!bool {
         const host_event: Host.State.Event = blk: {
-            // TODO no mutex
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
-            if (db.tree.queued_events.count() == 0) return error.NoEvents;
-            try db.tree.in_progress_events.ensureUnusedCapacity(db.allocator, 1);
-            db.acquireHostEvent() orelse return error.NoEvents;
+            if (db.queued_events.map.count() == 0) return false;
+            try db.in_progress_events.map.ensureUnusedCapacity(db.allocator, 1);
+            db.acquireHostEvent() orelse return false;
             errdefer comptime unreachable;
 
-            const kv = db.tree.queued_events.pop().?;
-            db.tree.in_progress_events.putAssumeCapacityNoClobber(kv.key, kv.value);
+            const kv = db.queued_events.map.pop().?;
+            const gop = db.in_progress_events.map.getOrPutAssumeCapacity(kv.key);
+            if (gop.found_existing) std.debug.panic("TODO: event already in progress for {any}", .{kv.key});
+            gop.value_ptr.* = kv.value;
+
             switch (kv.value) {
                 .new => {
                     const path = switch (kv.key) {
@@ -245,7 +238,7 @@ pub const Database = struct {
                     const info = db.tree.files.get(path).?;
                     switch (info.status) {
                         .new => {},
-                        .tracked, .pending_deletion, .untracked => unreachable,
+                        .tracked, .untracked => unreachable,
                     }
                     db.out_path = path;
                     db.out_directory = info.directory;
@@ -260,7 +253,7 @@ pub const Database = struct {
                     const info = db.tree.files.get(path).?;
                     switch (info.status) {
                         .tracked => {},
-                        .new, .untracked, .pending_deletion => unreachable,
+                        .new, .untracked => unreachable,
                     }
                     db.out_file_id = info.global_file_id;
                     db.out_path = path;
@@ -279,7 +272,7 @@ pub const Database = struct {
                     const info = db.tree.files.get(path).?;
                     switch (info.status) {
                         .tracked => {},
-                        .new, .untracked, .pending_deletion => unreachable,
+                        .new, .untracked => unreachable,
                     }
                     db.out_file_id = info.global_file_id;
                     db.out_path = path;
@@ -291,12 +284,7 @@ pub const Database = struct {
                         .path => unreachable,
                     };
                     const path = db.file_id_map.get(file_id).?;
-                    const info = db.tree.files.get(path).?;
-                    switch (info.status) {
-                        .pending_deletion => {},
-                        .new, .tracked, .untracked => unreachable,
-                    }
-                    db.out_file_id = info.global_file_id;
+                    db.out_file_id = file_id;
                     db.out_path = path;
                     break :blk .delete_file;
                 },
@@ -305,6 +293,7 @@ pub const Database = struct {
 
         db.releaseHostEvent(host_event);
         io.futexWake(Host.State, &db.host_state.raw, 1);
+        return true;
     }
 
     fn sendAlert(db: *Database, io: Io) void {
@@ -353,8 +342,19 @@ pub const LockedDatabase = struct {
         locked.db.mutex.unlock(io);
     }
 
-    pub fn manualScan(locked: LockedDatabase) !void {
+    pub fn manualScan(locked: LockedDatabase, io: Io) !void {
         try scan.run(locked);
+        locked.db.sendAlert(io);
+    }
+
+    fn queueEventAssumeCapacity(
+        locked: LockedDatabase,
+        key: Database.Event.Map.Key,
+        event: Database.Event,
+    ) void {
+        const gop = locked.db.queued_events.map.getOrPutAssumeCapacity(key);
+        if (gop.found_existing) std.debug.panic("TODO: event already queued for {any}", .{key});
+        gop.value_ptr.* = event;
     }
 
     fn addFile(
@@ -367,7 +367,7 @@ pub const LockedDatabase = struct {
         meta: switch (status) {
             .new => Database.Tree.Metadata,
             .untracked => void,
-            .tracked, .pending_deletion => unreachable,
+            .tracked => unreachable,
         },
     ) !void {
         try locked.db.tree.files.ensureUnusedCapacity(locked.db.allocator, 1);
@@ -384,9 +384,9 @@ pub const LockedDatabase = struct {
         } else null;
 
         switch (status) {
-            .new => try locked.db.tree.queued_events.ensureUnusedCapacity(locked.db.allocator, 1), // TODO may clobber
+            .new => try locked.db.queued_events.map.ensureUnusedCapacity(locked.db.allocator, 1),
             .untracked => {},
-            .tracked, .pending_deletion => comptime unreachable,
+            .tracked => comptime unreachable,
         }
         errdefer comptime unreachable;
 
@@ -402,7 +402,7 @@ pub const LockedDatabase = struct {
         locked.db.tree.meta.putAssumeCapacityNoClobber(path, switch (status) {
             .new => meta,
             .untracked => undefined,
-            .tracked, .pending_deletion => unreachable,
+            .tracked => unreachable,
         });
         switch (directory) {
             false => locked.db.tree.hash.putAssumeCapacityNoClobber(path, undefined),
@@ -410,9 +410,9 @@ pub const LockedDatabase = struct {
         }
         if (parent_children) |pc| pc.putAssumeCapacityNoClobber(path, {});
         switch (status) {
-            .new => locked.db.tree.queued_events.putAssumeCapacityNoClobber(.{ .path = path }, .new),
+            .new => locked.queueEventAssumeCapacity(.{ .path = path }, .new),
             .untracked => {},
-            .tracked, .pending_deletion => comptime unreachable,
+            .tracked => comptime unreachable,
         }
     }
 
@@ -435,13 +435,13 @@ pub const LockedDatabase = struct {
     ) !void {
         const info = locked.db.tree.files.getEntry(path).?;
 
-        assert(!locked.db.tree.in_progress_events.contains(.{ .path = path }));
-        try locked.db.tree.queued_events.putNoClobber(locked.db.allocator, .{ .path = info.key_ptr.* }, .new);
+        try locked.db.queued_events.map.ensureUnusedCapacity(locked.db.allocator, 1);
         errdefer comptime unreachable;
 
         info.value_ptr.status = .new;
         info.value_ptr.local_file_id = local_file_id;
         locked.db.tree.meta.getPtr(path).?.* = meta;
+        locked.queueEventAssumeCapacity(.{ .path = info.key_ptr.* }, .new);
     }
 
     fn updateTrackedRegularFile(
@@ -459,13 +459,13 @@ pub const LockedDatabase = struct {
             meta_ptr.size == meta.size and
             hash_ptr.eql(hash)) return;
 
-        if (locked.db.tree.in_progress_events.contains(.{ .file_id = info.value_ptr.global_file_id })) std.debug.panic("TODO file was modified while having an event: {f}", .{path.formatUtf8()});
-        try locked.db.tree.queued_events.putNoClobber(locked.db.allocator, .{ .file_id = info.value_ptr.global_file_id }, .modified); // TODO may clobber
+        try locked.db.queued_events.map.ensureUnusedCapacity(locked.db.allocator, 1);
         errdefer comptime unreachable;
 
         info.value_ptr.local_file_id = local_file_id;
         meta_ptr.* = meta;
         hash_ptr.* = hash.*;
+        locked.queueEventAssumeCapacity(.{ .file_id = info.value_ptr.global_file_id }, .modified);
     }
 
     fn updateTrackedDirectoryFile(
@@ -479,40 +479,54 @@ pub const LockedDatabase = struct {
         locked.db.tree.meta.getPtr(path).?.* = meta;
     }
 
-    fn deleteTrackedRegularFile(
-        locked: LockedDatabase,
-        path: Path,
-    ) !void {
-        const info = locked.db.tree.files.getEntry(path).?;
-
-        if (locked.db.tree.in_progress_events.contains(.{ .file_id = info.value_ptr.global_file_id })) std.debug.panic("TODO file was deleted while having an event: {f}", .{path.formatUtf8()});
-        try locked.db.tree.queued_events.putNoClobber(locked.db.allocator, .{ .file_id = info.value_ptr.global_file_id }, .deleted); // TODO may clobber
+    fn deleteTrackedRegularFile(locked: LockedDatabase, path: Path) !void {
+        try locked.db.queued_events.map.ensureUnusedCapacity(locked.db.allocator, 1);
         errdefer comptime unreachable;
 
-        info.value_ptr.status = .pending_deletion;
+        const info = locked.db.tree.files.fetchRemove(path).?;
+        assert(locked.db.tree.meta.remove(path));
+        assert(locked.db.tree.hash.remove(path));
+        const parent = locked.db.tree.parent.fetchRemove(path).?.value;
+        if (parent) |p| {
+            const parent_children = locked.db.tree.children.getPtr(p).?;
+            assert(parent_children.remove(path));
+        }
+        locked.queueEventAssumeCapacity(.{ .file_id = info.value.global_file_id }, .deleted);
+    }
+
+    fn changeTrackedRegularFileToUntracked(locked: LockedDatabase, path: Path) !void {
+        try locked.db.queued_events.map.ensureUnusedCapacity(locked.db.allocator, 1);
+        errdefer comptime unreachable;
+
+        const info = locked.db.tree.files.getPtr(path).?;
+        const file_id = info.global_file_id;
+        info.status = .untracked;
+        info.global_file_id = .unknown;
         locked.db.tree.meta.getPtr(path).?.* = undefined;
         locked.db.tree.hash.getPtr(path).?.* = undefined;
+        locked.queueEventAssumeCapacity(.{ .file_id = file_id }, .deleted);
     }
 
     // called from Host
-    fn setNewFileId(locked: LockedDatabase, path: Path, kind: network.FileKind, file_id_list: []const network.FileId, io: Io) !void {
-        assert(locked.db.tree.in_progress_events.fetchSwapRemove(.{ .path = path }).?.value == .new);
+    fn setNewFileId(locked: LockedDatabase, path: Path, kind: network.FileKind, reverse_file_id_list: []const network.FileId, io: Io) !void {
+        assert(locked.db.in_progress_events.map.fetchSwapRemove(.{ .path = path }).?.value == .new);
 
         const info = locked.db.tree.files.getPtr(path) orelse
             std.debug.panic("received file id for unknown file: {f}", .{path.formatUtf8()});
         // TODO make sure this is actually the same file that the event was created for
         switch (info.status) {
             .new => {},
-            .tracked, .pending_deletion, .untracked => std.debug.panic("TODO: handle new file id for non-new file", .{}),
+            .tracked, .untracked => std.debug.panic("TODO: handle new file id for non-new file", .{}),
         }
         switch (kind) {
             .regular => if (info.directory) std.debug.panic("TODO", .{}),
             .directory => if (!info.directory) std.debug.panic("TODO", .{}),
         }
 
-        try locked.db.file_id_map.ensureUnusedCapacity(locked.db.allocator, @as(fairy.PathComponentCount, @intCast(file_id_list.len)));
+        try locked.db.file_id_map.ensureUnusedCapacity(locked.db.allocator, @as(fairy.PathComponentCount, @intCast(reverse_file_id_list.len)));
+        try locked.db.queued_events.map.ensureUnusedCapacity(locked.db.allocator, 1);
 
-        // TODO: create a Database event that will compute the hash later
+        // TODO: do not compute the hash right now
         const hash = if (!info.directory) blk: {
             const file = try fairy.windows.openFile(locked.db.sync_dir, path, .read);
             defer fairy.windows.closeHandle(file);
@@ -529,15 +543,16 @@ pub const LockedDatabase = struct {
             break :blk try computeFileHash(file, information.EndOfFile);
         } else undefined;
 
-        try locked.db.tree.queued_events.ensureUnusedCapacity(locked.db.allocator, 1);
         errdefer comptime unreachable;
 
+        // Walk up the tree and set global file IDs for every path encountered
         const Iterator = std.fs.path.ComponentIterator(.windows, u16);
         var it = Iterator.init(path.slice);
         var i: fairy.PathComponentCount = 0;
         while (if (i == 0) it.last() else it.previous()) |component| : (i += 1) {
-            const file_id = file_id_list[i];
+            const file_id = reverse_file_id_list[i];
             const path_info = locked.db.tree.files.getEntry(.assumeValidPath(component.path)).?;
+            // TODO: switch (path_info.value_ptr.status) { ... }
             switch (path_info.value_ptr.global_file_id) {
                 .unknown => {
                     path_info.value_ptr.global_file_id = file_id;
@@ -551,44 +566,27 @@ pub const LockedDatabase = struct {
                             .{ path_info.key_ptr.formatUtf8(), path_info.value_ptr.global_file_id, file_id },
                         );
                     }
+                    // TODO: break here?
                 },
             }
         }
-        assert(i == file_id_list.len);
+        assert(i == reverse_file_id_list.len);
 
         info.status = .tracked;
         if (!info.directory) locked.db.tree.hash.getPtr(path).?.* = hash;
-        locked.db.tree.queued_events.putAssumeCapacityNoClobber(.{ .file_id = file_id_list[0] }, if (info.directory) .create_dir else .modified);
+        locked.queueEventAssumeCapacity(.{ .file_id = reverse_file_id_list[0] }, if (info.directory) .create_dir else .modified);
         locked.db.sendAlert(io);
     }
 
     // called from Host
-    fn confirmDeleteFile(locked: LockedDatabase, path: Path, file_id: network.FileId) !void {
-        assert(locked.db.tree.in_progress_events.fetchSwapRemove(.{ .file_id = file_id }).?.value == .deleted);
-
-        const info = locked.db.tree.files.getEntry(path) orelse
-            std.debug.panic("TODO received delete confirmation for unknown file: {f}", .{path.formatUtf8()});
-        // TODO make sure this is actually the same file that the event was created for
-        switch (info.value_ptr.status) {
-            .pending_deletion => {},
-            .new, .tracked, .untracked => std.debug.panic("TODO: handle delete confirmation for non-pending-delete file: {f}", .{path.formatUtf8()}),
-        }
-        if (info.value_ptr.directory) std.debug.panic("TODO delete confirmation for directory: {f}", .{path.formatUtf8()});
-
-        const parent = locked.db.tree.parent.fetchRemove(path).?.value;
-        assert(locked.db.tree.meta.remove(path));
-        assert(locked.db.tree.hash.remove(path));
-        if (parent) |p| {
-            const parent_children = locked.db.tree.children.getPtr(p).?;
-            assert(parent_children.remove(path));
-        }
-        locked.db.tree.files.removeByPtr(info.key_ptr);
+    fn confirmDeleteFile(locked: LockedDatabase, file_id: network.FileId) !void {
+        assert(locked.db.in_progress_events.map.fetchSwapRemove(.{ .file_id = file_id }).?.value == .deleted);
         assert(locked.db.file_id_map.remove(file_id));
     }
 
     // called from Host
     fn markFileAsSynced(locked: LockedDatabase, file_id: network.FileId) !void {
-        assert(locked.db.tree.in_progress_events.fetchSwapRemove(.{ .file_id = file_id }).?.value == .modified);
+        assert(locked.db.in_progress_events.map.fetchSwapRemove(.{ .file_id = file_id }).?.value == .modified);
     }
 
     pub const Debug = struct {
@@ -600,7 +598,7 @@ pub const LockedDatabase = struct {
             while (it.next()) |entry| {
                 switch (entry.value_ptr.status) {
                     .tracked => {},
-                    .new, .pending_deletion, .untracked => continue,
+                    .new, .untracked => continue,
                 }
                 const meta = locked.db.tree.meta.get(entry.key_ptr.*).?;
                 try writer.print(
@@ -619,7 +617,7 @@ pub const LockedDatabase = struct {
             while (it.next()) |entry| {
                 switch (entry.value_ptr.status) {
                     .new => {},
-                    .tracked, .pending_deletion, .untracked => continue,
+                    .tracked, .untracked => continue,
                 }
                 const meta = locked.db.tree.meta.get(entry.key_ptr.*).?;
                 try writer.print(
@@ -637,7 +635,7 @@ pub const LockedDatabase = struct {
             while (it.next()) |entry| {
                 switch (entry.value_ptr.status) {
                     .new, .tracked => continue,
-                    .pending_deletion, .untracked => {},
+                    .untracked => {},
                 }
                 try writer.print("{f}\n", .{entry.key_ptr.formatUtf8()});
             }
@@ -648,7 +646,7 @@ pub const LockedDatabase = struct {
         pub fn printFileEvents(debug: *const Debug, writer: *Io.Writer) !void {
             const locked: *const LockedDatabase = @alignCast(@fieldParentPtr("debug", debug));
 
-            inline for (&[_]struct { Database.Tree.Event, []const u8 }{
+            inline for (&[_]struct { Database.Event, []const u8 }{
                 .{ .new, "Locally new files:\n" },
                 .{ .modified, "Locally modified files:\n" },
                 .{ .deleted, "Locally deleted files:\n" },
@@ -661,7 +659,7 @@ pub const LockedDatabase = struct {
                     .{ "in_progress_events", "P" },
                 }) |item2| {
                     const field_name, const symbol = item2;
-                    var it = @field(locked.db.tree, field_name).iterator();
+                    var it = @field(locked.db, field_name).map.iterator();
                     while (it.next()) |entry| {
                         if (entry.value_ptr.* != status) continue;
                         switch (entry.key_ptr.*) {
@@ -929,16 +927,11 @@ const scan = struct {
                     try ctx.locked.changeUntrackedFileToNew(path, local_file_id, meta);
                     gop.value_ptr.status = .new;
                 },
-                .pending_deletion => {
-                    if (set_to_untracked) return;
-                    std.debug.panic("TODO: file was created while pending deletion: {f}", .{path.formatUtf8()});
-                },
                 .tracked => {
                     if (set_to_untracked) {
-                        try ctx.locked.deleteTrackedRegularFile(path);
-                        gop.value_ptr.status = .pending_deletion;
+                        try ctx.locked.changeTrackedRegularFileToUntracked(path);
                     } else {
-                        // TODO: mark the file's hash as stale, compute it later
+                        // TODO: do not compute the hash right now
                         const hash = blk: {
                             const file = try fairy.windows.openFile(ctx.locked.db.sync_dir, path, .read);
                             defer w.CloseHandle(file);
@@ -998,10 +991,6 @@ const scan = struct {
                     ctx.locked.updateNewFile(path, local_file_id, meta);
                 },
                 .untracked => std.debug.panic("TODO handle untracked folder: {f}", .{path.formatUtf8()}),
-                .pending_deletion => {
-                    if (set_to_untracked) return;
-                    std.debug.panic("TODO: file was created while pending deletion: {f}", .{path.formatUtf8()});
-                },
                 .tracked => {
                     if (set_to_untracked) std.debug.panic("TODO set a tracked directory to untracked: {f}", .{path.formatUtf8()});
                     ctx.locked.updateTrackedDirectoryFile(path, local_file_id, meta);
@@ -1041,7 +1030,6 @@ const scan = struct {
                     false => try ctx.locked.deleteTrackedRegularFile(path),
                     true => std.debug.panic("TODO delete a tracked directory: {f}", .{path.formatUtf8()}),
                 },
-                .pending_deletion => {},
                 .untracked => std.debug.panic("TODO delete an untracked file: {f}", .{path.formatUtf8()}),
             }
         }
@@ -1848,7 +1836,7 @@ pub const TxData = union(enum) {
                     {
                         const locked = try host.db.lock(io);
                         defer locked.unlock(io);
-                        try locked.confirmDeleteFile(out_delete_file.path, out_delete_file.file_id);
+                        try locked.confirmDeleteFile(out_delete_file.file_id);
                     }
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
