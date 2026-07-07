@@ -472,7 +472,7 @@ pub fn sendFile(
             break :buffer slice[0..@min(
                 slice.len,
                 file_size - @as(w.ULARGE_INTEGER, @intCast(written)),
-                std.math.maxInt(w.ULONG),
+                comptime std.math.maxInt(w.ULONG),
             )];
         };
         // TODO NtReadFileScatter
@@ -515,7 +515,7 @@ pub fn receiveFile(
             break :buffer slice[0..@min(
                 slice.len,
                 @as(w.ULARGE_INTEGER, @intCast(file_size - read)),
-                std.math.maxInt(w.ULONG),
+                comptime std.math.maxInt(w.ULONG),
             )];
         };
         // TODO NtWriteFileGather

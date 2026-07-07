@@ -190,40 +190,26 @@ pub const Database = struct {
         return list.items;
     }
 
-    const CompareMetadataResult = union(enum) {
+    const CanTransferDataResult = union(enum) {
         file_exists: struct {
-            path: Path,
-            comparison: enum { equals, differs },
-        },
-        file_is_uninitialized: struct {
             path: Path,
         },
         file_doesnt_exist,
         is_a_directory,
     };
 
-    fn compareMetadata(
+    fn canTransferData(
         db: *Database,
-        metadata: *const network.Reader.IncomingFileMetadata,
+        file_id: network.FileId,
         io: Io,
-    ) !CompareMetadataResult {
+    ) !CanTransferDataResult {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        const info = db.files.getPtr(metadata.file_id) orelse return .file_doesnt_exist;
+        const info = db.files.getPtr(file_id) orelse return .file_doesnt_exist;
         if (info.directory) return .is_a_directory;
-        const regular_info = db.regular_file_info.getPtr(metadata.file_id).?;
-        switch (regular_info.status) {
-            .unsynced => return .{ .file_is_uninitialized = .{ .path = info.path } },
-            .synced => {},
-        }
-        const equals =
-            regular_info.size == metadata.file_size and
-            regular_info.hash.eql(&metadata.hash);
-
         return .{ .file_exists = .{
             .path = info.path,
-            .comparison = if (equals) .equals else .differs,
         } };
     }
 
@@ -545,7 +531,6 @@ pub const Host = struct {
         InvalidHeader,
     } ||
         network.Reader.ReceiveActionError ||
-        network.Reader.ReceiveFileMetadataError ||
         network.Reader.ReceivePathEncodingError ||
         network.Reader.ReceiveWindowsPathError ||
         network.Reader.ReceiveFileKindError ||
@@ -571,7 +556,7 @@ pub const Host = struct {
                         .resolve_path => {
                             try TxData.InNewFile.newTx(host, header.peer_tx_id, io, reader);
                         },
-                        .transfer_file_metadata => {
+                        .transfer_file_id => {
                             try TxData.InFileContents.newTx(host, header.peer_tx_id, io, reader);
                         },
                         .create_dir => {
@@ -824,8 +809,6 @@ pub const TxData = union(enum) {
         state: State,
         file_id: network.FileId,
         path: Path,
-        size: w.LARGE_INTEGER,
-        hash: network.FileHash,
 
         pub const State = union(enum) {
             send_decision: SendDecision,
@@ -842,25 +825,19 @@ pub const TxData = union(enum) {
             io: Io,
             reader: network.Reader,
         ) !void {
-            const metadata = try reader.receiveFileMetadata();
-            const path: Path, const decision: State.SendDecision = switch (try host.db.compareMetadata(&metadata, io)) {
+            const file_id = try reader.receiveFileId();
+            const path: Path, const decision: State.SendDecision = switch (try host.db.canTransferData(file_id, io)) {
                 .file_exists => |res| .{
                     res.path,
-                    switch (res.comparison) {
-                        .equals => .decline,
-                        .differs => .accept,
-                    },
+                    .accept,
                 },
-                .file_is_uninitialized => |res| .{ res.path, .accept },
                 .file_doesnt_exist, .is_a_directory => std.debug.panic("TODO", .{}),
             };
             const data: TxData = .{
                 .in_file_contents = .{
                     .state = .{ .send_decision = decision },
-                    .file_id = metadata.file_id,
+                    .file_id = file_id,
                     .path = path,
-                    .size = @as(w.LARGE_INTEGER, @intCast(metadata.file_size)),
-                    .hash = metadata.hash,
                 },
             };
             try host.addOutgoingTx(io, data, peer_tx_id);
@@ -908,6 +885,16 @@ pub const TxData = union(enum) {
             assert(in_file_contents.state == .receive_file_contents);
             switch (action) {
                 .transfer_file_contents => {
+                    const file_size = blk: {
+                        const network_size = try reader.receiveFileSize();
+                        const windows_size = std.math.cast(w.LARGE_INTEGER, network_size) orelse
+                            std.debug.panic(
+                                "TODO: File too large to transfer: '{f}' with size {}",
+                                .{ in_file_contents.path.formatUtf8(), network_size },
+                            );
+                        break :blk windows_size;
+                    };
+
                     const create_result = try host.db.createParentDirectories(in_file_contents.path);
                     defer switch (create_result.parent) {
                         .handle => |handle| host.db.closeHandle(handle),
@@ -917,7 +904,7 @@ pub const TxData = union(enum) {
                     const handle = host.db.createFile(switch (create_result.parent) {
                         .handle => |handle| handle,
                         .sync_dir => host.db.sync_dir,
-                    }, create_result.name, in_file_contents.size) catch |err| switch (err) {
+                    }, create_result.name, file_size) catch |err| switch (err) {
                         error.ParentDirNotFound => {
                             // TODO: The directory we just created was deleted.
                             //       Either try to re-create it, or obtain exclusive delete access to it.
@@ -929,13 +916,14 @@ pub const TxData = union(enum) {
                     };
                     defer host.db.closeHandle(handle);
 
-                    try fairy.windows.receiveFile(reader.io, handle, in_file_contents.size);
+                    try fairy.windows.receiveFile(reader.io, handle, file_size);
+                    const file_hash = try reader.receiveFileHash();
                     try host.db.finishReceiveFileContents(
                         io,
                         handle,
                         in_file_contents.file_id,
-                        &in_file_contents.hash,
-                        in_file_contents.size,
+                        &file_hash, // TODO: verify the hash
+                        file_size,
                     );
 
                     in_file_contents.state = .{ .send_result = .success };

@@ -49,7 +49,7 @@ pub const Action = enum(u8) {
     /// Payload(success): A sequence of `FileId`, one for each component of the requested path, in REVERSE order.
     resolve_path_response,
 
-    transfer_file_metadata,
+    transfer_file_id,
     transfer_file_accept,
     transfer_file_decline,
     transfer_file_contents,
@@ -175,19 +175,16 @@ pub const Writer = struct {
         try writer.io.writeInt(PathByteCount, byte_count, endian);
     }
 
-    pub fn sendWindowsPath(writer: Writer, path: fairy.windows.Path) Io.Writer.Error!void {
-        try writer.io.writeAll(@ptrCast(path.slice));
+    pub fn sendFileSize(writer: Writer, file_size: FileSize) Io.Writer.Error!void {
+        try writer.io.writeInt(FileSize, file_size, endian);
     }
 
-    pub fn sendFileMetadata(
-        writer: Writer,
-        file_id: FileId,
-        file_size: FileSize,
-        hash: *const FileHash,
-    ) !void {
-        try writer.sendFileId(file_id);
-        try writer.io.writeInt(FileSize, file_size, endian);
-        try writer.io.writeAll(&hash.blake3);
+    pub fn sendFileHash(writer: Writer, file_hash: *const FileHash) Io.Writer.Error!void {
+        try writer.io.writeAll(&file_hash.blake3);
+    }
+
+    pub fn sendWindowsPath(writer: Writer, path: fairy.windows.Path) Io.Writer.Error!void {
+        try writer.io.writeAll(@ptrCast(path.slice));
     }
 
     pub fn sendResolvePathResponse(writer: Writer, response: ResolvePathResponse) Io.Writer.Error!void {
@@ -244,6 +241,15 @@ pub const Reader = struct {
         return try reader.io.takeInt(PathByteCount, endian);
     }
 
+    pub fn receiveFileSize(reader: Reader) Io.Reader.Error!FileSize {
+        return try reader.io.takeInt(FileSize, endian);
+    }
+
+    pub fn receiveFileHash(reader: Reader) Io.Reader.Error!FileHash {
+        const hash_bytes = try reader.io.takeArray(FileHash.byte_size);
+        return .{ .blake3 = hash_bytes.* };
+    }
+
     pub const ReceiveWindowsPathError = error{InvalidPath} || Io.Reader.StreamError;
 
     pub fn receiveWindowsPath(
@@ -251,7 +257,7 @@ pub const Reader = struct {
         byte_count: PathByteCount,
         encoding: PathEncoding,
         buffer: *align(2) FilePathBuffer,
-    ) !fairy.windows.Path {
+    ) ReceiveWindowsPathError!fairy.windows.Path {
         switch (encoding) {
             .wtf16le => {},
         }
@@ -260,28 +266,6 @@ pub const Reader = struct {
         try reader.io.streamExact(&file_path_writer, byte_count);
         const path = buffer[0..byte_count];
         return try .fromSlice(@ptrCast(path));
-    }
-
-    pub const IncomingFileMetadata = struct {
-        file_id: FileId,
-        file_size: FileSize,
-        hash: FileHash,
-    };
-
-    pub const ReceiveFileMetadataError = Io.Reader.Error;
-
-    pub fn receiveFileMetadata(reader: Reader) ReceiveFileMetadataError!IncomingFileMetadata {
-        const file_id = try receiveFileId(reader);
-        const file_size = try reader.io.takeInt(FileSize, endian);
-
-        const hash_bytes = try reader.io.takeArray(FileHash.byte_size);
-        const hash: FileHash = .{ .blake3 = hash_bytes.* };
-
-        return .{
-            .file_id = file_id,
-            .file_size = file_size,
-            .hash = hash,
-        };
     }
 
     pub const ReceiveResolvePathResponseError = error{UnknownResolvePathResponse} || Io.Reader.Error;

@@ -17,7 +17,7 @@ const cpu_endian = @import("builtin").cpu.arch.endian();
 
 pub const Database = struct {
     sync_dir: w.HANDLE,
-
+    alert: std.atomic.Value(Alert),
     mutex: Io.Mutex, // TODO: Compare with RwLock
 
     // Begin fields protected by mutex
@@ -34,15 +34,10 @@ pub const Database = struct {
     // End fields protected by mutex
 
     // Database-Host synchronization fields
-    alert: std.atomic.Value(Alert),
     host_state: std.atomic.Value(Host.State),
     out_path: Path,
     out_file_id: network.FileId,
     out_directory: bool,
-    out_metadata: struct {
-        size: w.ULARGE_INTEGER,
-        hash: network.FileHash,
-    },
 
     pub const Alert = enum(u32) { off, on };
 
@@ -141,8 +136,9 @@ pub const Database = struct {
 
         return .{
             .sync_dir = sync_dir,
-
+            .alert = .init(.off),
             .mutex = .init,
+
             .allocator = allocator,
             .path_arena = .{},
             .scan_arena = .{},
@@ -157,12 +153,10 @@ pub const Database = struct {
             .queued_events = .{ .map = .empty },
             .in_progress_events = .{ .map = .empty },
 
-            .alert = .init(.off),
             .host_state = .init(.{}),
             .out_path = undefined,
             .out_file_id = undefined,
             .out_directory = undefined,
-            .out_metadata = undefined,
         };
     }
 
@@ -257,10 +251,6 @@ pub const Database = struct {
                     }
                     db.out_file_id = info.global_file_id;
                     db.out_path = path;
-                    db.out_metadata = .{
-                        .size = db.tree.meta.get(path).?.size,
-                        .hash = db.tree.hash.get(path).?,
-                    };
                     break :blk .sync_file;
                 },
                 .create_dir => {
@@ -1036,6 +1026,18 @@ const scan = struct {
     }
 };
 
+fn getFileSize(file: w.HANDLE) !w.LARGE_INTEGER {
+    const Information = w.FILE.STANDARD_INFORMATION;
+    var information: Information = undefined;
+    var iosb: w.IO_STATUS_BLOCK = undefined;
+    const status = w.ntdll.NtQueryInformationFile(file, &iosb, &information, @sizeOf(Information), .Standard);
+    switch (status) {
+        .SUCCESS => {},
+        else => return w.unexpectedStatus(status),
+    }
+    return information.EndOfFile;
+}
+
 fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash {
     var iosb: w.IO_STATUS_BLOCK = undefined;
     var buffer: [64 * 1024]u8 = undefined;
@@ -1179,7 +1181,7 @@ pub const Host = struct {
                     .receive_decision => unreachable,
                 },
                 .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
-                    .send_metadata => try out_file_contents.sendMetadata(host, tx_id, host.tx.peer_tx_id, io, writer),
+                    .send_file_id => try out_file_contents.sendFileId(host, tx_id, host.tx.peer_tx_id, io, writer),
                     .send_file_contents => try out_file_contents.sendFileContents(host, tx_id, host.tx.peer_tx_id, io, writer),
                     .receive_decision, .receive_result => unreachable,
                 },
@@ -1227,18 +1229,15 @@ pub const Host = struct {
 
                 host.tx.data = .{
                     .out_file_contents = .{
-                        .state = .send_metadata,
+                        .state = .send_file_id,
                         .file_id = host.db.out_file_id,
                         .path = host.db.out_path,
-                        .size = host.db.out_metadata.size,
-                        .hash = host.db.out_metadata.hash,
                     },
                 };
                 host.tx.peer_tx_id = .invalid;
 
                 host.db.out_file_id = undefined;
                 host.db.out_path = undefined;
-                host.db.out_metadata = undefined;
             },
             .create_dir => {
                 const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
@@ -1299,7 +1298,6 @@ pub const Host = struct {
         InvalidHeader,
     } ||
         network.Reader.ReceiveActionError ||
-        network.Reader.ReceiveFileMetadataError ||
         network.Reader.ReceiveResolvePathResponseError ||
         network.Reader.ReceiveCreateDirResponseError ||
         Io.Cancelable ||
@@ -1353,7 +1351,7 @@ pub const Host = struct {
                                 );
                             },
                             .receive_result => return error.InvalidHeader,
-                            .send_metadata, .send_file_contents => unreachable,
+                            .send_file_id, .send_file_contents => unreachable,
                         },
                         .out_create_dir => |*out_create_dir| switch (out_create_dir.state) {
                             .receive_confirmation => try out_create_dir.receiveConfirmation(
@@ -1394,7 +1392,7 @@ pub const Host = struct {
                             .receive_result => {
                                 try out_file_contents.receiveResult(host, reader, io, header.tx_id, action);
                             },
-                            .send_metadata, .send_file_contents => unreachable,
+                            .send_file_id, .send_file_contents => unreachable,
                         },
                         .out_create_dir => |*out_create_dir| switch (out_create_dir.state) {
                             .receive_confirmation => return error.InvalidHeader,
@@ -1603,17 +1601,15 @@ pub const TxData = union(enum) {
         state: State,
         file_id: network.FileId,
         path: Path, // TODO: this field shouldn't be needed
-        size: w.ULARGE_INTEGER,
-        hash: network.FileHash,
 
         pub const State = enum {
-            send_metadata,
+            send_file_id,
             receive_decision,
             send_file_contents,
             receive_result,
         };
 
-        fn sendMetadata(
+        fn sendFileId(
             out_file_contents: *OutFileContents,
             host: *Host,
             tx_id: network.TransactionId,
@@ -1621,24 +1617,18 @@ pub const TxData = union(enum) {
             io: Io,
             writer: network.Writer,
         ) !void {
-            assert(out_file_contents.state == .send_metadata);
+            assert(out_file_contents.state == .send_file_id);
             assert(peer_tx_id == .invalid);
 
-            const action: network.Action = .transfer_file_metadata;
+            const action: network.Action = .transfer_file_id;
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
-
-            const file_size = std.math.cast(network.FileSize, out_file_contents.size) orelse
-                std.debug.panic(
-                    "TODO: File too large to transfer: '{f}' with size {}",
-                    .{ out_file_contents.path.formatUtf8(), out_file_contents.size },
-                );
 
             out_file_contents.state = .receive_decision;
             host.flipTransaction(.incoming, tx_id, io);
 
             try writer.sendMessageHeaderNewTx(tx_id);
             try writer.sendAction(action);
-            try writer.sendFileMetadata(out_file_contents.file_id, file_size, &out_file_contents.hash);
+            try writer.sendFileId(out_file_contents.file_id);
             try writer.flush();
         }
 
@@ -1681,15 +1671,29 @@ pub const TxData = union(enum) {
             const action: network.Action = .transfer_file_contents;
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
 
-            const handle = try host.db.openFileReadOnly(out_file_contents.path);
-            defer host.db.closeFile(handle);
+            const file = try host.db.openFileReadOnly(out_file_contents.path);
+            defer host.db.closeFile(file);
+            // TODO update the database with this new size information
+            const file_size = blk: {
+                const windows_size = try getFileSize(file);
+                const casted_size = std.math.cast(network.FileSize, windows_size) orelse
+                    std.debug.panic(
+                        "TODO: File too large to transfer: '{f}' with size {}",
+                        .{ out_file_contents.path.formatUtf8(), windows_size },
+                    );
+                break :blk casted_size;
+            };
+
+            const file_hash = network.FileHash{ .blake3 = @splat(0) }; // TODO: compute the hash while sending data
 
             out_file_contents.state = .receive_result;
             host.flipTransaction(.incoming, tx_id, io);
 
             try writer.sendMessageHeaderExistingTx(peer_tx_id);
             try writer.sendAction(action);
-            try fairy.windows.sendFile(writer.io, handle, out_file_contents.size);
+            try writer.sendFileSize(file_size);
+            try fairy.windows.sendFile(writer.io, file, file_size);
+            try writer.sendFileHash(&file_hash);
             try writer.flush();
         }
 
