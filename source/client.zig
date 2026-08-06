@@ -130,6 +130,7 @@ pub const Database = struct {
     };
 
     pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
+        // TODO: The length of this path must also be factored into path length calculations.
         const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
         const sync_dir = try fairy.windows.openSyncDir(sync_dir_path_nt.span());
         errdefer comptime unreachable;
@@ -520,17 +521,8 @@ pub const LockedDatabase = struct {
         const hash = if (!info.directory) blk: {
             const file = try fairy.windows.openFile(locked.db.sync_dir, path, .read);
             defer fairy.windows.closeHandle(file);
-
-            const Information = w.FILE.STANDARD_INFORMATION;
-            var information: Information = undefined;
-            var iosb: w.IO_STATUS_BLOCK = undefined;
-            const status = w.ntdll.NtQueryInformationFile(file, &iosb, &information, @sizeOf(Information), .Standard);
-            switch (status) {
-                .SUCCESS => {},
-                else => return w.unexpectedStatus(status),
-            }
-
-            break :blk try computeFileHash(file, information.EndOfFile);
+            const file_size = try getFileSize(file);
+            break :blk try computeFileHash(file, file_size);
         } else undefined;
 
         errdefer comptime unreachable;
@@ -545,6 +537,7 @@ pub const LockedDatabase = struct {
             // TODO: switch (path_info.value_ptr.status) { ... }
             switch (path_info.value_ptr.global_file_id) {
                 .unknown => {
+                    // NOTE: This is an instance where a `.new` file may have a global file ID that is not `.unknown`.
                     path_info.value_ptr.global_file_id = file_id;
                     locked.db.file_id_map.putAssumeCapacityNoClobber(file_id, path_info.key_ptr.*);
                     fairy.log.debug("db: set file id {} for {f}", .{ @intFromEnum(file_id), path_info.key_ptr.formatUtf8() });
@@ -667,14 +660,23 @@ const scan = struct {
     const Context = struct {
         locked: LockedDatabase,
         arena: *std.heap.ArenaAllocator,
+        /// A list of child directories relative to the current directory.
+        /// An empty slice means to pop the current directory off the stack.
         pending_dirs: std.ArrayList([]const u16),
-        sub_path: std.ArrayList(u16),
+        /// A path to the current directory/file.
+        current_path: std.ArrayList(u16),
+        /// A list of the indeces of all the backslash '\' characters within `current_path`.
         component_delimeters: std.ArrayList(u16),
+        /// A stack of open directory handles.
+        /// The first element is always a handle to the sync directory.
         open_dir_handles: std.ArrayList(w.HANDLE),
+        /// A stack of Database-owned directory paths.
+        /// The first element is always `null`.
         parent_paths: std.ArrayList(?Path),
-        set_of_tracked_files: SetOfTrackedFiles,
+        /// A copy of the database's current list of files.
+        all_files: AllFiles,
 
-        const SetOfTrackedFiles = PathHashMap(struct {
+        const AllFiles = PathHashMap(struct {
             status: Database.Tree.Status,
             directory: bool,
             already_seen: bool,
@@ -690,11 +692,11 @@ const scan = struct {
         var open_dir_handles: std.ArrayList(w.HANDLE) = .empty;
         try open_dir_handles.append(allocator, locked.db.sync_dir);
 
-        var set_of_tracked_files: Context.SetOfTrackedFiles = .empty;
-        try set_of_tracked_files.ensureTotalCapacity(allocator, locked.db.tree.files.count());
+        var all_files: Context.AllFiles = .empty;
+        try all_files.ensureTotalCapacity(allocator, locked.db.tree.files.count());
         var it = locked.db.tree.files.iterator();
         while (it.next()) |entry| {
-            set_of_tracked_files.putAssumeCapacityNoClobber(entry.key_ptr.*, .{
+            all_files.putAssumeCapacityNoClobber(entry.key_ptr.*, .{
                 .status = entry.value_ptr.status,
                 .directory = entry.value_ptr.directory,
                 .already_seen = false,
@@ -705,11 +707,11 @@ const scan = struct {
             .locked = locked,
             .arena = arena,
             .pending_dirs = .empty,
-            .sub_path = .empty,
+            .current_path = .empty,
             .component_delimeters = .empty,
             .open_dir_handles = open_dir_handles,
             .parent_paths = parent_paths,
-            .set_of_tracked_files = set_of_tracked_files,
+            .all_files = all_files,
         };
     }
 
@@ -834,10 +836,10 @@ const scan = struct {
         const set_to_untracked = @as(w.ULONG, @bitCast(rejected)) & @as(w.ULONG, @bitCast(information.FileAttributes)) != 0;
 
         const allocator = ctx.arena.allocator();
-        const component_delimeter_index = ctx.sub_path.items.len;
-        defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
-        try ctx.sub_path.appendSlice(allocator, name);
-        const path: Path = .assumeValidPath(ctx.sub_path.items);
+        const component_delimeter_index = ctx.current_path.items.len;
+        defer ctx.current_path.shrinkRetainingCapacity(component_delimeter_index);
+        try ctx.current_path.appendSlice(allocator, name); // TODO: check that it fits within the file path length limit
+        const path: Path = .assumeValidPath(ctx.current_path.items);
 
         if (information.FileAttributes.DIRECTORY) {
             try processDirectoryFile(ctx, path, information, set_to_untracked);
@@ -856,14 +858,14 @@ const scan = struct {
         const delimeter = comptime wtf16("\\");
         const allocator = ctx.arena.allocator();
         try ctx.component_delimeters.ensureTotalCapacity(allocator, 1);
-        try ctx.sub_path.ensureUnusedCapacity(allocator, dir_name.len + delimeter.len);
+        try ctx.current_path.ensureUnusedCapacity(allocator, dir_name.len + delimeter.len);
         try ctx.parent_paths.ensureUnusedCapacity(allocator, 1);
         try ctx.open_dir_handles.ensureUnusedCapacity(allocator, 1);
 
-        ctx.component_delimeters.appendAssumeCapacity(@intCast(ctx.sub_path.items.len));
-        ctx.sub_path.appendSliceAssumeCapacity(dir_name);
-        const parent_path_temp = ctx.sub_path.items;
-        ctx.sub_path.appendSliceAssumeCapacity(delimeter);
+        ctx.component_delimeters.appendAssumeCapacity(@intCast(ctx.current_path.items.len));
+        ctx.current_path.appendSliceAssumeCapacity(dir_name);
+        const parent_path_temp = ctx.current_path.items;
+        ctx.current_path.appendSliceAssumeCapacity(delimeter);
 
         var path_arena = ctx.locked.db.path_arena.promote(ctx.locked.db.allocator);
         defer ctx.locked.db.path_arena = path_arena.state;
@@ -881,7 +883,7 @@ const scan = struct {
 
     fn exitDir(ctx: *Context) void {
         const component_delimeter_index = ctx.component_delimeters.pop().?;
-        ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
+        ctx.current_path.shrinkRetainingCapacity(component_delimeter_index);
         _ = ctx.parent_paths.pop();
         const dir = ctx.open_dir_handles.pop().?;
         w.CloseHandle(dir);
@@ -901,7 +903,7 @@ const scan = struct {
         };
 
         const allocator = ctx.arena.allocator();
-        const gop = try ctx.set_of_tracked_files.getOrPut(allocator, path);
+        const gop = try ctx.all_files.getOrPut(allocator, path);
         if (gop.found_existing) {
             if (gop.value_ptr.already_seen) std.debug.panic("TODO saw file more than once while scanning: {f}", .{path.formatUtf8()});
             gop.value_ptr.already_seen = true;
@@ -933,7 +935,7 @@ const scan = struct {
                 },
             }
         } else {
-            errdefer ctx.set_of_tracked_files.removeByPtr(gop.key_ptr);
+            errdefer ctx.all_files.removeByPtr(gop.key_ptr);
 
             var path_arena = ctx.locked.db.path_arena.promote(ctx.locked.db.allocator);
             defer ctx.locked.db.path_arena = path_arena.state;
@@ -969,7 +971,7 @@ const scan = struct {
         };
 
         const allocator = ctx.arena.allocator();
-        const gop = try ctx.set_of_tracked_files.getOrPut(allocator, path);
+        const gop = try ctx.all_files.getOrPut(allocator, path);
         if (gop.found_existing) {
             if (gop.value_ptr.already_seen) std.debug.panic("TODO saw file more than once while scanning: {f}", .{path.formatUtf8()});
             gop.value_ptr.already_seen = true;
@@ -987,7 +989,7 @@ const scan = struct {
                 },
             }
         } else {
-            errdefer ctx.set_of_tracked_files.removeByPtr(gop.key_ptr);
+            errdefer ctx.all_files.removeByPtr(gop.key_ptr);
 
             var path_arena = ctx.locked.db.path_arena.promote(ctx.locked.db.allocator);
             defer ctx.locked.db.path_arena = path_arena.state;
@@ -1010,7 +1012,7 @@ const scan = struct {
     }
 
     fn deleteFiles(ctx: *Context) !void {
-        var it = ctx.set_of_tracked_files.iterator();
+        var it = ctx.all_files.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.already_seen) continue;
             const path = entry.key_ptr.*;
@@ -1545,7 +1547,7 @@ pub const TxData = union(enum) {
             try writer.sendAction(action);
             try writer.sendFileKind(out_new_file.kind);
             try writer.sendPathEncoding(.wtf16le);
-            try writer.sendPathByteCount(out_new_file.path.byteCount());
+            try writer.sendWindowsPathByteCount(out_new_file.path.byteCount());
             try writer.sendWindowsPath(out_new_file.path);
             try writer.flush();
         }

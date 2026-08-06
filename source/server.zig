@@ -45,6 +45,7 @@ pub const Database = struct {
     };
 
     pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
+        // TODO: The length of this path must also be factored into path length calculations.
         const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
         const sync_dir = try fairy.windows.openSyncDir(sync_dir_path_nt.span());
         errdefer comptime unreachable;
@@ -532,6 +533,7 @@ pub const Host = struct {
     } ||
         network.Reader.ReceiveActionError ||
         network.Reader.ReceivePathEncodingError ||
+        network.Reader.ReceiveWindowsPathByteCountError ||
         network.Reader.ReceiveWindowsPathError ||
         network.Reader.ReceiveFileKindError ||
         Io.Cancelable ||
@@ -730,7 +732,7 @@ pub const TxData = union(enum) {
         ) !void {
             const kind = try reader.receiveFileKind();
             const encoding = try reader.receivePathEncoding();
-            const path_byte_count = try reader.receivePathByteCount();
+            const path_byte_count = try reader.receiveWindowsPathByteCount();
 
             var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
             const path = reader.receiveWindowsPath(path_byte_count, encoding, &file_path_buffer) catch |err| switch (err) {
@@ -742,7 +744,7 @@ pub const TxData = union(enum) {
                     };
                     return try host.addOutgoingTx(io, data, peer_tx_id);
                 },
-                error.WriteFailed, error.ReadFailed, error.EndOfStream => |e| return e,
+                error.ReadFailed, error.EndOfStream => |e| return e,
             };
 
             const data: TxData = .{

@@ -171,7 +171,8 @@ pub const Writer = struct {
         try writer.writeEnum(PathEncoding, encoding);
     }
 
-    pub fn sendPathByteCount(writer: Writer, byte_count: PathByteCount) Io.Writer.Error!void {
+    pub fn sendWindowsPathByteCount(writer: Writer, byte_count: PathByteCount) Io.Writer.Error!void {
+        assert(byte_count % 2 == 0);
         try writer.io.writeInt(PathByteCount, byte_count, endian);
     }
 
@@ -237,8 +238,12 @@ pub const Reader = struct {
         return try reader.readEnum(PathEncoding) orelse error.UnknownPathEncoding;
     }
 
-    pub fn receivePathByteCount(reader: Reader) Io.Reader.Error!PathByteCount {
-        return try reader.io.takeInt(PathByteCount, endian);
+    pub const ReceiveWindowsPathByteCountError = error{InvalidWindowsPathByteCount} || Io.Reader.Error;
+
+    pub fn receiveWindowsPathByteCount(reader: Reader) ReceiveWindowsPathByteCountError!PathByteCount {
+        const int = try reader.io.takeInt(PathByteCount, endian);
+        if (int % 2 == 1) return error.InvalidWindowsPathByteCount;
+        return int;
     }
 
     pub fn receiveFileSize(reader: Reader) Io.Reader.Error!FileSize {
@@ -250,7 +255,7 @@ pub const Reader = struct {
         return .{ .blake3 = hash_bytes.* };
     }
 
-    pub const ReceiveWindowsPathError = error{InvalidPath} || Io.Reader.StreamError;
+    pub const ReceiveWindowsPathError = error{InvalidPath} || Io.Reader.Error;
 
     pub fn receiveWindowsPath(
         reader: Reader,
@@ -258,12 +263,16 @@ pub const Reader = struct {
         encoding: PathEncoding,
         buffer: *align(2) FilePathBuffer,
     ) ReceiveWindowsPathError!fairy.windows.Path {
+        assert(byte_count % 2 == 0);
         switch (encoding) {
             .wtf16le => {},
         }
 
         var file_path_writer: Io.Writer = .fixed(buffer);
-        try reader.io.streamExact(&file_path_writer, byte_count);
+        reader.io.streamExact(&file_path_writer, byte_count) catch |err| switch (err) {
+            error.WriteFailed => unreachable,
+            error.ReadFailed, error.EndOfStream => |e| return e,
+        };
         const path = buffer[0..byte_count];
         return try .fromSlice(@ptrCast(path));
     }

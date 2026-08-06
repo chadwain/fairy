@@ -10,23 +10,26 @@ const cpu_endian = @import("builtin").cpu.arch.endian();
 
 /// A path to a location within the sync directory.
 /// It is implemented as a WTF-16 encoded string, with the endianness of the host system.
-/// It aims to be interpretable as an NT relative path.
+/// It represents a subset of valid NT relative paths.
 ///
-/// A path must have these properties:
+/// A `Path` must have these properties:
 /// - It must be non-empty.
-/// - It must not be longer than `std.os.windows.PATH_MAX_WIDE` code units long.
+/// - It must not be longer than `Path.max_len` code units long.
 /// - It must not contain more than `fairy.max_path_components` components.
 /// - It must not contain any '/' codepoints.
 /// - It must not end with a '\' codepoint.
 /// - No component may be empty. (Thus consecutive '\' codepoints are disallowed.)
-/// - No component may be longer than `std.os.windows.NAME_MAX` code units long.
+/// - No component may be longer than `Path.component_max_len` code units long.
 /// - No component may end with a '.', or ' ' codepoint. (Thus '.' and '..' are not valid components.)
-/// - No component may refer to a special device.
+/// - No component may be the same as a legacy DOS device name. (NUL, COM1, AUX, etc.)
 
 // TODO: The maximum length of a path component is actually a run-time known value,
 //       it can be retrieved using NtQueryVolumeInformationFile.
 pub const Path = struct {
     slice: []const u16,
+
+    pub const max_len = 32767;
+    pub const component_max_len = 255;
 
     pub fn fromSlice(slice: []const u16) error{InvalidPath}!Path {
         if (!isValidWindowsPath(slice)) return error.InvalidPath;
@@ -83,26 +86,27 @@ pub fn isValidWindowsPath(path: []const u16) bool {
     // https://projectzero.google/2016/02/the-definitive-guide-on-win32-to-nt.html
 
     if (path.len == 0) return false;
-    if (path.len > w.PATH_MAX_WIDE) return false;
+    if (path.len > Path.max_len) return false;
     switch (std.fs.path.getWin32PathType(u16, path)) {
         .relative => {},
         else => return false,
     }
 
-    const L = std.unicode.wtf8ToWtf16LeStringLiteral;
+    const c = asciiToUtf16;
+
     var index: u16 = 0;
     var component_len: u16 = 0;
     var component_count: fairy.PathComponentCount = 0;
     while (index < path.len) : (index += 1) {
         switch (path[index]) {
-            L("\\")[0] => {
+            c('\\') => {
                 if (index + 1 == path.len) return false;
                 const component = path[index - component_len .. index];
                 component_len = 0;
                 component_count = if (component_count < fairy.max_path_components) component_count + 1 else return false;
                 if (!isValidComponent(component)) return false;
             },
-            L("/")[0] => return false,
+            c('/') => return false,
             else => component_len += 1,
         }
     } else {
@@ -114,20 +118,24 @@ pub fn isValidWindowsPath(path: []const u16) bool {
 
 fn isValidComponent(component: []const u16) bool {
     const L = std.unicode.wtf8ToWtf16LeStringLiteral;
+    const c = asciiToUtf16;
+
     if (component.len == 0) return false;
-    if (component.len > w.NAME_MAX) return false;
+    if (component.len > Path.component_max_len) return false;
     if (std.mem.trimEnd(u16, component, comptime L(" .")).len != component.len) return false;
-    var index = beginsWithSpecialDeviceName(component) orelse return true;
-    while (index < component.len) : (index += 1) {
-        switch (component[index]) {
-            L(" ")[0] => continue,
-            L(".")[0], L(":")[0] => return false,
-            else => return true,
-        }
-    } else return false;
+    if (beginsWithLegacyDeviceName(component)) |index| {
+        for (component[index..]) |codepoint| {
+            switch (codepoint) {
+                c(' ') => continue,
+                c('.'), c(':') => return false,
+                else => break,
+            }
+        } else return false;
+    }
+    return true;
 }
 
-fn beginsWithSpecialDeviceName(component: []const u16) ?u16 {
+fn beginsWithLegacyDeviceName(component: []const u16) ?u16 {
     const L = std.unicode.wtf8ToWtf16LeStringLiteral;
     if (std.mem.startsWith(u16, component, comptime L("PRN")) or
         std.mem.startsWith(u16, component, comptime L("AUX")) or
@@ -149,6 +157,15 @@ fn beginsWithSpecialDeviceName(component: []const u16) ?u16 {
         return 7;
 
     return null;
+}
+
+pub fn asciiToUtf16(comptime char: u8) u16 {
+    return comptime blk: {
+        assert(char < 128);
+        const as_utf16 = std.unicode.utf8ToUtf16LeStringLiteral(&.{char});
+        assert(as_utf16.len == 1);
+        break :blk as_utf16[0];
+    };
 }
 
 pub fn PathHashMap(comptime V: type) type {
