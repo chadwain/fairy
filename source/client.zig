@@ -39,6 +39,8 @@ pub const Database = struct {
     out_file_id: network.FileId,
     out_directory: bool,
 
+    debug: Debug,
+
     pub const Alert = enum(u32) { off, on };
 
     /// A re-representation of the contents of the sync directory.
@@ -108,6 +110,13 @@ pub const Database = struct {
             pub const Key = union(enum) {
                 path: Path,
                 file_id: network.FileId,
+
+                pub fn format(key: Key, writer: *Io.Writer) Io.Writer.Error!void {
+                    switch (key) {
+                        .path => |path| try writer.print("{f}", .{path.formatUtf8()}),
+                        .file_id => |file_id| try writer.print("{f}", .{file_id}),
+                    }
+                }
             };
 
             pub const Context = struct {
@@ -129,7 +138,7 @@ pub const Database = struct {
         };
     };
 
-    pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
+    pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator, debug: Debug) !Database {
         // TODO: The length of this path must also be factored into path length calculations.
         const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
         const sync_dir = try fairy.windows.openSyncDir(sync_dir_path_nt.span());
@@ -158,6 +167,8 @@ pub const Database = struct {
             .out_path = undefined,
             .out_file_id = undefined,
             .out_directory = undefined,
+
+            .debug = debug,
         };
     }
 
@@ -178,7 +189,7 @@ pub const Database = struct {
     }
 
     pub fn run(db: *Database, io: Io) !void {
-        std.debug.print("client db running on thread {}\n", .{std.os.windows.GetCurrentThreadId()});
+        db.debug.log("running on thread {}", .{std.os.windows.GetCurrentThreadId()});
         var stderr = Io.File.stderr().writer(io, &.{});
 
         const clock: Io.Clock = .boot;
@@ -221,7 +232,10 @@ pub const Database = struct {
 
             const kv = db.queued_events.map.pop().?;
             const gop = db.in_progress_events.map.getOrPutAssumeCapacity(kv.key);
-            if (gop.found_existing) std.debug.panic("TODO: event already in progress for {any}", .{kv.key});
+            if (gop.found_existing) {
+                std.debug.panic("TODO: event {s} already in progress for {f}", .{ @tagName(gop.value_ptr.*), kv.key });
+            }
+            db.debug.log("putting event {s} in progress for {f}", .{ @tagName(kv.value), kv.key });
             gop.value_ptr.* = kv.value;
 
             switch (kv.value) {
@@ -323,6 +337,14 @@ pub const Database = struct {
     fn closeFile(_: *const Database, file: w.HANDLE) void {
         fairy.windows.closeHandle(file);
     }
+
+    pub const Debug = struct {
+        name: []const u8 = "<unnamed>",
+
+        fn log(debug: *const Debug, comptime fmt: []const u8, args: anytype) void {
+            fairy.log.debug("(db:{s}) " ++ fmt, .{debug.name} ++ args);
+        }
+    };
 };
 
 pub const LockedDatabase = struct {
@@ -334,6 +356,7 @@ pub const LockedDatabase = struct {
     }
 
     pub fn manualScan(locked: LockedDatabase, io: Io) !void {
+        // TODO delay the next automatic scan
         try scan.run(locked);
         locked.db.sendAlert(io);
     }
@@ -343,8 +366,9 @@ pub const LockedDatabase = struct {
         key: Database.Event.Map.Key,
         event: Database.Event,
     ) void {
+        locked.db.debug.log("queueing event {s} for {f}", .{ @tagName(event), key });
         const gop = locked.db.queued_events.map.getOrPutAssumeCapacity(key);
-        if (gop.found_existing) std.debug.panic("TODO: event already queued for {any}", .{key});
+        if (gop.found_existing) std.debug.panic("TODO: event {s} already queued for {f}", .{ @tagName(gop.value_ptr.*), key });
         gop.value_ptr.* = event;
     }
 
@@ -485,6 +509,76 @@ pub const LockedDatabase = struct {
         locked.queueEventAssumeCapacity(.{ .file_id = info.value.global_file_id }, .deleted);
     }
 
+    fn deleteTrackedDirectoryFile(locked: LockedDatabase, path: Path) !void {
+        try locked.db.queued_events.map.ensureUnusedCapacity(locked.db.allocator, 1);
+        errdefer comptime unreachable;
+
+        const global_file_id = blk: {
+            const info = locked.db.tree.files.fetchRemove(path).?.value;
+            assert(info.directory);
+            break :blk info.global_file_id;
+        };
+
+        if (locked.db.tree.parent.fetchRemove(path).?.value) |parent| {
+            const parent_children = locked.db.tree.children.getPtr(parent).?;
+            assert(parent_children.remove(path));
+        }
+
+        const StackItem = struct {
+            path: Path,
+            children: PathHashMap(void),
+            child_iterator: PathHashMap(void).KeyIterator,
+        };
+        var stack: [fairy.max_path_components]StackItem = undefined;
+        stack[0] = .{
+            .path = path,
+            .children = locked.db.tree.children.fetchRemove(path).?.value,
+            .child_iterator = undefined,
+        };
+        stack[0].child_iterator = stack[0].children.keyIterator();
+        var stack_len: fairy.PathComponentCount = 1;
+
+        while (stack_len > 0) {
+            const stack_item = &stack[stack_len - 1];
+            if (stack_item.child_iterator.next()) |child_path_ptr| {
+                const child_path = child_path_ptr.*;
+                const info = locked.db.tree.files.fetchRemove(child_path).?;
+                assert(locked.db.tree.parent.remove(child_path));
+
+                if (locked.db.queued_events.map.contains(.{ .file_id = info.value.global_file_id }))
+                    std.debug.panic(
+                        "TODO: An event is queued for '{f}' while its parent directory '{f}' has been deleted",
+                        .{ info.key.formatUtf8(), path.formatUtf8() },
+                    );
+                if (locked.db.in_progress_events.map.contains(.{ .file_id = info.value.global_file_id }))
+                    std.debug.panic(
+                        "TODO: An event is in progress for '{f}' while its parent directory '{f}' has been deleted",
+                        .{ info.key.formatUtf8(), path.formatUtf8() },
+                    );
+
+                if (info.value.directory) {
+                    if (stack_len == fairy.max_path_components) unreachable;
+                    stack[stack_len] = .{
+                        .path = child_path,
+                        .children = locked.db.tree.children.fetchRemove(child_path).?.value,
+                        .child_iterator = undefined,
+                    };
+                    stack[stack_len].child_iterator = stack[stack_len].children.keyIterator();
+                    stack_len += 1;
+                } else {
+                    assert(locked.db.tree.meta.remove(child_path));
+                    assert(locked.db.tree.hash.remove(child_path));
+                }
+            } else {
+                stack_item.children.deinit(locked.db.allocator);
+                stack_item.* = undefined;
+                stack_len -= 1;
+            }
+        }
+
+        locked.queueEventAssumeCapacity(.{ .file_id = global_file_id }, .deleted);
+    }
+
     fn changeTrackedRegularFileToUntracked(locked: LockedDatabase, path: Path) !void {
         try locked.db.queued_events.map.ensureUnusedCapacity(locked.db.allocator, 1);
         errdefer comptime unreachable;
@@ -540,7 +634,7 @@ pub const LockedDatabase = struct {
                     // NOTE: This is an instance where a `.new` file may have a global file ID that is not `.unknown`.
                     path_info.value_ptr.global_file_id = file_id;
                     locked.db.file_id_map.putAssumeCapacityNoClobber(file_id, path_info.key_ptr.*);
-                    fairy.log.debug("db: set file id {} for {f}", .{ @intFromEnum(file_id), path_info.key_ptr.formatUtf8() });
+                    locked.db.debug.log("mapped {f} to {f}", .{ file_id, path_info.key_ptr.formatUtf8() });
                 },
                 _ => {
                     if (path_info.value_ptr.global_file_id != file_id) {
@@ -562,14 +656,19 @@ pub const LockedDatabase = struct {
     }
 
     // called from Host
-    fn confirmDeleteFile(locked: LockedDatabase, file_id: network.FileId) !void {
+    fn confirmDeleteFile(locked: LockedDatabase, file_id: network.FileId) void {
         assert(locked.db.in_progress_events.map.fetchSwapRemove(.{ .file_id = file_id }).?.value == .deleted);
         assert(locked.db.file_id_map.remove(file_id));
     }
 
     // called from Host
-    fn markFileAsSynced(locked: LockedDatabase, file_id: network.FileId) !void {
+    fn markFileAsSynced(locked: LockedDatabase, file_id: network.FileId) void {
         assert(locked.db.in_progress_events.map.fetchSwapRemove(.{ .file_id = file_id }).?.value == .modified);
+    }
+
+    // called from Host
+    fn acknowledgeCreateDir(locked: LockedDatabase, file_id: network.FileId) void {
+        assert(locked.db.in_progress_events.map.fetchSwapRemove(.{ .file_id = file_id }).?.value == .create_dir);
     }
 
     pub const Debug = struct {
@@ -774,7 +873,7 @@ const scan = struct {
             try scanOneDirectory(&ctx);
         }
 
-        try deleteFiles(&ctx);
+        try deleteUnseenFiles(&ctx);
     }
 
     fn scanOneDirectory(ctx: *Context) !void {
@@ -1011,7 +1110,7 @@ const scan = struct {
         }
     }
 
-    fn deleteFiles(ctx: *Context) !void {
+    fn deleteUnseenFiles(ctx: *Context) !void {
         var it = ctx.all_files.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.already_seen) continue;
@@ -1020,6 +1119,7 @@ const scan = struct {
                 .new => std.debug.panic("TODO delete a new file: {f}", .{path.formatUtf8()}),
                 .tracked => switch (entry.value_ptr.directory) {
                     false => try ctx.locked.deleteTrackedRegularFile(path),
+                    // TODO: try ctx.locked.deleteTrackedDirectoryFile(path),
                     true => std.debug.panic("TODO delete a tracked directory: {f}", .{path.formatUtf8()}),
                 },
                 .untracked => std.debug.panic("TODO delete an untracked file: {f}", .{path.formatUtf8()}),
@@ -1584,7 +1684,7 @@ pub const TxData = union(enum) {
                         try locked.setNewFileId(out_new_file.path, out_new_file.kind, file_id_list.items, io);
                     }
 
-                    host.debugLog("received file id {} for file {f}\n", .{ @intFromEnum(file_id_list.items[0]), out_new_file.path.formatUtf8() });
+                    host.debugLog("received {f} for file {f}\n", .{ file_id_list.items[0], out_new_file.path.formatUtf8() });
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
                 .invalid_path,
@@ -1712,7 +1812,7 @@ pub const TxData = union(enum) {
                     {
                         const locked = try host.db.lock(io);
                         defer locked.unlock(io);
-                        try locked.markFileAsSynced(out_file_contents.file_id);
+                        locked.markFileAsSynced(out_file_contents.file_id);
                     }
                     host.debugLog("successfully synced file: {f}\n", .{out_file_contents.path.formatUtf8()});
                 },
@@ -1721,7 +1821,7 @@ pub const TxData = union(enum) {
                     {
                         const locked = try host.db.lock(io);
                         defer locked.unlock(io);
-                        try locked.markFileAsSynced(out_file_contents.file_id);
+                        locked.markFileAsSynced(out_file_contents.file_id);
                     }
                     host.debugLog("failed to sync file: {f}\n", .{out_file_contents.path.formatUtf8()});
                 },
@@ -1780,6 +1880,11 @@ pub const TxData = union(enum) {
             const response = try reader.receiveCreateDirResponse();
             switch (response) {
                 .success => {
+                    {
+                        const locked = try host.db.lock(io);
+                        defer locked.unlock(io);
+                        locked.acknowledgeCreateDir(out_create_dir.file_id);
+                    }
                     host.debugLog(
                         "create dir with id {} name {f}\n",
                         .{ @intFromEnum(out_create_dir.file_id), out_create_dir.path.formatUtf8() },
@@ -1787,6 +1892,12 @@ pub const TxData = union(enum) {
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
                 .not_a_directory, .unknown_file, .unexpected => {
+                    // TODO handle this error
+                    {
+                        const locked = try host.db.lock(io);
+                        defer locked.unlock(io);
+                        locked.acknowledgeCreateDir(out_create_dir.file_id);
+                    }
                     host.debugLog(
                         "error '{s}' while creating dir {} {f}\n",
                         .{ @tagName(response), @intFromEnum(out_create_dir.file_id), out_create_dir.path.formatUtf8() },
@@ -1842,7 +1953,7 @@ pub const TxData = union(enum) {
                     {
                         const locked = try host.db.lock(io);
                         defer locked.unlock(io);
-                        try locked.confirmDeleteFile(out_delete_file.file_id);
+                        locked.confirmDeleteFile(out_delete_file.file_id);
                     }
                     host.deleteTransaction(tx_id, .incoming, io);
                 },

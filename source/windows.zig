@@ -22,17 +22,17 @@ const cpu_endian = @import("builtin").cpu.arch.endian();
 /// - No component may be longer than `Path.component_max_len` code units long.
 /// - No component may end with a '.', or ' ' codepoint. (Thus '.' and '..' are not valid components.)
 /// - No component may be the same as a legacy DOS device name. (NUL, COM1, AUX, etc.)
-
-// TODO: The maximum length of a path component is actually a run-time known value,
-//       it can be retrieved using NtQueryVolumeInformationFile.
 pub const Path = struct {
     slice: []const u16,
 
     pub const max_len = 32767;
+
+    // TODO: The maximum length of a path component is actually a run-time known value,
+    //       it can be retrieved using NtQueryVolumeInformationFile.
     pub const component_max_len = 255;
 
     pub fn fromSlice(slice: []const u16) error{InvalidPath}!Path {
-        if (!isValidWindowsPath(slice)) return error.InvalidPath;
+        if (!isValidPath(slice)) return error.InvalidPath;
         return .{ .slice = slice };
     }
 
@@ -81,12 +81,13 @@ pub const Path = struct {
     }
 };
 
-pub fn isValidWindowsPath(path: []const u16) bool {
+pub fn isValidPath(path: []const u16) bool {
     // My reference for how NT paths work is here:
     // https://projectzero.google/2016/02/the-definitive-guide-on-win32-to-nt.html
 
     if (path.len == 0) return false;
     if (path.len > Path.max_len) return false;
+    // TODO No sense in calling a function that takes Win32 paths
     switch (std.fs.path.getWin32PathType(u16, path)) {
         .relative => {},
         else => return false,

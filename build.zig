@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "fairy", .module = fairy },
             },
         }),
-        .use_llvm = false,
+        .use_llvm = true,
     });
     b.installArtifact(test_exe);
 }

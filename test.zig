@@ -16,7 +16,7 @@ pub fn main(init: std.process.Init) !void {
     const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.peerSyncDir());
     defer allocator.free(peer_sync_dir);
 
-    var cdb = try fairy.client.Database.init(sync_dir, allocator);
+    var cdb = try fairy.client.Database.init(sync_dir, allocator, .{ .name = "client" });
     defer cdb.deinit();
 
     var sdb = try fairy.server.Database.init(peer_sync_dir, allocator);

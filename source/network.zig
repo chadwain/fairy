@@ -80,7 +80,14 @@ pub const FileHash = struct {
     }
 };
 
-pub const FileId = enum(u32) { unknown = 0, _ };
+pub const FileId = enum(u32) {
+    unknown = 0,
+    _,
+
+    pub fn format(file_id: FileId, writer: *Io.Writer) Io.Writer.Error!void {
+        try writer.print("FileId({d})", .{@intFromEnum(file_id)});
+    }
+};
 
 pub const FileSize = u64;
 

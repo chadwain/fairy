@@ -365,8 +365,7 @@ pub const Database = struct {
         defer db.mutex.unlock(io);
 
         const file_info = db.files.getEntry(file_id) orelse return .unknown_file;
-        // TODO delete folders
-        if (file_info.value_ptr.directory) std.debug.panic("TODO", .{});
+        if (file_info.value_ptr.directory) std.debug.panic("TODO delete folders", .{});
         const regular_info = db.regular_file_info.getEntry(file_id).?;
         const path_info_entry = db.path_map.getEntry(file_info.value_ptr.path).?;
         assert(path_info_entry.value_ptr.* == file_id);
