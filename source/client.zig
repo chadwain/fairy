@@ -45,16 +45,18 @@ pub const Database = struct {
 
     /// A re-representation of the contents of the sync directory.
     pub const Tree = struct {
-        files: PathHashMap(Info),
+        files: PathHashMap(Info) = .empty,
         /// Applies to all files
-        parent: PathHashMap(?Path),
+        parent: PathHashMap(?Path) = .empty,
         /// Applies only to directories
-        children: PathHashMap(PathHashMap(void)),
+        children: PathHashMap(PathHashMap(void)) = .empty,
+        /// The direct children of the sync directory.
+        top_level_children: PathHashMap(void) = .empty,
         /// Applies only to regular files
-        meta: PathHashMap(Metadata),
+        meta: PathHashMap(Metadata) = .empty,
         /// Applies only to regular files
         // TODO: Make the hash nullable, do not compute it until the file is being synced
-        hash: PathHashMap(network.FileHash),
+        hash: PathHashMap(network.FileHash) = .empty,
 
         fn deinit(tree: *Tree, allocator: Allocator) void {
             var it = tree.children.valueIterator();
@@ -63,6 +65,7 @@ pub const Database = struct {
             tree.files.deinit(allocator);
             tree.parent.deinit(allocator);
             tree.children.deinit(allocator);
+            tree.top_level_children.deinit(allocator);
             tree.meta.deinit(allocator);
             tree.hash.deinit(allocator);
 
@@ -152,13 +155,7 @@ pub const Database = struct {
             .allocator = allocator,
             .path_arena = .{},
             .scan_arena = .{},
-            .tree = .{
-                .files = .empty,
-                .parent = .empty,
-                .children = .empty,
-                .meta = .empty,
-                .hash = .empty,
-            },
+            .tree = .{},
             .file_id_map = .empty,
             .queued_events = .{ .map = .empty },
             .in_progress_events = .{ .map = .empty },
@@ -392,11 +389,11 @@ pub const LockedDatabase = struct {
             false => try locked.db.tree.hash.ensureUnusedCapacity(locked.db.allocator, 1),
             true => try locked.db.tree.children.ensureUnusedCapacity(locked.db.allocator, 1),
         }
-        const parent_children = if (parent) |p| blk: {
-            const ptr = locked.db.tree.children.getPtr(p).?;
+        const parent_children = blk: {
+            const ptr = if (parent) |p| locked.db.tree.children.getPtr(p).? else &locked.db.tree.top_level_children;
             try ptr.ensureUnusedCapacity(locked.db.allocator, 1);
             break :blk ptr;
-        } else null;
+        };
 
         switch (status) {
             .new => try locked.db.queued_events.map.ensureUnusedCapacity(locked.db.allocator, 1),
@@ -423,7 +420,7 @@ pub const LockedDatabase = struct {
             false => locked.db.tree.hash.putAssumeCapacityNoClobber(path, undefined),
             true => locked.db.tree.children.putAssumeCapacityNoClobber(path, .empty),
         }
-        if (parent_children) |pc| pc.putAssumeCapacityNoClobber(path, {});
+        parent_children.putAssumeCapacityNoClobber(path, {});
         switch (status) {
             .new => locked.queueEventAssumeCapacity(.{ .path = path }, .new),
             .untracked => {},
@@ -502,10 +499,8 @@ pub const LockedDatabase = struct {
         assert(locked.db.tree.meta.remove(path));
         assert(locked.db.tree.hash.remove(path));
         const parent = locked.db.tree.parent.fetchRemove(path).?.value;
-        if (parent) |p| {
-            const parent_children = locked.db.tree.children.getPtr(p).?;
-            assert(parent_children.remove(path));
-        }
+        const parent_children = if (parent) |p| locked.db.tree.children.getPtr(p).? else &locked.db.tree.top_level_children;
+        assert(parent_children.remove(path));
         locked.queueEventAssumeCapacity(.{ .file_id = info.value.global_file_id }, .deleted);
     }
 
@@ -519,10 +514,11 @@ pub const LockedDatabase = struct {
             break :blk info.global_file_id;
         };
 
-        if (locked.db.tree.parent.fetchRemove(path).?.value) |parent| {
-            const parent_children = locked.db.tree.children.getPtr(parent).?;
-            assert(parent_children.remove(path));
-        }
+        const parent_children = if (locked.db.tree.parent.fetchRemove(path).?.value) |parent|
+            locked.db.tree.children.getPtr(parent).?
+        else
+            &locked.db.tree.top_level_children;
+        assert(parent_children.remove(path));
 
         const StackItem = struct {
             path: Path,
