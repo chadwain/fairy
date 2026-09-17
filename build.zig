@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const use_llvm = b.option(bool, "llvm", "Use LLVM") orelse false;
 
     const fairy = b.addModule("fairy", .{
         .root_source_file = b.path("source/fairy.zig"),
@@ -20,7 +21,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "fairy", .module = fairy },
             },
         }),
-        .use_llvm = true,
+        .use_llvm = use_llvm,
     });
     b.installArtifact(test_exe);
 }
