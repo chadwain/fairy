@@ -580,10 +580,11 @@ pub const LockedDatabase = struct {
 
 const scan = struct {
     const Context = struct {
+        // TODO: delete this field
         locked: LockedDatabase,
         arena: *std.heap.ArenaAllocator,
 
-        /// A list of child directories relative to the current directory.
+        /// A stack of names of child directories relative to the current directory.
         /// An empty slice means to pop the current directory off the stack.
         pending_dirs: std.ArrayList([]const u16),
         /// A path to the current directory/file.
@@ -607,7 +608,10 @@ const scan = struct {
         const FileInfo = PathHashMap(struct {
             status: Database.Tree.Status,
             directory: bool,
+            /// Becomes true when the file is seen while scanning.
             already_seen: bool,
+            /// Only used in the second phase of scanning, where unseen files are marked as deleted.
+            already_scanned_for_deletion: bool,
         });
 
         fn init(locked: LockedDatabase, arena: *std.heap.ArenaAllocator) !Context {
@@ -628,6 +632,7 @@ const scan = struct {
                     .status = entry.value_ptr.status,
                     .directory = entry.value_ptr.directory,
                     .already_seen = false,
+                    .already_scanned_for_deletion = false,
                 });
             }
 
@@ -897,14 +902,14 @@ const scan = struct {
             errdefer file_path_allocator.free(path_copy.slice);
 
             gop.key_ptr.* = path_copy;
-            gop.value_ptr.* = .{ .status = undefined, .directory = false, .already_seen = true };
+            gop.value_ptr.* = .{ .status = undefined, .directory = false, .already_seen = true, .already_scanned_for_deletion = false };
 
             const parent = ctx.parent_paths.getLast();
             if (set_to_untracked) {
-                try addFile(ctx, ctx.locked.db.allocator, false, .untracked, path_copy, parent, local_file_id, {});
+                try addFile(ctx, ctx.locked.db.allocator, .regular, .untracked, path_copy, parent, local_file_id, {});
                 gop.value_ptr.status = .untracked;
             } else {
-                try addFile(ctx, ctx.locked.db.allocator, false, .new, path_copy, parent, local_file_id, meta);
+                try addFile(ctx, ctx.locked.db.allocator, .regular, .new, path_copy, parent, local_file_id, meta);
                 gop.value_ptr.status = .new;
             }
         }
@@ -924,16 +929,16 @@ const scan = struct {
 
         const gop = try ctx.file_info.getOrPut(ctx.arena.allocator(), path);
         if (gop.found_existing) {
-            if (gop.value_ptr.already_seen) std.debug.panic("TODO saw file more than once while scanning: {f}", .{path.formatUtf8()});
+            if (gop.value_ptr.already_seen) std.debug.panic("TODO saw directory more than once while scanning: {f}", .{path.formatUtf8()});
             gop.value_ptr.already_seen = true;
             if (!gop.value_ptr.directory) std.debug.panic("TODO a regular file was changed into a directory: {f}", .{path.formatUtf8()});
 
             switch (gop.value_ptr.status) {
                 .new => {
-                    if (set_to_untracked) std.debug.panic("TODO set a new file to untracked: {f}", .{path.formatUtf8()});
+                    if (set_to_untracked) std.debug.panic("TODO set a new directory to untracked: {f}", .{path.formatUtf8()});
                     updateNewFile(ctx, path, local_file_id, meta);
                 },
-                .untracked => std.debug.panic("TODO handle untracked folder: {f}", .{path.formatUtf8()}),
+                .untracked => std.debug.panic("TODO handle untracked directory: {f}", .{path.formatUtf8()}),
                 .tracked => {
                     if (set_to_untracked) std.debug.panic("TODO set a tracked directory to untracked: {f}", .{path.formatUtf8()});
                     updateTrackedDirectoryFile(ctx, path, local_file_id, meta);
@@ -950,31 +955,51 @@ const scan = struct {
             errdefer path_allocator.free(path_copy.slice);
 
             gop.key_ptr.* = path_copy;
-            gop.value_ptr.* = .{ .status = undefined, .directory = true, .already_seen = true };
+            gop.value_ptr.* = .{ .status = undefined, .directory = true, .already_seen = true, .already_scanned_for_deletion = false };
 
             const parent = ctx.parent_paths.getLast();
             if (set_to_untracked) {
-                std.debug.panic("TODO handle untracked folder: {f}", .{path.formatUtf8()});
+                std.debug.panic("TODO handle untracked directory: {f}", .{path.formatUtf8()});
             } else {
-                try addFile(ctx, ctx.locked.db.allocator, true, .new, path_copy, parent, local_file_id, meta);
+                try addFile(ctx, ctx.locked.db.allocator, .directory, .new, path_copy, parent, local_file_id, meta);
                 gop.value_ptr.status = .new;
             }
         }
     }
 
     fn deleteUnseenFiles(ctx: *Context) !void {
-        var it = ctx.file_info.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.already_seen) continue;
-            const path = entry.key_ptr.*;
-            switch (entry.value_ptr.status) {
-                .new => std.debug.panic("TODO delete a new file: {f}", .{path.formatUtf8()}),
-                .tracked => switch (entry.value_ptr.directory) {
-                    false => try deleteTrackedRegularFile(ctx, ctx.locked.db.allocator, path),
-                    // TODO: try deleteTrackedDirectoryFile(ctx, ctx.locked.db.allocator, path),
-                    true => std.debug.panic("TODO delete a tracked directory: {f}", .{path.formatUtf8()}),
-                },
-                .untracked => std.debug.panic("TODO delete an untracked file: {f}", .{path.formatUtf8()}),
+        var stack: [fairy.max_path_components]Path = undefined;
+        var stack_len: fairy.PathComponentCount = 0;
+        while (true) {
+            const children = if (stack_len == 0) ctx.tree.top_level_children else ctx.tree.children.get(stack[stack_len - 1]).?;
+            var it = children.keyIterator();
+            // TODO: O(N^2) loop
+            while (it.next()) |child| {
+                const file_info = ctx.file_info.getPtr(child.*).?;
+                if (file_info.already_scanned_for_deletion) continue;
+                file_info.already_scanned_for_deletion = true;
+
+                if (file_info.already_seen) {
+                    if (file_info.directory and stack_len < fairy.max_path_components) {
+                        stack[stack_len] = child.*;
+                        stack_len += 1;
+                    }
+                } else {
+                    switch (file_info.status) {
+                        .new => std.debug.panic("TODO delete a new file: {f}", .{child.formatUtf8()}),
+                        .tracked => switch (file_info.directory) {
+                            false => try deleteTrackedRegularFile(ctx, ctx.locked.db.allocator, child.*),
+                            // TODO: try deleteTrackedDirectoryFile(ctx, ctx.locked.db.allocator, path),
+                            true => std.debug.panic("TODO delete a tracked directory: {f}", .{child.formatUtf8()}),
+                        },
+                        .untracked => std.debug.panic("TODO delete an untracked file: {f}", .{child.formatUtf8()}),
+                    }
+                }
+                break;
+            } else {
+                if (stack_len == 0) break;
+                stack[stack_len - 1] = undefined;
+                stack_len -= 1;
             }
         }
     }
@@ -992,10 +1017,12 @@ const scan = struct {
         gop.value_ptr.* = event;
     }
 
+    const FileKind = enum { regular, directory };
+
     fn addFile(
         ctx: *Context,
         allocator: Allocator,
-        directory: bool,
+        kind: FileKind,
         comptime status: Database.Tree.Status,
         path: Path,
         parent: ?Path,
@@ -1009,9 +1036,9 @@ const scan = struct {
         try ctx.tree.files.ensureUnusedCapacity(allocator, 1);
         try ctx.tree.parent.ensureUnusedCapacity(allocator, 1);
         try ctx.tree.meta.ensureUnusedCapacity(allocator, 1);
-        switch (directory) {
-            false => try ctx.tree.hash.ensureUnusedCapacity(allocator, 1),
-            true => try ctx.tree.children.ensureUnusedCapacity(allocator, 1),
+        switch (kind) {
+            .regular => try ctx.tree.hash.ensureUnusedCapacity(allocator, 1),
+            .directory => try ctx.tree.children.ensureUnusedCapacity(allocator, 1),
         }
         const parent_children = blk: {
             const ptr = if (parent) |p| ctx.tree.children.getPtr(p).? else &ctx.tree.top_level_children;
@@ -1029,7 +1056,10 @@ const scan = struct {
         const gop = ctx.tree.files.getOrPutAssumeCapacity(path);
         if (gop.found_existing) std.debug.panic("TODO addFile file already exists", .{});
         gop.value_ptr.* = .{
-            .directory = directory,
+            .directory = switch (kind) {
+                .regular => false,
+                .directory => true,
+            },
             .status = status,
             .local_file_id = local_file_id,
             .global_file_id = .unknown,
@@ -1040,9 +1070,9 @@ const scan = struct {
             .untracked => undefined,
             .tracked => comptime unreachable,
         });
-        switch (directory) {
-            false => ctx.tree.hash.putAssumeCapacityNoClobber(path, undefined),
-            true => ctx.tree.children.putAssumeCapacityNoClobber(path, .empty),
+        switch (kind) {
+            .regular => ctx.tree.hash.putAssumeCapacityNoClobber(path, undefined),
+            .directory => ctx.tree.children.putAssumeCapacityNoClobber(path, .empty),
         }
         parent_children.putAssumeCapacityNoClobber(path, {});
         switch (status) {
