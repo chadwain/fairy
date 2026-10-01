@@ -15,6 +15,8 @@ const PathArrayHashMap = fairy.windows.PathArrayHashMap;
 
 const cpu_endian = @import("builtin").cpu.arch.endian();
 
+// TODO: Stop using std.fs.path.ComponentIterator, because it assumes Win32 paths, but fairy.windows.Path is not neccessarily so.
+
 pub const Database = struct {
     sync_dir: w.HANDLE,
     alert: std.atomic.Value(Alert),
@@ -280,6 +282,7 @@ pub const Database = struct {
             db.debug.log("putting event {s} in progress for {f}", .{ @tagName(kv.value), kv.key });
             gop.value_ptr.* = kv.value;
 
+            // TODO: All of the assertions on `info.status` are possibly unsound
             switch (kv.value) {
                 .new => {
                     const path = switch (kv.key) {
@@ -416,7 +419,7 @@ pub const LockedDatabase = struct {
     }
 
     // called from Host
-    fn setNewFileId(locked: LockedDatabase, path: Path, kind: network.FileKind, reverse_file_id_list: []const network.FileId, io: Io) !void {
+    fn setNewFileId(locked: LockedDatabase, path: Path, kind: network.FileKind, file_id_list: []const network.FileId, io: Io) !void {
         assert(locked.db.in_progress_events.map.fetchSwapRemove(.{ .path = path }).?.value == .new);
 
         const info = locked.db.tree.files.getPtr(path) orelse
@@ -431,7 +434,8 @@ pub const LockedDatabase = struct {
             .directory => if (!info.directory) std.debug.panic("TODO", .{}),
         }
 
-        try locked.db.file_id_map.ensureUnusedCapacity(locked.db.allocator, @as(fairy.PathComponentCount, @intCast(reverse_file_id_list.len)));
+        const component_count: fairy.PathComponentCount = @intCast(file_id_list.len);
+        try locked.db.file_id_map.ensureUnusedCapacity(locked.db.allocator, component_count);
         try locked.db.queued_events.map.ensureUnusedCapacity(locked.db.allocator, 1);
 
         // TODO: do not compute the hash right now
@@ -447,15 +451,18 @@ pub const LockedDatabase = struct {
         // Walk up the tree and set global file IDs for every path encountered
         const Iterator = std.fs.path.ComponentIterator(.windows, u16);
         var it = Iterator.init(path.slice);
-        var i: fairy.PathComponentCount = 0;
-        while (if (i == 0) it.last() else it.previous()) |component| : (i += 1) {
-            const file_id = reverse_file_id_list[i];
+        var i = component_count;
+        while (if (i == component_count) it.last() else it.previous()) |component| : (i -= 1) {
+            const file_id = file_id_list[i - 1];
+            // `.?` assertion is valid because of an above check
             const path_info = locked.db.tree.files.getEntry(.assumeValidPath(component.path)).?;
             // TODO: switch (path_info.value_ptr.status) { ... }
+            // TODO: switch (path_info.value_ptr.directory) { ... }
             switch (path_info.value_ptr.global_file_id) {
                 .unknown => {
                     // NOTE: This is an instance where a `.new` file may have a global file ID that is not `.unknown`.
                     path_info.value_ptr.global_file_id = file_id;
+                    // TODO: No clobber can't be assumed because the server could have returned a wrong result
                     locked.db.file_id_map.putAssumeCapacityNoClobber(file_id, path_info.key_ptr.*);
                     locked.db.debug.log("mapped {f} to {f}", .{ file_id, path_info.key_ptr.formatUtf8() });
                 },
@@ -470,11 +477,11 @@ pub const LockedDatabase = struct {
                 },
             }
         }
-        assert(i == reverse_file_id_list.len);
+        assert(i == 0);
 
         info.status = .tracked;
         if (!info.directory) locked.db.tree.hash.getPtr(path).?.* = hash;
-        locked.queueEventAssumeCapacity(.{ .file_id = reverse_file_id_list[0] }, if (info.directory) .create_dir else .modified);
+        locked.queueEventAssumeCapacity(.{ .file_id = file_id_list[component_count - 1] }, if (info.directory) .create_dir else .modified);
         locked.db.sendAlert(io);
     }
 

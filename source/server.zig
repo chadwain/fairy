@@ -786,8 +786,8 @@ pub const TxData = union(enum) {
                     try writer.sendMessageHeaderNewTxReply(outgoing_tx_id, peer_tx_id);
                     try writer.sendAction(action);
                     try writer.sendResolvePathResponse(.success);
-                    for (reversed_file_id_path) |sub_file_id| {
-                        try writer.sendFileId(sub_file_id);
+                    for (0..reversed_file_id_path.len) |index| {
+                        try writer.sendFileId(reversed_file_id_path[reversed_file_id_path.len - 1 - index]);
                     }
                 },
                 .invalid_path,

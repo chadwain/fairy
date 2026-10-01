@@ -46,7 +46,7 @@ pub const Action = enum(u8) {
     resolve_path,
     /// Sent in response to a `resolve_path` message.
     /// Payload: A `ResolvePathResponse`
-    /// Payload(success): A sequence of `FileId`, one for each component of the requested path, in REVERSE order.
+    /// Payload(success): A sequence of `FileId`, one for each component of the requested path.
     resolve_path_response,
 
     transfer_file_id,
