@@ -15,7 +15,7 @@ const PathArrayHashMap = fairy.windows.PathArrayHashMap;
 
 const cpu_endian = @import("builtin").cpu.arch.endian();
 
-// TODO: Stop using std.fs.path.ComponentIterator, because it assumes Win32 paths, but fairy.windows.Path is not neccessarily so.
+// TODO: Stop using std.fs.path.ComponentIterator, because it assumes Win32 paths, but fairy.windows.Path is not necessarily so.
 
 pub const Database = struct {
     sync_dir: w.HANDLE,
@@ -27,11 +27,8 @@ pub const Database = struct {
     allocator: Allocator,
     path_arena: std.heap.ArenaAllocator.State,
     scan_arena: std.heap.ArenaAllocator.State,
-    tree: Tree,
-    file_id_map: std.AutoHashMapUnmanaged(network.FileId, Path),
-    /// The database periodically checks this map for new events and tries to move them to "in progress".
-    queued_events: Event.Map,
-    in_progress_events: Event.Map,
+    local_fs: LocalFilesystem,
+    global_fs: GlobalFilesystem,
 
     // End fields protected by mutex
 
@@ -44,149 +41,6 @@ pub const Database = struct {
     debug: Debug,
 
     pub const Alert = enum(u32) { off, on };
-
-    /// A re-representation of the contents of the sync directory.
-    pub const Tree = struct {
-        files: PathHashMap(Info) = .empty,
-        /// Applies to all files
-        parent: PathHashMap(?Path) = .empty,
-        /// Applies only to directories
-        children: PathHashMap(PathHashMap(void)) = .empty,
-        /// The direct children of the sync directory.
-        top_level_children: PathHashMap(void) = .empty,
-        /// Applies only to regular files
-        meta: PathHashMap(Metadata) = .empty,
-        /// Applies only to regular files
-        // TODO: Make the hash nullable, do not compute it until the file is being synced
-        hash: PathHashMap(network.FileHash) = .empty,
-
-        fn deinit(tree: *Tree, allocator: Allocator) void {
-            var it = tree.children.valueIterator();
-            while (it.next()) |list| list.deinit(allocator);
-
-            tree.files.deinit(allocator);
-            tree.parent.deinit(allocator);
-            tree.children.deinit(allocator);
-            tree.top_level_children.deinit(allocator);
-            tree.meta.deinit(allocator);
-            tree.hash.deinit(allocator);
-
-            tree.* = undefined;
-        }
-
-        fn clone(tree: *const Tree, allocator: Allocator) !Tree {
-            var count: u64 = 0;
-            var children = try tree.children.clone(allocator);
-            errdefer {
-                var it = children.valueIterator();
-                while (count > 0) : (count -= 1) {
-                    const entry = it.next().?;
-                    entry.deinit(allocator);
-                }
-                children.deinit(allocator);
-            }
-            {
-                var it = tree.children.valueIterator();
-                while (it.next()) |entry| : (count += 1) {
-                    const list = try entry.clone(allocator);
-                    entry.* = list;
-                }
-            }
-
-            var files = try tree.files.clone(allocator);
-            errdefer files.deinit(allocator);
-
-            var parent = try tree.parent.clone(allocator);
-            errdefer parent.deinit(allocator);
-
-            var top_level_children = try tree.top_level_children.clone(allocator);
-            errdefer top_level_children.deinit(allocator);
-
-            var meta = try tree.meta.clone(allocator);
-            errdefer meta.deinit(allocator);
-
-            var hash = try tree.hash.clone(allocator);
-            errdefer hash.deinit(allocator);
-
-            return .{
-                .files = files,
-                .parent = parent,
-                .children = children,
-                .top_level_children = top_level_children,
-                .meta = meta,
-                .hash = hash,
-            };
-        }
-
-        pub const Info = struct {
-            directory: bool,
-            status: Status,
-            local_file_id: w.LARGE_INTEGER,
-            global_file_id: network.FileId,
-        };
-
-        pub const Status = enum {
-            /// A file which was previously untracked and is now known to exist.
-            ///
-            /// global_file_id may be `.unknown`
-            /// hash is undefined
-            new,
-            /// A file which is being tracked.
-            tracked,
-            /// A file whose existence is known, but will not be synced to the server for one or more reasons.
-            ///
-            /// global_file_id is `.unknown`
-            /// meta is undefined
-            /// hash is undefined
-            untracked,
-        };
-
-        pub const Metadata = struct {
-            modified_time: w.LARGE_INTEGER,
-            size: w.ULARGE_INTEGER,
-        };
-    };
-
-    // TODO: an event cancellation system
-    pub const Event = enum {
-        new,
-        modified,
-        create_dir,
-        deleted,
-
-        pub const Map = struct {
-            map: std.ArrayHashMapUnmanaged(Key, Event, Context, true),
-
-            pub const Key = union(enum) {
-                path: Path,
-                file_id: network.FileId,
-
-                pub fn format(key: Key, writer: *Io.Writer) Io.Writer.Error!void {
-                    switch (key) {
-                        .path => |path| try writer.print("{f}", .{path.formatUtf8()}),
-                        .file_id => |file_id| try writer.print("{f}", .{file_id}),
-                    }
-                }
-            };
-
-            pub const Context = struct {
-                pub fn hash(_: @This(), key: Key) u32 {
-                    switch (key) {
-                        .path => |path| return path.hash(),
-                        .file_id => |file_id| return std.hash.int(@intFromEnum(file_id)),
-                    }
-                }
-
-                pub fn eql(_: @This(), a: Key, b: Key, _: usize) bool {
-                    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-                    switch (a) {
-                        .path => return Path.eql(a.path, b.path),
-                        .file_id => return a.file_id == b.file_id,
-                    }
-                }
-            };
-        };
-    };
 
     pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator, debug: Debug) !Database {
         // TODO: The length of this path must also be factored into path length calculations.
@@ -202,10 +56,8 @@ pub const Database = struct {
             .allocator = allocator,
             .path_arena = .{},
             .scan_arena = .{},
-            .tree = .{},
-            .file_id_map = .empty,
-            .queued_events = .{ .map = .empty },
-            .in_progress_events = .{ .map = .empty },
+            .local_fs = .{},
+            .global_fs = .{},
 
             .host_state = .init(.{}),
             .out_path = undefined,
@@ -224,10 +76,8 @@ pub const Database = struct {
         var scan_arena = db.scan_arena.promote(db.allocator);
         scan_arena.deinit();
 
-        db.tree.deinit(db.allocator);
-        db.file_id_map.deinit(db.allocator);
-        db.queued_events.map.deinit(db.allocator);
-        db.in_progress_events.map.deinit(db.allocator);
+        db.local_fs.deinit(db.allocator);
+        db.global_fs.deinit(db.allocator);
 
         db.* = undefined;
     }
@@ -237,7 +87,7 @@ pub const Database = struct {
         var stderr = Io.File.stderr().writer(io, &.{});
 
         const clock: Io.Clock = .boot;
-        const max_wait_time = Io.Clock.Duration{ .raw = .fromSeconds(8), .clock = clock };
+        const max_wait_time = Io.Clock.Duration{ .raw = .fromSeconds(15), .clock = clock };
         var next_scan_time = Io.Clock.Timestamp.now(io, clock); // First scan happens immediately
 
         while (true) {
@@ -264,83 +114,60 @@ pub const Database = struct {
     }
 
     /// Returns true if an event was sent.
-    fn sendHostEvents(db: *Database, io: Io) (Allocator.Error || Io.Cancelable)!bool {
-        const host_event: Host.State.Event = blk: {
+    fn sendHostEvents(db: *Database, io: Io) Io.Cancelable!bool {
+        const local_event: LocalFilesystem.Event, const file_id: ?network.FileId = blk: {
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
-            if (db.queued_events.map.count() == 0) return false;
-            try db.in_progress_events.map.ensureUnusedCapacity(db.allocator, 1);
-            db.acquireHostEvent() orelse return false;
-            errdefer comptime unreachable;
+            if (db.global_fs.event_in_progress) return false;
+            const events = db.local_fs.events.items;
+            if (events.len == 0) return false;
+            const event = events[0];
+            const file_id = db.global_fs.path_to_id.get(event.path);
+            break :blk .{ event, file_id };
+        };
 
-            const kv = db.queued_events.map.pop().?;
-            const gop = db.in_progress_events.map.getOrPutAssumeCapacity(kv.key);
-            if (gop.found_existing) {
-                std.debug.panic("TODO: event {s} already in progress for {f}", .{ @tagName(gop.value_ptr.*), kv.key });
-            }
-            db.debug.log("putting event {s} in progress for {f}", .{ @tagName(kv.value), kv.key });
-            gop.value_ptr.* = kv.value;
+        db.acquireHostEvent() orelse return false;
+        errdefer comptime unreachable;
 
-            // TODO: All of the assertions on `info.status` are possibly unsound
-            switch (kv.value) {
-                .new => {
-                    const path = switch (kv.key) {
-                        .file_id => unreachable,
-                        .path => |path| path,
-                    };
-                    const info = db.tree.files.get(path).?;
-                    switch (info.status) {
-                        .new => {},
-                        .tracked, .untracked => unreachable,
-                    }
-                    db.out_path = path;
-                    db.out_directory = info.directory;
+        const host_event: Host.State.Event = blk: {
+            switch (local_event.action) {
+                .new_regular => {
+                    db.out_path = local_event.path;
+                    db.out_directory = false;
                     break :blk .get_global_file_id;
                 },
-                .modified => {
-                    const file_id = switch (kv.key) {
-                        .file_id => |file_id| file_id,
-                        .path => unreachable,
-                    };
-                    const path = db.file_id_map.get(file_id).?;
-                    const info = db.tree.files.get(path).?;
-                    switch (info.status) {
-                        .tracked => {},
-                        .new, .untracked => unreachable,
-                    }
-                    db.out_file_id = info.global_file_id;
-                    db.out_path = path;
+                .new_directory => {
+                    db.out_path = local_event.path;
+                    db.out_directory = true;
+                    break :blk .get_global_file_id;
+                },
+                .modified_regular => {
+                    db.out_file_id = file_id.?;
+                    // TODO: It should not be necessary to set the path for this event
+                    db.out_path = local_event.path;
                     break :blk .sync_file;
                 },
                 .create_dir => {
-                    const file_id = switch (kv.key) {
-                        .file_id => |file_id| file_id,
-                        .path => unreachable,
-                    };
-                    const path = db.file_id_map.get(file_id).?;
-                    const info = db.tree.files.get(path).?;
-                    switch (info.status) {
-                        .tracked => {},
-                        .new, .untracked => unreachable,
-                    }
-                    db.out_file_id = info.global_file_id;
-                    db.out_path = path;
+                    db.out_file_id = file_id.?;
+                    // TODO: It should not be necessary to set the path for this event
+                    db.out_path = local_event.path;
                     break :blk .create_dir;
                 },
-                .deleted => {
-                    const file_id = switch (kv.key) {
-                        .file_id => |file_id| file_id,
-                        .path => unreachable,
-                    };
-                    const path = db.file_id_map.get(file_id).?;
-                    db.out_file_id = file_id;
-                    db.out_path = path;
+                .delete_regular => {
+                    db.out_file_id = file_id.?;
+                    // TODO: It should not be necessary to set the path for this event
+                    db.out_path = local_event.path;
                     break :blk .delete_file;
+                },
+                .delete_directory => {
+                    std.debug.panic("TODO: Handle the '{s}' local filesystem event", .{@tagName(local_event.action)});
                 },
             }
         };
 
+        db.debug.log("(local event) action: {s}, path: {f}", .{ @tagName(local_event.action), local_event.path.formatUtf8() });
+        db.global_fs.event_in_progress = true;
         db.releaseHostEvent(host_event);
         io.futexWake(Host.State, &db.host_state.raw, 1);
         return true;
@@ -392,6 +219,149 @@ pub const Database = struct {
     };
 };
 
+pub const LocalFilesystem = struct {
+    repr: Repr = .{},
+    events: std.ArrayList(Event) = .empty,
+
+    /// A representation of the contents of the sync directory.
+    pub const Repr = struct {
+        files: PathHashMap(Info) = .empty,
+        /// Applies to all files
+        parent: PathHashMap(?Path) = .empty,
+        /// Applies only to directories
+        children: PathHashMap(PathHashMap(void)) = .empty,
+        /// The direct children of the sync directory.
+        top_level_children: PathHashMap(void) = .empty,
+        /// Applies to all files
+        meta: PathHashMap(Metadata) = .empty,
+        /// Applies only to regular files
+        // TODO: Make the hash nullable, do not compute it until the file is being synced
+        hash: PathHashMap(network.FileHash) = .empty,
+
+        fn deinit(repr: *Repr, allocator: Allocator) void {
+            var it = repr.children.valueIterator();
+            while (it.next()) |list| list.deinit(allocator);
+
+            repr.files.deinit(allocator);
+            repr.parent.deinit(allocator);
+            repr.children.deinit(allocator);
+            repr.top_level_children.deinit(allocator);
+            repr.meta.deinit(allocator);
+            repr.hash.deinit(allocator);
+
+            repr.* = undefined;
+        }
+
+        pub const Info = struct {
+            directory: bool,
+            status: Status,
+            local_file_id: w.LARGE_INTEGER,
+            // TODO delete this field
+            global_file_id: network.FileId,
+        };
+
+        pub const Status = enum {
+            /// A file which was previously untracked and is now known to exist.
+            ///
+            /// global_file_id may be `.unknown`
+            /// hash is undefined
+
+            // TODO delete this field
+            new,
+            /// A file which is being tracked.
+            tracked,
+            /// A file whose existence is known, but will not be synced to the server for one or more reasons.
+            ///
+            /// global_file_id is `.unknown`
+            /// meta is undefined
+            /// hash is undefined
+            untracked,
+        };
+
+        pub const Metadata = struct {
+            modified_time: w.LARGE_INTEGER,
+            size: w.ULARGE_INTEGER,
+        };
+    };
+
+    pub const Event = struct {
+        action: Action,
+        path: Path,
+
+        pub const Action = enum {
+            new_regular,
+            new_directory,
+            delete_regular,
+            delete_directory,
+            modified_regular,
+
+            // TODO: Temporary workaround, delete this field
+            create_dir,
+        };
+    };
+
+    pub fn deinit(local_fs: *LocalFilesystem, allocator: Allocator) void {
+        local_fs.repr.deinit(allocator);
+        local_fs.events.deinit(allocator);
+    }
+
+    fn ensureEventCapacity(local_fs: *LocalFilesystem, allocator: Allocator) !void {
+        try local_fs.events.ensureUnusedCapacity(allocator, 1);
+    }
+
+    fn queueEventAssumeCapacity(local_fs: *LocalFilesystem, action: LocalFilesystem.Event.Action, path: Path) void {
+        local_fs.events.appendAssumeCapacity(.{ .action = action, .path = path });
+    }
+};
+
+pub const GlobalFilesystem = struct {
+    // An entry in this map implies the existence of a corresponding entry in `path_to_id`.
+    files: std.AutoHashMapUnmanaged(network.FileId, FileInfo) = .empty,
+    path_to_id: PathHashMap(network.FileId) = .empty,
+    event_in_progress: bool = false,
+    // event: ?Event = null,
+
+    pub const FileInfo = struct {
+        directory: bool,
+        path: Path,
+    };
+
+    fn deleteRegularFile(global_fs: *GlobalFilesystem, file_id: network.FileId) void {
+        const info = global_fs.files.fetchRemove(file_id).?;
+        assert(!info.value.directory);
+        assert(global_fs.path_to_id.remove(info.value.path));
+    }
+
+    pub const Event = struct {
+        action: Action,
+        target: Target,
+
+        pub const Action = enum {
+            new,
+            modified,
+            create_dir,
+            deleted,
+        };
+
+        pub const Target = union(enum) {
+            path: Path,
+            file_id: network.FileId,
+
+            pub fn format(target: Target, writer: *Io.Writer) Io.Writer.Error!void {
+                switch (target) {
+                    .path => |path| try writer.print("{f}", .{path.formatUtf8()}),
+                    .file_id => |file_id| try writer.print("{f}", .{file_id}),
+                }
+            }
+        };
+    };
+
+    pub fn deinit(global_fs: *GlobalFilesystem, allocator: Allocator) void {
+        global_fs.files.deinit(allocator);
+        global_fs.path_to_id.deinit(allocator);
+    }
+};
+
 pub const LockedDatabase = struct {
     db: *Database,
     debug: Debug = .{},
@@ -406,99 +376,104 @@ pub const LockedDatabase = struct {
         locked.db.sendAlert(io);
     }
 
-    // TODO: Delete this; it's duplicated in scan.Context
-    fn queueEventAssumeCapacity(
-        locked: LockedDatabase,
-        key: Database.Event.Map.Key,
-        event: Database.Event,
-    ) void {
-        locked.db.debug.log("queueing event {s} for {f}", .{ @tagName(event), key });
-        const gop = locked.db.queued_events.map.getOrPutAssumeCapacity(key);
-        if (gop.found_existing) std.debug.panic("TODO: event {s} already queued for {f}", .{ @tagName(gop.value_ptr.*), key });
-        gop.value_ptr.* = event;
+    fn finishLocalEventWithPath(locked: LockedDatabase, action: LocalFilesystem.Event.Action, path: Path) void {
+        const event = locked.db.local_fs.events.orderedRemove(0);
+        assert(event.action == action);
+        assert(event.path.eql(path));
+        locked.db.global_fs.event_in_progress = false;
+    }
+
+    fn finishLocalEventWithFileId(locked: LockedDatabase, action: LocalFilesystem.Event.Action, file_id: network.FileId) void {
+        const path = locked.db.global_fs.files.get(file_id).?.path;
+        const event = locked.db.local_fs.events.orderedRemove(0);
+        assert(event.action == action);
+        assert(event.path.eql(path));
+        locked.db.global_fs.event_in_progress = false;
     }
 
     // called from Host
-    fn setNewFileId(locked: LockedDatabase, path: Path, kind: network.FileKind, file_id_list: []const network.FileId, io: Io) !void {
-        assert(locked.db.in_progress_events.map.fetchSwapRemove(.{ .path = path }).?.value == .new);
-
-        const info = locked.db.tree.files.getPtr(path) orelse
-            std.debug.panic("received file id for unknown file: {f}", .{path.formatUtf8()});
-        // TODO make sure this is actually the same file that the event was created for
-        switch (info.status) {
-            .new => {},
-            .tracked, .untracked => std.debug.panic("TODO: handle new file id for non-new file", .{}),
-        }
-        switch (kind) {
-            .regular => if (info.directory) std.debug.panic("TODO", .{}),
-            .directory => if (!info.directory) std.debug.panic("TODO", .{}),
-        }
+    fn setNewFileId(locked: LockedDatabase, path: Path, kind: network.FileKind, file_id_list: []const network.FileId) !void {
+        assert(file_id_list.len > 0);
+        locked.finishLocalEventWithPath(switch (kind) {
+            .directory => .new_directory,
+            .regular => .new_regular,
+        }, path);
 
         const component_count: fairy.PathComponentCount = @intCast(file_id_list.len);
-        try locked.db.file_id_map.ensureUnusedCapacity(locked.db.allocator, component_count);
-        try locked.db.queued_events.map.ensureUnusedCapacity(locked.db.allocator, 1);
+        try locked.db.global_fs.files.ensureUnusedCapacity(locked.db.allocator, component_count);
+        try locked.db.global_fs.path_to_id.ensureUnusedCapacity(locked.db.allocator, component_count);
+        // TODO: We should not be using the local event queue for this
+        try locked.db.local_fs.ensureEventCapacity(locked.db.allocator);
 
         // TODO: do not compute the hash right now
-        const hash = if (!info.directory) blk: {
-            const file = try fairy.windows.openFile(locked.db.sync_dir, path, .read);
-            defer fairy.windows.closeHandle(file);
-            const file_size = try getFileSize(file);
-            break :blk try computeFileHash(file, file_size);
-        } else undefined;
+        const hash = switch (kind) {
+            .directory => undefined,
+            .regular => blk: {
+                const file = try fairy.windows.openFile(locked.db.sync_dir, path, .read);
+                defer fairy.windows.closeHandle(file);
+                const file_size = try getFileSize(file);
+                break :blk try computeFileHash(file, file_size);
+            },
+        };
 
         errdefer comptime unreachable;
 
-        // Walk up the tree and set global file IDs for every path encountered
         const Iterator = std.fs.path.ComponentIterator(.windows, u16);
         var it = Iterator.init(path.slice);
-        var i = component_count;
-        while (if (i == component_count) it.last() else it.previous()) |component| : (i -= 1) {
-            const file_id = file_id_list[i - 1];
-            // `.?` assertion is valid because of an above check
-            const path_info = locked.db.tree.files.getEntry(.assumeValidPath(component.path)).?;
-            // TODO: switch (path_info.value_ptr.status) { ... }
-            // TODO: switch (path_info.value_ptr.directory) { ... }
-            switch (path_info.value_ptr.global_file_id) {
-                .unknown => {
-                    // NOTE: This is an instance where a `.new` file may have a global file ID that is not `.unknown`.
-                    path_info.value_ptr.global_file_id = file_id;
-                    // TODO: No clobber can't be assumed because the server could have returned a wrong result
-                    locked.db.file_id_map.putAssumeCapacityNoClobber(file_id, path_info.key_ptr.*);
-                    locked.db.debug.log("mapped {f} to {f}", .{ file_id, path_info.key_ptr.formatUtf8() });
-                },
-                _ => {
-                    if (path_info.value_ptr.global_file_id != file_id) {
-                        std.debug.panic(
-                            "TODO client/server conflict detected: {f} has client id {} and server id {}",
-                            .{ path_info.key_ptr.formatUtf8(), path_info.value_ptr.global_file_id, file_id },
-                        );
-                    }
-                    // TODO: break here?
-                },
+
+        for (file_id_list, 0..) |file_id, index| {
+            const component = it.next().?;
+            const component_as_path = Path.assumeValidPath(component.path);
+            const gop = locked.db.global_fs.files.getOrPutAssumeCapacity(file_id);
+            if (gop.found_existing) {
+                if (index < file_id_list.len - 1 and !gop.value_ptr.directory) std.debug.panic(
+                    "TODO client/server conflict: {f}: client says regular file, server says directory",
+                    .{file_id},
+                );
+                if (!gop.value_ptr.path.eql(component_as_path)) std.debug.panic(
+                    "TODO client/server conflict: {f}: client path '{f}', server path '{f}'",
+                    .{ file_id, gop.value_ptr.path.formatUtf8(), component_as_path.formatUtf8() },
+                );
+            } else {
+                if (index != file_id_list.len - 1) {
+                    // TODO This assumes that new file events are always handled in order from shallow to deep directories.
+                    std.debug.panic("TODO", .{});
+                }
+                gop.value_ptr.* = .{
+                    .directory = switch (kind) {
+                        .directory => true,
+                        .regular => false,
+                    },
+                    .path = path,
+                };
+                locked.db.global_fs.path_to_id.putAssumeCapacity(path, file_id);
             }
         }
-        assert(i == 0);
+        assert(it.peekNext() == null);
 
-        info.status = .tracked;
-        if (!info.directory) locked.db.tree.hash.getPtr(path).?.* = hash;
-        locked.queueEventAssumeCapacity(.{ .file_id = file_id_list[component_count - 1] }, if (info.directory) .create_dir else .modified);
-        locked.db.sendAlert(io);
+        // TODO: We should not be using the local event queue for this
+        {
+            const info = locked.db.local_fs.repr.files.getPtr(path) orelse std.debug.panic("TODO", .{});
+            info.status = .tracked;
+            if (!info.directory) locked.db.local_fs.repr.hash.getPtr(path).?.* = hash;
+            locked.db.local_fs.queueEventAssumeCapacity(if (info.directory) .create_dir else .modified_regular, path);
+        }
     }
 
     // called from Host
     fn confirmDeleteFile(locked: LockedDatabase, file_id: network.FileId) void {
-        assert(locked.db.in_progress_events.map.fetchSwapRemove(.{ .file_id = file_id }).?.value == .deleted);
-        assert(locked.db.file_id_map.remove(file_id));
+        locked.finishLocalEventWithFileId(.delete_regular, file_id);
+        locked.db.global_fs.deleteRegularFile(file_id);
     }
 
     // called from Host
     fn markFileAsSynced(locked: LockedDatabase, file_id: network.FileId) void {
-        assert(locked.db.in_progress_events.map.fetchSwapRemove(.{ .file_id = file_id }).?.value == .modified);
+        locked.finishLocalEventWithFileId(.modified_regular, file_id);
     }
 
     // called from Host
     fn acknowledgeCreateDir(locked: LockedDatabase, file_id: network.FileId) void {
-        assert(locked.db.in_progress_events.map.fetchSwapRemove(.{ .file_id = file_id }).?.value == .create_dir);
+        locked.finishLocalEventWithFileId(.create_dir, file_id);
     }
 
     pub const Debug = struct {
@@ -506,32 +481,32 @@ pub const LockedDatabase = struct {
             const locked: *const LockedDatabase = @alignCast(@fieldParentPtr("debug", debug));
 
             try writer.writeAll("Tracked files\n");
-            var it = locked.db.tree.files.iterator();
+            var it = locked.db.local_fs.repr.files.iterator();
             while (it.next()) |entry| {
                 switch (entry.value_ptr.status) {
                     .tracked => {},
                     .new, .untracked => continue,
                 }
-                const meta = locked.db.tree.meta.get(entry.key_ptr.*).?;
+                const meta = locked.db.local_fs.repr.meta.get(entry.key_ptr.*).?;
                 try writer.print(
                     "{f}: modified({}) size({}) hash({?f})\n",
                     .{
                         entry.key_ptr.formatUtf8(),
                         meta.modified_time,
                         meta.size,
-                        locked.db.tree.hash.get(entry.key_ptr.*),
+                        locked.db.local_fs.repr.hash.get(entry.key_ptr.*),
                     },
                 );
             }
 
             try writer.writeAll("New files\n");
-            it = locked.db.tree.files.iterator();
+            it = locked.db.local_fs.repr.files.iterator();
             while (it.next()) |entry| {
                 switch (entry.value_ptr.status) {
                     .new => {},
                     .tracked, .untracked => continue,
                 }
-                const meta = locked.db.tree.meta.get(entry.key_ptr.*).?;
+                const meta = locked.db.local_fs.repr.meta.get(entry.key_ptr.*).?;
                 try writer.print(
                     "{f}: modified({}) size({})\n",
                     .{
@@ -543,7 +518,7 @@ pub const LockedDatabase = struct {
             }
 
             try writer.writeAll("\nUntracked files\n");
-            it = locked.db.tree.files.iterator();
+            it = locked.db.local_fs.repr.files.iterator();
             while (it.next()) |entry| {
                 switch (entry.value_ptr.status) {
                     .new, .tracked => continue,
@@ -558,27 +533,17 @@ pub const LockedDatabase = struct {
         pub fn printFileEvents(debug: *const Debug, writer: *Io.Writer) !void {
             const locked: *const LockedDatabase = @alignCast(@fieldParentPtr("debug", debug));
 
-            inline for (&[_]struct { Database.Event, []const u8 }{
-                .{ .new, "Locally new files:\n" },
-                .{ .modified, "Locally modified files:\n" },
-                .{ .deleted, "Locally deleted files:\n" },
+            inline for (&[_]struct { []const LocalFilesystem.Event.Action, []const u8 }{
+                .{ &.{ .new_regular, .new_directory }, "Locally new files:\n" },
+                .{ &.{.modified_regular}, "Locally modified files:\n" },
+                .{ &.{ .delete_regular, .delete_directory }, "Locally deleted files:\n" },
             }) |item| {
-                const status, const text = item;
+                const actions, const text = item;
                 try writer.writeAll(text);
 
-                inline for (.{
-                    .{ "queued_events", "Q" },
-                    .{ "in_progress_events", "P" },
-                }) |item2| {
-                    const field_name, const symbol = item2;
-                    var it = @field(locked.db, field_name).map.iterator();
-                    while (it.next()) |entry| {
-                        if (entry.value_ptr.* != status) continue;
-                        switch (entry.key_ptr.*) {
-                            .path => |path| try writer.print("\t{f} ({s})\n", .{ path.formatUtf8(), symbol }),
-                            .file_id => |file_id| try writer.print("\tfile_id({}) ({s})\n", .{ @intFromEnum(file_id), symbol }),
-                        }
-                    }
+                for (locked.db.local_fs.events.items) |event| {
+                    _ = std.mem.findScalar(LocalFilesystem.Event.Action, actions, event.action) orelse continue;
+                    try writer.print("\t{f}\n", .{event.path.formatUtf8()});
                 }
             }
         }
@@ -587,9 +552,10 @@ pub const LockedDatabase = struct {
 
 const scan = struct {
     const Context = struct {
-        // TODO: delete this field
-        locked: LockedDatabase,
-        arena: *std.heap.ArenaAllocator,
+        local_fs: *LocalFilesystem,
+        db_allocator: Allocator,
+        scan_arena: *std.heap.ArenaAllocator,
+        path_arena: *std.heap.ArenaAllocator,
 
         /// A stack of names of child directories relative to the current directory.
         /// An empty slice means to pop the current directory off the stack.
@@ -607,51 +573,39 @@ const scan = struct {
         /// Info about each file that is relevant for scanning.
         file_info: FileInfo,
 
-        // A copy of the database's state.
-        tree: Database.Tree,
-        queued_events: Database.Event.Map,
-        in_progress_events: Database.Event.Map,
-
         const FileInfo = PathHashMap(struct {
-            status: Database.Tree.Status,
-            directory: bool,
             /// Becomes true when the file is seen while scanning.
             already_seen: bool,
             /// Only used in the second phase of scanning, where unseen files are marked as deleted.
             already_scanned_for_deletion: bool,
         });
 
-        fn init(locked: LockedDatabase, arena: *std.heap.ArenaAllocator) !Context {
-            var tree = try locked.db.tree.clone(locked.db.allocator);
-            errdefer tree.deinit(locked.db.allocator);
-
-            var queued_events = try locked.db.queued_events.map.clone(locked.db.allocator);
-            errdefer queued_events.deinit(locked.db.allocator);
-
-            var in_progress_events = try locked.db.in_progress_events.map.clone(locked.db.allocator);
-            errdefer in_progress_events.deinit(locked.db.allocator);
-
+        fn init(
+            locked: LockedDatabase,
+            scan_arena: *std.heap.ArenaAllocator,
+            path_arena: *std.heap.ArenaAllocator,
+        ) !Context {
             var file_info: Context.FileInfo = .empty;
-            try file_info.ensureTotalCapacity(arena.allocator(), tree.files.count());
-            var it = tree.files.iterator();
+            try file_info.ensureTotalCapacity(scan_arena.allocator(), locked.db.local_fs.repr.files.count());
+            var it = locked.db.local_fs.repr.files.iterator();
             while (it.next()) |entry| {
                 file_info.putAssumeCapacityNoClobber(entry.key_ptr.*, .{
-                    .status = entry.value_ptr.status,
-                    .directory = entry.value_ptr.directory,
                     .already_seen = false,
                     .already_scanned_for_deletion = false,
                 });
             }
 
             var parent_paths: std.ArrayList(?Path) = .empty;
-            try parent_paths.append(arena.allocator(), null);
+            try parent_paths.append(scan_arena.allocator(), null);
 
             var open_dir_handles: std.ArrayList(w.HANDLE) = .empty;
-            try open_dir_handles.append(arena.allocator(), locked.db.sync_dir);
+            try open_dir_handles.append(scan_arena.allocator(), locked.db.sync_dir);
 
             return .{
-                .locked = locked,
-                .arena = arena,
+                .local_fs = &locked.db.local_fs,
+                .db_allocator = locked.db.allocator,
+                .path_arena = path_arena,
+                .scan_arena = scan_arena,
 
                 .pending_dirs = .empty,
                 .current_path = .empty,
@@ -659,28 +613,14 @@ const scan = struct {
                 .open_dir_handles = open_dir_handles,
                 .parent_paths = parent_paths,
                 .file_info = file_info,
-
-                .tree = tree,
-                .queued_events = .{ .map = queued_events },
-                .in_progress_events = .{ .map = in_progress_events },
             };
         }
 
         fn deinit(ctx: *Context) void {
-            ctx.tree.deinit(ctx.locked.db.allocator);
-            ctx.queued_events.map.deinit(ctx.locked.db.allocator);
-            ctx.in_progress_events.map.deinit(ctx.locked.db.allocator);
-
             for (ctx.open_dir_handles.items[1..]) |handle| {
                 w.CloseHandle(handle);
             }
             ctx.* = undefined;
-        }
-
-        fn finalizeScan(ctx: *Context) void {
-            std.mem.swap(Database.Tree, &ctx.tree, &ctx.locked.db.tree);
-            std.mem.swap(Database.Event.Map, &ctx.queued_events, &ctx.locked.db.queued_events);
-            std.mem.swap(Database.Event.Map, &ctx.in_progress_events, &ctx.locked.db.in_progress_events);
         }
     };
 
@@ -712,13 +652,16 @@ const scan = struct {
     };
 
     fn run(locked: LockedDatabase) !void {
-        var arena = locked.db.scan_arena.promote(locked.db.allocator);
+        var scan_arena = locked.db.scan_arena.promote(locked.db.allocator);
         defer {
-            _ = arena.reset(.retain_capacity);
-            locked.db.scan_arena = arena.state;
+            _ = scan_arena.reset(.retain_capacity);
+            locked.db.scan_arena = scan_arena.state;
         }
 
-        var ctx = try Context.init(locked, &arena);
+        var path_arena = locked.db.path_arena.promote(locked.db.allocator);
+        defer locked.db.path_arena = path_arena.state;
+
+        var ctx = try Context.init(locked, &scan_arena, &path_arena);
         defer ctx.deinit();
 
         try scanOneDirectory(&ctx);
@@ -737,8 +680,6 @@ const scan = struct {
         }
 
         try deleteUnseenFiles(&ctx);
-
-        ctx.finalizeScan();
     }
 
     fn scanOneDirectory(ctx: *Context) !void {
@@ -799,7 +740,7 @@ const scan = struct {
         // TODO: Use @backingInt https://codeberg.org/ziglang/zig/issues/35602
         const set_to_untracked = @as(w.ULONG, @bitCast(rejected)) & @as(w.ULONG, @bitCast(information.FileAttributes)) != 0;
 
-        const allocator = ctx.arena.allocator();
+        const allocator = ctx.scan_arena.allocator();
         const component_delimeter_index = ctx.current_path.items.len;
         defer ctx.current_path.shrinkRetainingCapacity(component_delimeter_index);
         try ctx.current_path.appendSlice(allocator, name); // TODO: check that it fits within the file path length limit
@@ -820,7 +761,7 @@ const scan = struct {
 
     fn enterDir(ctx: *Context, dir_name: []const u16) !void {
         const delimeter = comptime wtf16("\\");
-        const allocator = ctx.arena.allocator();
+        const allocator = ctx.scan_arena.allocator();
         try ctx.component_delimeters.ensureTotalCapacity(allocator, 1);
         try ctx.current_path.ensureUnusedCapacity(allocator, dir_name.len + delimeter.len);
         try ctx.parent_paths.ensureUnusedCapacity(allocator, 1);
@@ -831,11 +772,8 @@ const scan = struct {
         const parent_path_temp = ctx.current_path.items;
         ctx.current_path.appendSliceAssumeCapacity(delimeter);
 
-        var path_arena = ctx.locked.db.path_arena.promote(ctx.locked.db.allocator);
-        defer ctx.locked.db.path_arena = path_arena.state;
-        const path_allocator = path_arena.allocator();
-
-        const key = ctx.locked.db.tree.files.getKey(.assumeValidPath(parent_path_temp));
+        const path_allocator = ctx.path_arena.allocator();
+        const key = ctx.local_fs.repr.files.getKey(.assumeValidPath(parent_path_temp));
         const parent_path = key orelse Path.assumeValidPath(try path_allocator.dupe(u16, parent_path_temp));
         errdefer if (key == null) path_allocator.free(parent_path.slice);
         ctx.parent_paths.appendAssumeCapacity(parent_path);
@@ -862,62 +800,59 @@ const scan = struct {
     ) !void {
         const local_file_id = information.FileId;
         const size = std.math.cast(w.ULARGE_INTEGER, information.EndOfFile) orelse return error.Unexpected;
-        const meta = Database.Tree.Metadata{
+        const meta = LocalFilesystem.Repr.Metadata{
             .modified_time = information.ChangeTime,
             .size = size,
         };
 
-        const gop = try ctx.file_info.getOrPut(ctx.arena.allocator(), path);
+        const gop = try ctx.file_info.getOrPut(ctx.scan_arena.allocator(), path);
         if (gop.found_existing) {
             if (gop.value_ptr.already_seen) std.debug.panic("TODO saw file more than once while scanning: {f}", .{path.formatUtf8()});
             gop.value_ptr.already_seen = true;
-            if (gop.value_ptr.directory) std.debug.panic("TODO a directory was changed to a regular file: {f}", .{path.formatUtf8()});
 
-            switch (gop.value_ptr.status) {
+            // TODO Reuse the result of this lookup
+            const info = ctx.local_fs.repr.files.get(path).?;
+            if (info.directory) std.debug.panic("TODO a directory was changed to a regular file: {f}", .{path.formatUtf8()});
+
+            switch (info.status) {
                 .new => {
                     if (set_to_untracked) std.debug.panic("TODO set a new file to untracked: {f}", .{path.formatUtf8()});
-                    updateNewFile(ctx, path, local_file_id, meta);
+                    updateNewFile(ctx.local_fs, path, local_file_id, meta);
                 },
                 .untracked => {
                     if (set_to_untracked) return;
-                    try changeUntrackedFileToNew(ctx, ctx.locked.db.allocator, path, local_file_id, meta);
-                    gop.value_ptr.status = .new;
+                    try changeUntrackedRegularFileToNew(ctx.local_fs, ctx.db_allocator, path, local_file_id, meta);
                 },
                 .tracked => {
                     if (set_to_untracked) {
-                        try changeTrackedRegularFileToUntracked(ctx, ctx.locked.db.allocator, path);
+                        try changeTrackedRegularFileToUntracked(ctx.local_fs, ctx.db_allocator, path);
                     } else {
                         // TODO: do not compute the hash right now
                         const hash = blk: {
-                            const file = try fairy.windows.openFile(ctx.locked.db.sync_dir, path, .read);
+                            const file = try fairy.windows.openFile(ctx.open_dir_handles.items[0], path, .read);
                             defer w.CloseHandle(file);
                             break :blk try computeFileHash(file, information.EndOfFile);
                         };
 
-                        try updateTrackedRegularFile(ctx, ctx.locked.db.allocator, path, local_file_id, meta, &hash);
+                        try updateTrackedRegularFile(ctx.local_fs, ctx.db_allocator, path, local_file_id, meta, &hash);
                     }
                 },
             }
         } else {
             errdefer ctx.file_info.removeByPtr(gop.key_ptr);
 
-            var path_arena = ctx.locked.db.path_arena.promote(ctx.locked.db.allocator);
-            defer ctx.locked.db.path_arena = path_arena.state;
-            const file_path_allocator = path_arena.allocator();
-
-            const path_copy = try path.dupe(file_path_allocator);
-            errdefer file_path_allocator.free(path_copy.slice);
+            const path_allocator = ctx.path_arena.allocator();
+            const path_copy = try path.dupe(path_allocator);
+            errdefer path_allocator.free(path_copy.slice);
 
             gop.key_ptr.* = path_copy;
-            gop.value_ptr.* = .{ .status = undefined, .directory = false, .already_seen = true, .already_scanned_for_deletion = false };
+            gop.value_ptr.* = .{ .already_seen = true, .already_scanned_for_deletion = false };
 
             const parent = ctx.parent_paths.getLast();
             if (set_to_untracked) {
-                try addFile(ctx, ctx.locked.db.allocator, .regular, .untracked, path_copy, parent, local_file_id, {});
-                gop.value_ptr.status = .untracked;
+                try addFile(ctx.local_fs, ctx.db_allocator, .regular, .untracked, path_copy, parent, local_file_id, {});
             } else {
-                try addFile(ctx, ctx.locked.db.allocator, .regular, .new, path_copy, parent, local_file_id, meta);
-                gop.value_ptr.status = .new;
+                try addFile(ctx.local_fs, ctx.db_allocator, .regular, .new, path_copy, parent, local_file_id, meta);
             }
         }
     }
@@ -929,47 +864,46 @@ const scan = struct {
         set_to_untracked: bool,
     ) !void {
         const local_file_id = information.FileId;
-        const meta = Database.Tree.Metadata{
+        const meta = LocalFilesystem.Repr.Metadata{
             .modified_time = information.ChangeTime,
             .size = 0,
         };
 
-        const gop = try ctx.file_info.getOrPut(ctx.arena.allocator(), path);
+        const gop = try ctx.file_info.getOrPut(ctx.scan_arena.allocator(), path);
         if (gop.found_existing) {
             if (gop.value_ptr.already_seen) std.debug.panic("TODO saw directory more than once while scanning: {f}", .{path.formatUtf8()});
             gop.value_ptr.already_seen = true;
-            if (!gop.value_ptr.directory) std.debug.panic("TODO a regular file was changed into a directory: {f}", .{path.formatUtf8()});
 
-            switch (gop.value_ptr.status) {
+            // TODO Reuse the result of this lookup
+            const info = ctx.local_fs.repr.files.get(path).?;
+            if (!info.directory) std.debug.panic("TODO a regular file was changed into a directory: {f}", .{path.formatUtf8()});
+
+            switch (info.status) {
                 .new => {
                     if (set_to_untracked) std.debug.panic("TODO set a new directory to untracked: {f}", .{path.formatUtf8()});
-                    updateNewFile(ctx, path, local_file_id, meta);
+                    updateNewFile(ctx.local_fs, path, local_file_id, meta);
                 },
                 .untracked => std.debug.panic("TODO handle untracked directory: {f}", .{path.formatUtf8()}),
                 .tracked => {
                     if (set_to_untracked) std.debug.panic("TODO set a tracked directory to untracked: {f}", .{path.formatUtf8()});
-                    updateTrackedDirectoryFile(ctx, path, local_file_id, meta);
+                    updateTrackedDirectoryFile(ctx.local_fs, path, local_file_id, meta);
                 },
             }
         } else {
             errdefer ctx.file_info.removeByPtr(gop.key_ptr);
 
-            var path_arena = ctx.locked.db.path_arena.promote(ctx.locked.db.allocator);
-            defer ctx.locked.db.path_arena = path_arena.state;
-            const path_allocator = path_arena.allocator();
-
+            const path_allocator = ctx.path_arena.allocator();
             const path_copy = try path.dupe(path_allocator);
             errdefer path_allocator.free(path_copy.slice);
 
             gop.key_ptr.* = path_copy;
-            gop.value_ptr.* = .{ .status = undefined, .directory = true, .already_seen = true, .already_scanned_for_deletion = false };
+            gop.value_ptr.* = .{ .already_seen = true, .already_scanned_for_deletion = false };
 
             const parent = ctx.parent_paths.getLast();
             if (set_to_untracked) {
                 std.debug.panic("TODO handle untracked directory: {f}", .{path.formatUtf8()});
             } else {
-                try addFile(ctx, ctx.locked.db.allocator, .directory, .new, path_copy, parent, local_file_id, meta);
-                gop.value_ptr.status = .new;
+                try addFile(ctx.local_fs, ctx.db_allocator, .directory, .new, path_copy, parent, local_file_id, meta);
             }
         }
     }
@@ -978,24 +912,25 @@ const scan = struct {
         var stack: [fairy.max_path_components]Path = undefined;
         var stack_len: fairy.PathComponentCount = 0;
         while (true) {
-            const children = if (stack_len == 0) ctx.tree.top_level_children else ctx.tree.children.get(stack[stack_len - 1]).?;
+            const children = if (stack_len == 0) ctx.local_fs.repr.top_level_children else ctx.local_fs.repr.children.get(stack[stack_len - 1]).?;
             var it = children.keyIterator();
             // TODO: O(N^2) loop
             while (it.next()) |child| {
                 const file_info = ctx.file_info.getPtr(child.*).?;
                 if (file_info.already_scanned_for_deletion) continue;
                 file_info.already_scanned_for_deletion = true;
+                const info = ctx.local_fs.repr.files.get(child.*).?;
 
                 if (file_info.already_seen) {
-                    if (file_info.directory and stack_len < fairy.max_path_components) {
+                    if (info.directory and stack_len < fairy.max_path_components) {
                         stack[stack_len] = child.*;
                         stack_len += 1;
                     }
                 } else {
-                    switch (file_info.status) {
+                    switch (info.status) {
                         .new => std.debug.panic("TODO delete a new file: {f}", .{child.formatUtf8()}),
-                        .tracked => switch (file_info.directory) {
-                            false => try deleteTrackedRegularFile(ctx, ctx.locked.db.allocator, child.*),
+                        .tracked => switch (info.directory) {
+                            false => try deleteTrackedRegularFile(ctx.local_fs, ctx.db_allocator, child.*),
                             // TODO: try deleteTrackedDirectoryFile(ctx, ctx.locked.db.allocator, path),
                             true => std.debug.panic("TODO delete a tracked directory: {f}", .{child.formatUtf8()}),
                         },
@@ -1013,54 +948,43 @@ const scan = struct {
 
     // ===========================================
 
-    fn queueEventAssumeCapacity(
-        ctx: *Context,
-        key: Database.Event.Map.Key,
-        event: Database.Event,
-    ) void {
-        ctx.locked.db.debug.log("queueing event {s} for {f}", .{ @tagName(event), key });
-        const gop = ctx.queued_events.map.getOrPutAssumeCapacity(key);
-        if (gop.found_existing) std.debug.panic("TODO: event {s} already queued for {f}", .{ @tagName(gop.value_ptr.*), key });
-        gop.value_ptr.* = event;
-    }
-
     const FileKind = enum { regular, directory };
 
     fn addFile(
-        ctx: *Context,
+        local_fs: *LocalFilesystem,
         allocator: Allocator,
         kind: FileKind,
-        comptime status: Database.Tree.Status,
+        comptime status: LocalFilesystem.Repr.Status,
         path: Path,
         parent: ?Path,
         local_file_id: w.LARGE_INTEGER,
         meta: switch (status) {
-            .new => Database.Tree.Metadata,
+            .new => LocalFilesystem.Repr.Metadata,
             .untracked => void,
             .tracked => unreachable,
         },
     ) !void {
-        try ctx.tree.files.ensureUnusedCapacity(allocator, 1);
-        try ctx.tree.parent.ensureUnusedCapacity(allocator, 1);
-        try ctx.tree.meta.ensureUnusedCapacity(allocator, 1);
+        try local_fs.repr.files.ensureUnusedCapacity(allocator, 1);
+        try local_fs.repr.parent.ensureUnusedCapacity(allocator, 1);
+        try local_fs.repr.meta.ensureUnusedCapacity(allocator, 1);
         switch (kind) {
-            .regular => try ctx.tree.hash.ensureUnusedCapacity(allocator, 1),
-            .directory => try ctx.tree.children.ensureUnusedCapacity(allocator, 1),
+            .regular => try local_fs.repr.hash.ensureUnusedCapacity(allocator, 1),
+            .directory => try local_fs.repr.children.ensureUnusedCapacity(allocator, 1),
         }
         const parent_children = blk: {
-            const ptr = if (parent) |p| ctx.tree.children.getPtr(p).? else &ctx.tree.top_level_children;
+            const ptr = if (parent) |p| local_fs.repr.children.getPtr(p).? else &local_fs.repr.top_level_children;
             try ptr.ensureUnusedCapacity(allocator, 1);
             break :blk ptr;
         };
 
         switch (status) {
-            .new => try ctx.queued_events.map.ensureUnusedCapacity(allocator, 1),
+            .new => try local_fs.ensureEventCapacity(allocator),
             .untracked => {},
             .tracked => comptime unreachable,
         }
         errdefer comptime unreachable;
 
-        const gop = ctx.tree.files.getOrPutAssumeCapacity(path);
+        const gop = local_fs.repr.files.getOrPutAssumeCapacity(path);
         if (gop.found_existing) std.debug.panic("TODO addFile file already exists", .{});
         gop.value_ptr.* = .{
             .directory = switch (kind) {
@@ -1071,125 +995,120 @@ const scan = struct {
             .local_file_id = local_file_id,
             .global_file_id = .unknown,
         };
-        ctx.tree.parent.putAssumeCapacityNoClobber(path, parent);
-        ctx.tree.meta.putAssumeCapacityNoClobber(path, switch (status) {
+        local_fs.repr.parent.putAssumeCapacityNoClobber(path, if (parent) |p| local_fs.repr.files.getKey(p).? else null);
+        local_fs.repr.meta.putAssumeCapacityNoClobber(path, switch (status) {
             .new => meta,
             .untracked => undefined,
             .tracked => comptime unreachable,
         });
         switch (kind) {
-            .regular => ctx.tree.hash.putAssumeCapacityNoClobber(path, undefined),
-            .directory => ctx.tree.children.putAssumeCapacityNoClobber(path, .empty),
+            .regular => local_fs.repr.hash.putAssumeCapacityNoClobber(path, undefined),
+            .directory => local_fs.repr.children.putAssumeCapacityNoClobber(path, .empty),
         }
         parent_children.putAssumeCapacityNoClobber(path, {});
         switch (status) {
-            .new => queueEventAssumeCapacity(ctx, .{ .path = path }, .new),
+            .new => local_fs.queueEventAssumeCapacity(switch (kind) {
+                .regular => .new_regular,
+                .directory => .new_directory,
+            }, path),
             .untracked => {},
             .tracked => comptime unreachable,
         }
     }
 
     fn updateNewFile(
-        ctx: *Context,
+        local_fs: *LocalFilesystem,
         path: Path,
         local_file_id: w.LARGE_INTEGER,
-        meta: Database.Tree.Metadata,
+        meta: LocalFilesystem.Repr.Metadata,
     ) void {
-        const info = ctx.tree.files.getPtr(path).?;
+        const info = local_fs.repr.files.getPtr(path).?;
         info.local_file_id = local_file_id;
-        ctx.tree.meta.getPtr(path).?.* = meta;
+        local_fs.repr.meta.getPtr(path).?.* = meta;
     }
 
-    fn changeUntrackedFileToNew(
-        ctx: *Context,
+    fn changeUntrackedRegularFileToNew(
+        local_fs: *LocalFilesystem,
         allocator: Allocator,
         path: Path,
         local_file_id: w.LARGE_INTEGER,
-        meta: Database.Tree.Metadata,
+        meta: LocalFilesystem.Repr.Metadata,
     ) !void {
-        const info = ctx.tree.files.getEntry(path).?;
+        const info = local_fs.repr.files.getEntry(path).?;
 
-        try ctx.queued_events.map.ensureUnusedCapacity(allocator, 1);
+        try local_fs.ensureEventCapacity(allocator);
         errdefer comptime unreachable;
 
         info.value_ptr.status = .new;
         info.value_ptr.local_file_id = local_file_id;
-        ctx.tree.meta.getPtr(path).?.* = meta;
-        queueEventAssumeCapacity(ctx, .{ .path = info.key_ptr.* }, .new);
+        local_fs.repr.meta.getPtr(path).?.* = meta;
+        local_fs.queueEventAssumeCapacity(.new_regular, info.key_ptr.*);
     }
 
     fn updateTrackedRegularFile(
-        ctx: *Context,
+        local_fs: *LocalFilesystem,
         allocator: Allocator,
         path: Path,
         local_file_id: w.LARGE_INTEGER,
-        meta: Database.Tree.Metadata,
+        meta: LocalFilesystem.Repr.Metadata,
         hash: *const network.FileHash,
     ) !void {
-        const info = ctx.tree.files.getEntry(path).?;
-        const meta_ptr = ctx.tree.meta.getPtr(path).?;
-        const hash_ptr = ctx.tree.hash.getPtr(path).?;
+        const info = local_fs.repr.files.getEntry(path).?;
+        assert(!info.value_ptr.directory);
+        const meta_ptr = local_fs.repr.meta.getPtr(path).?;
+        const hash_ptr = local_fs.repr.hash.getPtr(path).?;
 
         if (info.value_ptr.local_file_id == local_file_id and
             meta_ptr.size == meta.size and
             hash_ptr.eql(hash)) return;
 
-        try ctx.queued_events.map.ensureUnusedCapacity(allocator, 1);
+        try local_fs.ensureEventCapacity(allocator);
         errdefer comptime unreachable;
 
         info.value_ptr.local_file_id = local_file_id;
         meta_ptr.* = meta;
         hash_ptr.* = hash.*;
-        queueEventAssumeCapacity(ctx, .{ .file_id = info.value_ptr.global_file_id }, .modified);
+        local_fs.queueEventAssumeCapacity(.modified_regular, info.key_ptr.*);
     }
 
     fn updateTrackedDirectoryFile(
-        ctx: *Context,
+        local_fs: *LocalFilesystem,
         path: Path,
         local_file_id: w.LARGE_INTEGER,
-        meta: Database.Tree.Metadata,
+        meta: LocalFilesystem.Repr.Metadata,
     ) void {
-        const info = ctx.tree.files.getPtr(path).?;
+        const info = local_fs.repr.files.getPtr(path).?;
+        assert(info.directory);
         info.local_file_id = local_file_id;
-        ctx.tree.meta.getPtr(path).?.* = meta;
+        local_fs.repr.meta.getPtr(path).?.* = meta;
+        // TODO: Send an event?
     }
 
     fn deleteTrackedRegularFile(
-        ctx: *Context,
+        local_fs: *LocalFilesystem,
         allocator: Allocator,
         path: Path,
     ) !void {
-        try ctx.queued_events.map.ensureUnusedCapacity(allocator, 1);
+        try local_fs.ensureEventCapacity(allocator);
         errdefer comptime unreachable;
 
-        const info = ctx.tree.files.fetchRemove(path).?;
-        assert(ctx.tree.meta.remove(path));
-        assert(ctx.tree.hash.remove(path));
-        const parent = ctx.tree.parent.fetchRemove(path).?.value;
-        const parent_children = if (parent) |p| ctx.tree.children.getPtr(p).? else &ctx.tree.top_level_children;
+        const info = local_fs.repr.files.fetchRemove(path).?;
+        assert(!info.value.directory);
+        assert(local_fs.repr.meta.remove(path));
+        assert(local_fs.repr.hash.remove(path));
+        const parent = local_fs.repr.parent.fetchRemove(path).?.value;
+        const parent_children = if (parent) |p| local_fs.repr.children.getPtr(p).? else &local_fs.repr.top_level_children;
         assert(parent_children.remove(path));
-        queueEventAssumeCapacity(ctx, .{ .file_id = info.value.global_file_id }, .deleted);
+        local_fs.queueEventAssumeCapacity(.delete_regular, info.key);
     }
 
     fn deleteTrackedDirectoryFile(
-        ctx: *Context,
+        local_fs: *LocalFilesystem,
         allocator: Allocator,
         path: Path,
     ) !void {
-        try ctx.queued_events.map.ensureUnusedCapacity(allocator, 1);
+        try local_fs.ensureEventCapacity(allocator);
         errdefer comptime unreachable;
-
-        const global_file_id = blk: {
-            const info = ctx.tree.files.fetchRemove(path).?.value;
-            assert(info.directory);
-            break :blk info.global_file_id;
-        };
-
-        const parent_children = if (ctx.tree.parent.fetchRemove(path).?.value) |parent|
-            ctx.tree.children.getPtr(parent).?
-        else
-            &ctx.tree.top_level_children;
-        assert(parent_children.remove(path));
 
         const StackItem = struct {
             path: Path,
@@ -1199,7 +1118,7 @@ const scan = struct {
         var stack: [fairy.max_path_components]StackItem = undefined;
         stack[0] = .{
             .path = path,
-            .children = ctx.tree.children.fetchRemove(path).?.value,
+            .children = local_fs.repr.children.fetchRemove(path).?.value,
             .child_iterator = undefined,
         };
         stack[0].child_iterator = stack[0].children.keyIterator();
@@ -1209,32 +1128,21 @@ const scan = struct {
             const stack_item = &stack[stack_len - 1];
             if (stack_item.child_iterator.next()) |child_path_ptr| {
                 const child_path = child_path_ptr.*;
-                const info = ctx.tree.files.fetchRemove(child_path).?;
-                assert(ctx.tree.parent.remove(child_path));
-
-                if (ctx.queued_events.map.contains(.{ .file_id = info.value.global_file_id }))
-                    std.debug.panic(
-                        "TODO: An event is queued for '{f}' while its parent directory '{f}' has been deleted",
-                        .{ info.key.formatUtf8(), path.formatUtf8() },
-                    );
-                if (ctx.in_progress_events.map.contains(.{ .file_id = info.value.global_file_id }))
-                    std.debug.panic(
-                        "TODO: An event is in progress for '{f}' while its parent directory '{f}' has been deleted",
-                        .{ info.key.formatUtf8(), path.formatUtf8() },
-                    );
+                const info = local_fs.repr.files.fetchRemove(child_path).?;
+                assert(local_fs.repr.parent.remove(child_path));
+                assert(local_fs.repr.meta.remove(child_path));
 
                 if (info.value.directory) {
                     if (stack_len == fairy.max_path_components) unreachable; // TODO: unsound assumption; the directory could be empty
                     stack[stack_len] = .{
                         .path = child_path,
-                        .children = ctx.tree.children.fetchRemove(child_path).?.value,
+                        .children = local_fs.repr.children.fetchRemove(child_path).?.value,
                         .child_iterator = undefined,
                     };
                     stack[stack_len].child_iterator = stack[stack_len].children.keyIterator();
                     stack_len += 1;
                 } else {
-                    assert(ctx.tree.meta.remove(child_path));
-                    assert(ctx.tree.hash.remove(child_path));
+                    assert(local_fs.repr.hash.remove(child_path));
                 }
             } else {
                 stack_item.children.deinit(allocator);
@@ -1243,24 +1151,35 @@ const scan = struct {
             }
         }
 
-        queueEventAssumeCapacity(ctx, .{ .file_id = global_file_id }, .deleted);
+        const info = local_fs.repr.files.fetchRemove(path).?;
+        assert(info.value.directory);
+
+        const parent_children = if (local_fs.repr.parent.fetchRemove(path).?.value) |parent|
+            local_fs.repr.children.getPtr(parent).?
+        else
+            &local_fs.repr.top_level_children;
+        assert(parent_children.remove(path));
+
+        assert(local_fs.repr.meta.remove(path));
+
+        local_fs.queueEventAssumeCapacity(.delete_directory, info.key);
     }
 
     fn changeTrackedRegularFileToUntracked(
-        ctx: *Context,
+        local_fs: *LocalFilesystem,
         allocator: Allocator,
         path: Path,
     ) !void {
-        try ctx.queued_events.map.ensureUnusedCapacity(allocator, 1);
+        try local_fs.ensureEventCapacity(allocator);
         errdefer comptime unreachable;
 
-        const info = ctx.tree.files.getPtr(path).?;
-        const file_id = info.global_file_id;
-        info.status = .untracked;
-        info.global_file_id = .unknown;
-        ctx.tree.meta.getPtr(path).?.* = undefined;
-        ctx.tree.hash.getPtr(path).?.* = undefined;
-        queueEventAssumeCapacity(ctx, .{ .file_id = file_id }, .deleted);
+        const info = local_fs.repr.files.getEntry(path).?;
+        assert(!info.value_ptr.directory);
+        info.value_ptr.status = .untracked;
+        info.value_ptr.global_file_id = .unknown;
+        local_fs.repr.meta.getPtr(path).?.* = undefined;
+        local_fs.repr.hash.getPtr(path).?.* = undefined;
+        local_fs.queueEventAssumeCapacity(.delete_regular, info.key_ptr.*);
     }
 };
 
@@ -1684,16 +1603,19 @@ pub const Host = struct {
         }
     }
 
-    fn deleteTransaction(host: *Host, tx_id: network.TransactionId, expected_status: State.TxStatus, io: Io) void {
+    fn deleteTransaction(host: *Host, tx_id: network.TransactionId, comptime expected_status: State.TxStatus, io: Io) void {
         assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
         host.tx.data = undefined;
         host.tx.peer_tx_id = undefined;
         host.releaseNewTxStatus(expected_status, .init);
 
         switch (expected_status) {
-            .init, .acquired => unreachable,
-            .outgoing => {},
-            .incoming => io.futexWake(State, &host.db.host_state.raw, 1),
+            .init, .acquired => comptime unreachable,
+            .outgoing => comptime unreachable,
+            .incoming => {
+                host.db.sendAlert(io);
+                io.futexWake(State, &host.db.host_state.raw, 1);
+            },
         }
     }
 
@@ -1817,10 +1739,10 @@ pub const TxData = union(enum) {
                     {
                         const locked = try host.db.lock(io);
                         defer locked.unlock(io);
-                        try locked.setNewFileId(out_new_file.path, out_new_file.kind, file_id_list.items, io);
+                        try locked.setNewFileId(out_new_file.path, out_new_file.kind, file_id_list.items);
                     }
 
-                    host.debugLog("received {f} for file {f}\n", .{ file_id_list.items[0], out_new_file.path.formatUtf8() });
+                    host.debugLog("received {f} for file {f}\n", .{ file_id_list.items[file_id_list.items.len - 1], out_new_file.path.formatUtf8() });
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
                 .invalid_path,

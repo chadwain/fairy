@@ -81,6 +81,7 @@ pub const FileHash = struct {
 };
 
 pub const FileId = enum(u32) {
+    // TODO delete this field
     unknown = 0,
     _,
 
