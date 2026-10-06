@@ -234,9 +234,6 @@ pub const LocalFilesystem = struct {
         top_level_children: PathHashMap(void) = .empty,
         /// Applies to all files
         meta: PathHashMap(Metadata) = .empty,
-        /// Applies only to regular files
-        // TODO: Make the hash nullable, do not compute it until the file is being synced
-        hash: PathHashMap(network.FileHash) = .empty,
 
         fn deinit(repr: *Repr, allocator: Allocator) void {
             var it = repr.children.valueIterator();
@@ -247,7 +244,6 @@ pub const LocalFilesystem = struct {
             repr.children.deinit(allocator);
             repr.top_level_children.deinit(allocator);
             repr.meta.deinit(allocator);
-            repr.hash.deinit(allocator);
 
             repr.* = undefined;
         }
@@ -256,25 +252,14 @@ pub const LocalFilesystem = struct {
             directory: bool,
             status: Status,
             local_file_id: w.LARGE_INTEGER,
-            // TODO delete this field
-            global_file_id: network.FileId,
         };
 
         pub const Status = enum {
-            /// A file which was previously untracked and is now known to exist.
-            ///
-            /// global_file_id may be `.unknown`
-            /// hash is undefined
-
-            // TODO delete this field
-            new,
             /// A file which is being tracked.
             tracked,
             /// A file whose existence is known, but will not be synced to the server for one or more reasons.
             ///
-            /// global_file_id is `.unknown`
             /// meta is undefined
-            /// hash is undefined
             untracked,
         };
 
@@ -319,7 +304,6 @@ pub const GlobalFilesystem = struct {
     files: std.AutoHashMapUnmanaged(network.FileId, FileInfo) = .empty,
     path_to_id: PathHashMap(network.FileId) = .empty,
     event_in_progress: bool = false,
-    // event: ?Event = null,
 
     pub const FileInfo = struct {
         directory: bool,
@@ -331,30 +315,6 @@ pub const GlobalFilesystem = struct {
         assert(!info.value.directory);
         assert(global_fs.path_to_id.remove(info.value.path));
     }
-
-    pub const Event = struct {
-        action: Action,
-        target: Target,
-
-        pub const Action = enum {
-            new,
-            modified,
-            create_dir,
-            deleted,
-        };
-
-        pub const Target = union(enum) {
-            path: Path,
-            file_id: network.FileId,
-
-            pub fn format(target: Target, writer: *Io.Writer) Io.Writer.Error!void {
-                switch (target) {
-                    .path => |path| try writer.print("{f}", .{path.formatUtf8()}),
-                    .file_id => |file_id| try writer.print("{f}", .{file_id}),
-                }
-            }
-        };
-    };
 
     pub fn deinit(global_fs: *GlobalFilesystem, allocator: Allocator) void {
         global_fs.files.deinit(allocator);
@@ -385,10 +345,7 @@ pub const LockedDatabase = struct {
 
     fn finishLocalEventWithFileId(locked: LockedDatabase, action: LocalFilesystem.Event.Action, file_id: network.FileId) void {
         const path = locked.db.global_fs.files.get(file_id).?.path;
-        const event = locked.db.local_fs.events.orderedRemove(0);
-        assert(event.action == action);
-        assert(event.path.eql(path));
-        locked.db.global_fs.event_in_progress = false;
+        locked.finishLocalEventWithPath(action, path);
     }
 
     // called from Host
@@ -404,18 +361,6 @@ pub const LockedDatabase = struct {
         try locked.db.global_fs.path_to_id.ensureUnusedCapacity(locked.db.allocator, component_count);
         // TODO: We should not be using the local event queue for this
         try locked.db.local_fs.ensureEventCapacity(locked.db.allocator);
-
-        // TODO: do not compute the hash right now
-        const hash = switch (kind) {
-            .directory => undefined,
-            .regular => blk: {
-                const file = try fairy.windows.openFile(locked.db.sync_dir, path, .read);
-                defer fairy.windows.closeHandle(file);
-                const file_size = try getFileSize(file);
-                break :blk try computeFileHash(file, file_size);
-            },
-        };
-
         errdefer comptime unreachable;
 
         const Iterator = std.fs.path.ComponentIterator(.windows, u16);
@@ -454,8 +399,7 @@ pub const LockedDatabase = struct {
         // TODO: We should not be using the local event queue for this
         {
             const info = locked.db.local_fs.repr.files.getPtr(path) orelse std.debug.panic("TODO", .{});
-            info.status = .tracked;
-            if (!info.directory) locked.db.local_fs.repr.hash.getPtr(path).?.* = hash;
+            assert(info.status == .tracked);
             locked.db.local_fs.queueEventAssumeCapacity(if (info.directory) .create_dir else .modified_regular, path);
         }
     }
@@ -485,26 +429,7 @@ pub const LockedDatabase = struct {
             while (it.next()) |entry| {
                 switch (entry.value_ptr.status) {
                     .tracked => {},
-                    .new, .untracked => continue,
-                }
-                const meta = locked.db.local_fs.repr.meta.get(entry.key_ptr.*).?;
-                try writer.print(
-                    "{f}: modified({}) size({}) hash({?f})\n",
-                    .{
-                        entry.key_ptr.formatUtf8(),
-                        meta.modified_time,
-                        meta.size,
-                        locked.db.local_fs.repr.hash.get(entry.key_ptr.*),
-                    },
-                );
-            }
-
-            try writer.writeAll("New files\n");
-            it = locked.db.local_fs.repr.files.iterator();
-            while (it.next()) |entry| {
-                switch (entry.value_ptr.status) {
-                    .new => {},
-                    .tracked, .untracked => continue,
+                    .untracked => continue,
                 }
                 const meta = locked.db.local_fs.repr.meta.get(entry.key_ptr.*).?;
                 try writer.print(
@@ -521,7 +446,7 @@ pub const LockedDatabase = struct {
             it = locked.db.local_fs.repr.files.iterator();
             while (it.next()) |entry| {
                 switch (entry.value_ptr.status) {
-                    .new, .tracked => continue,
+                    .tracked => continue,
                     .untracked => {},
                 }
                 try writer.print("{f}\n", .{entry.key_ptr.formatUtf8()});
@@ -815,27 +740,16 @@ const scan = struct {
             if (info.directory) std.debug.panic("TODO a directory was changed to a regular file: {f}", .{path.formatUtf8()});
 
             switch (info.status) {
-                .new => {
-                    if (set_to_untracked) std.debug.panic("TODO set a new file to untracked: {f}", .{path.formatUtf8()});
-                    updateNewFile(ctx.local_fs, path, local_file_id, meta);
-                },
-                .untracked => {
-                    if (set_to_untracked) return;
-                    try changeUntrackedRegularFileToNew(ctx.local_fs, ctx.db_allocator, path, local_file_id, meta);
-                },
                 .tracked => {
                     if (set_to_untracked) {
                         try changeTrackedRegularFileToUntracked(ctx.local_fs, ctx.db_allocator, path);
                     } else {
-                        // TODO: do not compute the hash right now
-                        const hash = blk: {
-                            const file = try fairy.windows.openFile(ctx.open_dir_handles.items[0], path, .read);
-                            defer w.CloseHandle(file);
-                            break :blk try computeFileHash(file, information.EndOfFile);
-                        };
-
-                        try updateTrackedRegularFile(ctx.local_fs, ctx.db_allocator, path, local_file_id, meta, &hash);
+                        try updateTrackedRegularFile(ctx.local_fs, ctx.db_allocator, path, local_file_id, meta);
                     }
+                },
+                .untracked => {
+                    if (set_to_untracked) return;
+                    try changeUntrackedRegularFileToNew(ctx.local_fs, ctx.db_allocator, path, local_file_id, meta);
                 },
             }
         } else {
@@ -852,7 +766,7 @@ const scan = struct {
             if (set_to_untracked) {
                 try addFile(ctx.local_fs, ctx.db_allocator, .regular, .untracked, path_copy, parent, local_file_id, {});
             } else {
-                try addFile(ctx.local_fs, ctx.db_allocator, .regular, .new, path_copy, parent, local_file_id, meta);
+                try addFile(ctx.local_fs, ctx.db_allocator, .regular, .tracked, path_copy, parent, local_file_id, meta);
             }
         }
     }
@@ -879,15 +793,11 @@ const scan = struct {
             if (!info.directory) std.debug.panic("TODO a regular file was changed into a directory: {f}", .{path.formatUtf8()});
 
             switch (info.status) {
-                .new => {
-                    if (set_to_untracked) std.debug.panic("TODO set a new directory to untracked: {f}", .{path.formatUtf8()});
-                    updateNewFile(ctx.local_fs, path, local_file_id, meta);
-                },
-                .untracked => std.debug.panic("TODO handle untracked directory: {f}", .{path.formatUtf8()}),
                 .tracked => {
                     if (set_to_untracked) std.debug.panic("TODO set a tracked directory to untracked: {f}", .{path.formatUtf8()});
                     updateTrackedDirectoryFile(ctx.local_fs, path, local_file_id, meta);
                 },
+                .untracked => std.debug.panic("TODO handle untracked directory: {f}", .{path.formatUtf8()}),
             }
         } else {
             errdefer ctx.file_info.removeByPtr(gop.key_ptr);
@@ -903,7 +813,7 @@ const scan = struct {
             if (set_to_untracked) {
                 std.debug.panic("TODO handle untracked directory: {f}", .{path.formatUtf8()});
             } else {
-                try addFile(ctx.local_fs, ctx.db_allocator, .directory, .new, path_copy, parent, local_file_id, meta);
+                try addFile(ctx.local_fs, ctx.db_allocator, .directory, .tracked, path_copy, parent, local_file_id, meta);
             }
         }
     }
@@ -928,7 +838,6 @@ const scan = struct {
                     }
                 } else {
                     switch (info.status) {
-                        .new => std.debug.panic("TODO delete a new file: {f}", .{child.formatUtf8()}),
                         .tracked => switch (info.directory) {
                             false => try deleteTrackedRegularFile(ctx.local_fs, ctx.db_allocator, child.*),
                             // TODO: try deleteTrackedDirectoryFile(ctx, ctx.locked.db.allocator, path),
@@ -959,16 +868,15 @@ const scan = struct {
         parent: ?Path,
         local_file_id: w.LARGE_INTEGER,
         meta: switch (status) {
-            .new => LocalFilesystem.Repr.Metadata,
+            .tracked => LocalFilesystem.Repr.Metadata,
             .untracked => void,
-            .tracked => unreachable,
         },
     ) !void {
         try local_fs.repr.files.ensureUnusedCapacity(allocator, 1);
         try local_fs.repr.parent.ensureUnusedCapacity(allocator, 1);
         try local_fs.repr.meta.ensureUnusedCapacity(allocator, 1);
         switch (kind) {
-            .regular => try local_fs.repr.hash.ensureUnusedCapacity(allocator, 1),
+            .regular => {},
             .directory => try local_fs.repr.children.ensureUnusedCapacity(allocator, 1),
         }
         const parent_children = blk: {
@@ -978,9 +886,8 @@ const scan = struct {
         };
 
         switch (status) {
-            .new => try local_fs.ensureEventCapacity(allocator),
+            .tracked => try local_fs.ensureEventCapacity(allocator),
             .untracked => {},
-            .tracked => comptime unreachable,
         }
         errdefer comptime unreachable;
 
@@ -993,38 +900,24 @@ const scan = struct {
             },
             .status = status,
             .local_file_id = local_file_id,
-            .global_file_id = .unknown,
         };
         local_fs.repr.parent.putAssumeCapacityNoClobber(path, if (parent) |p| local_fs.repr.files.getKey(p).? else null);
         local_fs.repr.meta.putAssumeCapacityNoClobber(path, switch (status) {
-            .new => meta,
+            .tracked => meta,
             .untracked => undefined,
-            .tracked => comptime unreachable,
         });
         switch (kind) {
-            .regular => local_fs.repr.hash.putAssumeCapacityNoClobber(path, undefined),
+            .regular => {},
             .directory => local_fs.repr.children.putAssumeCapacityNoClobber(path, .empty),
         }
         parent_children.putAssumeCapacityNoClobber(path, {});
         switch (status) {
-            .new => local_fs.queueEventAssumeCapacity(switch (kind) {
+            .tracked => local_fs.queueEventAssumeCapacity(switch (kind) {
                 .regular => .new_regular,
                 .directory => .new_directory,
             }, path),
             .untracked => {},
-            .tracked => comptime unreachable,
         }
-    }
-
-    fn updateNewFile(
-        local_fs: *LocalFilesystem,
-        path: Path,
-        local_file_id: w.LARGE_INTEGER,
-        meta: LocalFilesystem.Repr.Metadata,
-    ) void {
-        const info = local_fs.repr.files.getPtr(path).?;
-        info.local_file_id = local_file_id;
-        local_fs.repr.meta.getPtr(path).?.* = meta;
     }
 
     fn changeUntrackedRegularFileToNew(
@@ -1039,7 +932,7 @@ const scan = struct {
         try local_fs.ensureEventCapacity(allocator);
         errdefer comptime unreachable;
 
-        info.value_ptr.status = .new;
+        info.value_ptr.status = .tracked;
         info.value_ptr.local_file_id = local_file_id;
         local_fs.repr.meta.getPtr(path).?.* = meta;
         local_fs.queueEventAssumeCapacity(.new_regular, info.key_ptr.*);
@@ -1051,23 +944,19 @@ const scan = struct {
         path: Path,
         local_file_id: w.LARGE_INTEGER,
         meta: LocalFilesystem.Repr.Metadata,
-        hash: *const network.FileHash,
     ) !void {
         const info = local_fs.repr.files.getEntry(path).?;
         assert(!info.value_ptr.directory);
         const meta_ptr = local_fs.repr.meta.getPtr(path).?;
-        const hash_ptr = local_fs.repr.hash.getPtr(path).?;
 
         if (info.value_ptr.local_file_id == local_file_id and
-            meta_ptr.size == meta.size and
-            hash_ptr.eql(hash)) return;
+            meta_ptr.size == meta.size) return;
 
         try local_fs.ensureEventCapacity(allocator);
         errdefer comptime unreachable;
 
         info.value_ptr.local_file_id = local_file_id;
         meta_ptr.* = meta;
-        hash_ptr.* = hash.*;
         local_fs.queueEventAssumeCapacity(.modified_regular, info.key_ptr.*);
     }
 
@@ -1095,7 +984,6 @@ const scan = struct {
         const info = local_fs.repr.files.fetchRemove(path).?;
         assert(!info.value.directory);
         assert(local_fs.repr.meta.remove(path));
-        assert(local_fs.repr.hash.remove(path));
         const parent = local_fs.repr.parent.fetchRemove(path).?.value;
         const parent_children = if (parent) |p| local_fs.repr.children.getPtr(p).? else &local_fs.repr.top_level_children;
         assert(parent_children.remove(path));
@@ -1141,8 +1029,6 @@ const scan = struct {
                     };
                     stack[stack_len].child_iterator = stack[stack_len].children.keyIterator();
                     stack_len += 1;
-                } else {
-                    assert(local_fs.repr.hash.remove(child_path));
                 }
             } else {
                 stack_item.children.deinit(allocator);
@@ -1176,9 +1062,7 @@ const scan = struct {
         const info = local_fs.repr.files.getEntry(path).?;
         assert(!info.value_ptr.directory);
         info.value_ptr.status = .untracked;
-        info.value_ptr.global_file_id = .unknown;
         local_fs.repr.meta.getPtr(path).?.* = undefined;
-        local_fs.repr.hash.getPtr(path).?.* = undefined;
         local_fs.queueEventAssumeCapacity(.delete_regular, info.key_ptr.*);
     }
 };
@@ -1283,6 +1167,7 @@ pub const Host = struct {
     };
 
     /// Blocks until the `Host` is finished running.
+    // TODO: Handle Writer.WriteFailed and Reader.ReadFailed errors
     pub fn run(
         host: *Host,
         diag: ?*Diagnostics,

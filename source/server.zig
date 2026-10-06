@@ -458,6 +458,7 @@ pub const Host = struct {
     };
 
     /// Blocks until the `Host` is finished running.
+    // TODO: Handle Writer.WriteFailed and Reader.ReadFailed errors
     pub fn run(
         host: *Host,
         diag: ?*Diagnostics,
