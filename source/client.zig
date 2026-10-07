@@ -29,6 +29,7 @@ pub const Database = struct {
     scan_arena: std.heap.ArenaAllocator.State,
     local_fs: LocalFilesystem,
     global_fs: GlobalFilesystem,
+    events: Events,
 
     // End fields protected by mutex
 
@@ -58,6 +59,7 @@ pub const Database = struct {
             .scan_arena = .{},
             .local_fs = .{},
             .global_fs = .{},
+            .events = .{},
 
             .host_state = .init(.{}),
             .out_path = undefined,
@@ -78,6 +80,7 @@ pub const Database = struct {
 
         db.local_fs.deinit(db.allocator);
         db.global_fs.deinit(db.allocator);
+        db.events.deinit(db.allocator);
 
         db.* = undefined;
     }
@@ -115,59 +118,77 @@ pub const Database = struct {
 
     /// Returns true if an event was sent.
     fn sendHostEvents(db: *Database, io: Io) Io.Cancelable!bool {
-        const local_event: LocalFilesystem.Event, const file_id: ?network.FileId = blk: {
+        const Event = union(enum) {
+            local: struct {
+                event: Events.Local,
+                file_id: ?network.FileId,
+            },
+            sync: struct {
+                file_id: network.FileId,
+                path: Path,
+            },
+        };
+        const event: Event = blk: {
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
-            if (db.global_fs.event_in_progress) return false;
-            const events = db.local_fs.events.items;
-            if (events.len == 0) return false;
-            const event = events[0];
-            const file_id = db.global_fs.path_to_id.get(event.path);
-            break :blk .{ event, file_id };
+            if (db.events.in_progress) return false;
+
+            const local_events = db.events.local.items;
+            if (local_events.len > 0) {
+                const event = local_events[0];
+                const file_id = db.global_fs.path_to_id.get(event.path);
+                break :blk .{ .local = .{ .event = event, .file_id = file_id } };
+            }
+
+            var sync_events = db.events.file_sync.keyIterator();
+            if (sync_events.next()) |file_id| {
+                const info = db.global_fs.files.get(file_id.*).?;
+                assert(!info.directory);
+                break :blk .{ .sync = .{ .file_id = file_id.*, .path = info.path } };
+            }
+
+            return false;
         };
 
         db.acquireHostEvent() orelse return false;
         errdefer comptime unreachable;
 
-        const host_event: Host.State.Event = blk: {
-            switch (local_event.action) {
-                .new_regular => {
-                    db.out_path = local_event.path;
-                    db.out_directory = false;
-                    break :blk .get_global_file_id;
-                },
-                .new_directory => {
-                    db.out_path = local_event.path;
-                    db.out_directory = true;
-                    break :blk .get_global_file_id;
-                },
-                .modified_regular => {
-                    db.out_file_id = file_id.?;
-                    // TODO: It should not be necessary to set the path for this event
-                    db.out_path = local_event.path;
-                    break :blk .sync_file;
-                },
-                .create_dir => {
-                    db.out_file_id = file_id.?;
-                    // TODO: It should not be necessary to set the path for this event
-                    db.out_path = local_event.path;
-                    break :blk .create_dir;
-                },
-                .delete_regular => {
-                    db.out_file_id = file_id.?;
-                    // TODO: It should not be necessary to set the path for this event
-                    db.out_path = local_event.path;
-                    break :blk .delete_file;
-                },
-                .delete_directory => {
-                    std.debug.panic("TODO: Handle the '{s}' local filesystem event", .{@tagName(local_event.action)});
-                },
-            }
+        const host_event: Host.State.Event = blk: switch (event) {
+            .local => |local| {
+                db.debug.log("(local event) action: {s}, path: {f}", .{ @tagName(local.event.action), local.event.path.formatUtf8() });
+                switch (local.event.action) {
+                    .new_regular => {
+                        db.out_path = local.event.path;
+                        db.out_directory = false;
+                        break :blk .get_global_file_id;
+                    },
+                    .new_directory => {
+                        db.out_path = local.event.path;
+                        db.out_directory = true;
+                        break :blk .get_global_file_id;
+                    },
+                    .delete_regular => {
+                        db.out_file_id = local.file_id.?;
+                        // TODO: It should not be necessary to set the path for this event
+                        db.out_path = local.event.path;
+                        break :blk .delete_file;
+                    },
+                    .delete_directory => {
+                        std.debug.panic("TODO: Handle the '{s}' local filesystem event", .{@tagName(local.event.action)});
+                    },
+                }
+            },
+            .sync => |sync| {
+                db.debug.log("(sync event) path: {f}", .{sync.path.formatUtf8()});
+                db.out_file_id = sync.file_id;
+                // TODO: It should not be necessary to set the path for this event
+                db.out_path = sync.path;
+                break :blk .sync_file;
+            },
         };
 
-        db.debug.log("(local event) action: {s}, path: {f}", .{ @tagName(local_event.action), local_event.path.formatUtf8() });
-        db.global_fs.event_in_progress = true;
+        db.events.in_progress = true;
         db.releaseHostEvent(host_event);
         io.futexWake(Host.State, &db.host_state.raw, 1);
         return true;
@@ -221,7 +242,6 @@ pub const Database = struct {
 
 pub const LocalFilesystem = struct {
     repr: Repr = .{},
-    events: std.ArrayList(Event) = .empty,
 
     /// A representation of the contents of the sync directory.
     pub const Repr = struct {
@@ -251,51 +271,24 @@ pub const LocalFilesystem = struct {
         pub const Info = struct {
             directory: bool,
             status: Status,
-            local_file_id: w.LARGE_INTEGER,
         };
 
         pub const Status = enum {
             /// A file which is being tracked.
             tracked,
             /// A file whose existence is known, but will not be synced to the server for one or more reasons.
-            ///
-            /// meta is undefined
             untracked,
         };
 
         pub const Metadata = struct {
+            local_file_id: w.LARGE_INTEGER,
             modified_time: w.LARGE_INTEGER,
             size: w.ULARGE_INTEGER,
         };
     };
 
-    pub const Event = struct {
-        action: Action,
-        path: Path,
-
-        pub const Action = enum {
-            new_regular,
-            new_directory,
-            delete_regular,
-            delete_directory,
-            modified_regular,
-
-            // TODO: Temporary workaround, delete this field
-            create_dir,
-        };
-    };
-
     pub fn deinit(local_fs: *LocalFilesystem, allocator: Allocator) void {
         local_fs.repr.deinit(allocator);
-        local_fs.events.deinit(allocator);
-    }
-
-    fn ensureEventCapacity(local_fs: *LocalFilesystem, allocator: Allocator) !void {
-        try local_fs.events.ensureUnusedCapacity(allocator, 1);
-    }
-
-    fn queueEventAssumeCapacity(local_fs: *LocalFilesystem, action: LocalFilesystem.Event.Action, path: Path) void {
-        local_fs.events.appendAssumeCapacity(.{ .action = action, .path = path });
     }
 };
 
@@ -303,7 +296,6 @@ pub const GlobalFilesystem = struct {
     // An entry in this map implies the existence of a corresponding entry in `path_to_id`.
     files: std.AutoHashMapUnmanaged(network.FileId, FileInfo) = .empty,
     path_to_id: PathHashMap(network.FileId) = .empty,
-    event_in_progress: bool = false,
 
     pub const FileInfo = struct {
         directory: bool,
@@ -322,6 +314,71 @@ pub const GlobalFilesystem = struct {
     }
 };
 
+pub const Events = struct {
+    local: std.ArrayList(Local) = .empty,
+    file_sync: std.AutoHashMapUnmanaged(network.FileId, void) = .empty,
+    in_progress: bool = false,
+
+    pub const Local = struct {
+        action: Action,
+        path: Path,
+
+        pub const Action = enum {
+            new_regular,
+            new_directory,
+            delete_regular,
+            delete_directory,
+        };
+    };
+
+    pub fn deinit(events: *Events, allocator: Allocator) void {
+        events.local.deinit(allocator);
+        events.file_sync.deinit(allocator);
+        events.* = undefined;
+    }
+
+    fn ensureLocalEventCapacity(events: *Events, allocator: Allocator) !void {
+        try events.local.ensureUnusedCapacity(allocator, 1);
+    }
+
+    fn queueLocalEventAssumeCapacity(events: *Events, action: Local.Action, path: Path) void {
+        events.local.appendAssumeCapacity(.{ .action = action, .path = path });
+    }
+
+    fn finishLocalEventWithPath(events: *Events, action: Local.Action, path: Path) void {
+        assert(events.in_progress);
+        const event = events.local.orderedRemove(0);
+        assert(event.action == action);
+        assert(event.path.eql(path));
+        events.in_progress = false;
+    }
+
+    // TODO: Maybe this function should not exist
+    fn finishLocalEventWithFileId(events: *Events, action: Local.Action, file_id: network.FileId) void {
+        const db: *const Database = @alignCast(@fieldParentPtr("events", events));
+        const path = db.global_fs.files.get(file_id).?.path;
+        events.finishLocalEventWithPath(action, path);
+    }
+
+    fn ensureSyncEventCapacity(events: *Events, allocator: Allocator) !void {
+        try events.file_sync.ensureUnusedCapacity(allocator, 1);
+    }
+
+    fn queueSyncEventAssumeCapacity(events: *Events, file_id: network.FileId) void {
+        const db: *const Database = @alignCast(@fieldParentPtr("events", events));
+        assert(!db.global_fs.files.get(file_id).?.directory);
+        events.file_sync.putAssumeCapacity(file_id, {});
+    }
+
+    fn finishSyncEvent(events: *Events, file_id: network.FileId) void {
+        assert(events.in_progress);
+        const db: *const Database = @alignCast(@fieldParentPtr("events", events));
+        assert(!db.global_fs.files.get(file_id).?.directory);
+        assert(events.file_sync.remove(file_id));
+        events.in_progress = false;
+    }
+};
+
 pub const LockedDatabase = struct {
     db: *Database,
     debug: Debug = .{},
@@ -336,22 +393,10 @@ pub const LockedDatabase = struct {
         locked.db.sendAlert(io);
     }
 
-    fn finishLocalEventWithPath(locked: LockedDatabase, action: LocalFilesystem.Event.Action, path: Path) void {
-        const event = locked.db.local_fs.events.orderedRemove(0);
-        assert(event.action == action);
-        assert(event.path.eql(path));
-        locked.db.global_fs.event_in_progress = false;
-    }
-
-    fn finishLocalEventWithFileId(locked: LockedDatabase, action: LocalFilesystem.Event.Action, file_id: network.FileId) void {
-        const path = locked.db.global_fs.files.get(file_id).?.path;
-        locked.finishLocalEventWithPath(action, path);
-    }
-
     // called from Host
     fn setNewFileId(locked: LockedDatabase, path: Path, kind: network.FileKind, file_id_list: []const network.FileId) !void {
         assert(file_id_list.len > 0);
-        locked.finishLocalEventWithPath(switch (kind) {
+        locked.db.events.finishLocalEventWithPath(switch (kind) {
             .directory => .new_directory,
             .regular => .new_regular,
         }, path);
@@ -359,8 +404,10 @@ pub const LockedDatabase = struct {
         const component_count: fairy.PathComponentCount = @intCast(file_id_list.len);
         try locked.db.global_fs.files.ensureUnusedCapacity(locked.db.allocator, component_count);
         try locked.db.global_fs.path_to_id.ensureUnusedCapacity(locked.db.allocator, component_count);
-        // TODO: We should not be using the local event queue for this
-        try locked.db.local_fs.ensureEventCapacity(locked.db.allocator);
+        switch (kind) {
+            .regular => try locked.db.events.ensureSyncEventCapacity(locked.db.allocator),
+            .directory => {},
+        }
         errdefer comptime unreachable;
 
         const Iterator = std.fs.path.ComponentIterator(.windows, u16);
@@ -396,28 +443,28 @@ pub const LockedDatabase = struct {
         }
         assert(it.peekNext() == null);
 
-        // TODO: We should not be using the local event queue for this
-        {
-            const info = locked.db.local_fs.repr.files.getPtr(path) orelse std.debug.panic("TODO", .{});
-            assert(info.status == .tracked);
-            locked.db.local_fs.queueEventAssumeCapacity(if (info.directory) .create_dir else .modified_regular, path);
+        switch (kind) {
+            .regular => locked.db.events.queueSyncEventAssumeCapacity(file_id_list[file_id_list.len - 1]),
+            .directory => {},
         }
     }
 
     // called from Host
     fn confirmDeleteFile(locked: LockedDatabase, file_id: network.FileId) void {
-        locked.finishLocalEventWithFileId(.delete_regular, file_id);
+        locked.db.events.finishLocalEventWithFileId(.delete_regular, file_id);
         locked.db.global_fs.deleteRegularFile(file_id);
     }
 
     // called from Host
     fn markFileAsSynced(locked: LockedDatabase, file_id: network.FileId) void {
-        locked.finishLocalEventWithFileId(.modified_regular, file_id);
+        locked.db.events.finishSyncEvent(file_id);
     }
 
     // called from Host
     fn acknowledgeCreateDir(locked: LockedDatabase, file_id: network.FileId) void {
-        locked.finishLocalEventWithFileId(.create_dir, file_id);
+        _ = locked;
+        _ = file_id;
+        std.debug.panic("TODO", .{});
     }
 
     pub const Debug = struct {
@@ -458,16 +505,15 @@ pub const LockedDatabase = struct {
         pub fn printFileEvents(debug: *const Debug, writer: *Io.Writer) !void {
             const locked: *const LockedDatabase = @alignCast(@fieldParentPtr("debug", debug));
 
-            inline for (&[_]struct { []const LocalFilesystem.Event.Action, []const u8 }{
+            inline for (&[_]struct { []const Events.Local.Action, []const u8 }{
                 .{ &.{ .new_regular, .new_directory }, "Locally new files:\n" },
-                .{ &.{.modified_regular}, "Locally modified files:\n" },
                 .{ &.{ .delete_regular, .delete_directory }, "Locally deleted files:\n" },
             }) |item| {
                 const actions, const text = item;
                 try writer.writeAll(text);
 
-                for (locked.db.local_fs.events.items) |event| {
-                    _ = std.mem.findScalar(LocalFilesystem.Event.Action, actions, event.action) orelse continue;
+                for (locked.db.events.local.items) |event| {
+                    _ = std.mem.findScalar(Events.Local.Action, actions, event.action) orelse continue;
                     try writer.print("\t{f}\n", .{event.path.formatUtf8()});
                 }
             }
@@ -478,6 +524,8 @@ pub const LockedDatabase = struct {
 const scan = struct {
     const Context = struct {
         local_fs: *LocalFilesystem,
+        global_fs: *GlobalFilesystem,
+        events: *Events,
         db_allocator: Allocator,
         scan_arena: *std.heap.ArenaAllocator,
         path_arena: *std.heap.ArenaAllocator,
@@ -528,6 +576,8 @@ const scan = struct {
 
             return .{
                 .local_fs = &locked.db.local_fs,
+                .global_fs = &locked.db.global_fs,
+                .events = &locked.db.events,
                 .db_allocator = locked.db.allocator,
                 .path_arena = path_arena,
                 .scan_arena = scan_arena,
@@ -723,9 +773,9 @@ const scan = struct {
         information: *const NtQueryInformation,
         set_to_untracked: bool,
     ) !void {
-        const local_file_id = information.FileId;
         const size = std.math.cast(w.ULARGE_INTEGER, information.EndOfFile) orelse return error.Unexpected;
         const meta = LocalFilesystem.Repr.Metadata{
+            .local_file_id = information.FileId,
             .modified_time = information.ChangeTime,
             .size = size,
         };
@@ -742,14 +792,14 @@ const scan = struct {
             switch (info.status) {
                 .tracked => {
                     if (set_to_untracked) {
-                        try changeTrackedRegularFileToUntracked(ctx.local_fs, ctx.db_allocator, path);
+                        try changeTrackedRegularFileToUntracked(ctx.local_fs, ctx.events, ctx.db_allocator, path);
                     } else {
-                        try updateTrackedRegularFile(ctx.local_fs, ctx.db_allocator, path, local_file_id, meta);
+                        try updateTrackedRegularFile(ctx.local_fs, ctx.global_fs, ctx.events, ctx.db_allocator, path, meta);
                     }
                 },
                 .untracked => {
                     if (set_to_untracked) return;
-                    try changeUntrackedRegularFileToNew(ctx.local_fs, ctx.db_allocator, path, local_file_id, meta);
+                    try changeUntrackedRegularFileToNew(ctx.local_fs, ctx.events, ctx.db_allocator, path, meta);
                 },
             }
         } else {
@@ -763,11 +813,8 @@ const scan = struct {
             gop.value_ptr.* = .{ .already_seen = true, .already_scanned_for_deletion = false };
 
             const parent = ctx.parent_paths.getLast();
-            if (set_to_untracked) {
-                try addFile(ctx.local_fs, ctx.db_allocator, .regular, .untracked, path_copy, parent, local_file_id, {});
-            } else {
-                try addFile(ctx.local_fs, ctx.db_allocator, .regular, .tracked, path_copy, parent, local_file_id, meta);
-            }
+            const status: LocalFilesystem.Repr.Status = if (set_to_untracked) .untracked else .tracked;
+            try addFile(ctx.local_fs, ctx.events, ctx.db_allocator, .regular, status, path_copy, parent, meta);
         }
     }
 
@@ -777,8 +824,8 @@ const scan = struct {
         information: *const NtQueryInformation,
         set_to_untracked: bool,
     ) !void {
-        const local_file_id = information.FileId;
         const meta = LocalFilesystem.Repr.Metadata{
+            .local_file_id = information.FileId,
             .modified_time = information.ChangeTime,
             .size = 0,
         };
@@ -795,7 +842,7 @@ const scan = struct {
             switch (info.status) {
                 .tracked => {
                     if (set_to_untracked) std.debug.panic("TODO set a tracked directory to untracked: {f}", .{path.formatUtf8()});
-                    updateTrackedDirectoryFile(ctx.local_fs, path, local_file_id, meta);
+                    updateTrackedDirectoryFile(ctx.local_fs, path, meta);
                 },
                 .untracked => std.debug.panic("TODO handle untracked directory: {f}", .{path.formatUtf8()}),
             }
@@ -813,7 +860,7 @@ const scan = struct {
             if (set_to_untracked) {
                 std.debug.panic("TODO handle untracked directory: {f}", .{path.formatUtf8()});
             } else {
-                try addFile(ctx.local_fs, ctx.db_allocator, .directory, .tracked, path_copy, parent, local_file_id, meta);
+                try addFile(ctx.local_fs, ctx.events, ctx.db_allocator, .directory, .tracked, path_copy, parent, meta);
             }
         }
     }
@@ -839,7 +886,7 @@ const scan = struct {
                 } else {
                     switch (info.status) {
                         .tracked => switch (info.directory) {
-                            false => try deleteTrackedRegularFile(ctx.local_fs, ctx.db_allocator, child.*),
+                            false => try deleteTrackedRegularFile(ctx.local_fs, ctx.events, ctx.db_allocator, child.*),
                             // TODO: try deleteTrackedDirectoryFile(ctx, ctx.locked.db.allocator, path),
                             true => std.debug.panic("TODO delete a tracked directory: {f}", .{child.formatUtf8()}),
                         },
@@ -861,16 +908,13 @@ const scan = struct {
 
     fn addFile(
         local_fs: *LocalFilesystem,
+        events: *Events,
         allocator: Allocator,
         kind: FileKind,
-        comptime status: LocalFilesystem.Repr.Status,
+        status: LocalFilesystem.Repr.Status,
         path: Path,
         parent: ?Path,
-        local_file_id: w.LARGE_INTEGER,
-        meta: switch (status) {
-            .tracked => LocalFilesystem.Repr.Metadata,
-            .untracked => void,
-        },
+        meta: LocalFilesystem.Repr.Metadata,
     ) !void {
         try local_fs.repr.files.ensureUnusedCapacity(allocator, 1);
         try local_fs.repr.parent.ensureUnusedCapacity(allocator, 1);
@@ -886,7 +930,7 @@ const scan = struct {
         };
 
         switch (status) {
-            .tracked => try local_fs.ensureEventCapacity(allocator),
+            .tracked => try events.ensureLocalEventCapacity(allocator),
             .untracked => {},
         }
         errdefer comptime unreachable;
@@ -899,20 +943,16 @@ const scan = struct {
                 .directory => true,
             },
             .status = status,
-            .local_file_id = local_file_id,
         };
         local_fs.repr.parent.putAssumeCapacityNoClobber(path, if (parent) |p| local_fs.repr.files.getKey(p).? else null);
-        local_fs.repr.meta.putAssumeCapacityNoClobber(path, switch (status) {
-            .tracked => meta,
-            .untracked => undefined,
-        });
+        local_fs.repr.meta.putAssumeCapacityNoClobber(path, meta);
         switch (kind) {
             .regular => {},
             .directory => local_fs.repr.children.putAssumeCapacityNoClobber(path, .empty),
         }
         parent_children.putAssumeCapacityNoClobber(path, {});
         switch (status) {
-            .tracked => local_fs.queueEventAssumeCapacity(switch (kind) {
+            .tracked => events.queueLocalEventAssumeCapacity(switch (kind) {
                 .regular => .new_regular,
                 .directory => .new_directory,
             }, path),
@@ -922,63 +962,64 @@ const scan = struct {
 
     fn changeUntrackedRegularFileToNew(
         local_fs: *LocalFilesystem,
+        events: *Events,
         allocator: Allocator,
         path: Path,
-        local_file_id: w.LARGE_INTEGER,
         meta: LocalFilesystem.Repr.Metadata,
     ) !void {
         const info = local_fs.repr.files.getEntry(path).?;
 
-        try local_fs.ensureEventCapacity(allocator);
+        try events.ensureLocalEventCapacity(allocator);
         errdefer comptime unreachable;
 
         info.value_ptr.status = .tracked;
-        info.value_ptr.local_file_id = local_file_id;
         local_fs.repr.meta.getPtr(path).?.* = meta;
-        local_fs.queueEventAssumeCapacity(.new_regular, info.key_ptr.*);
+        events.queueLocalEventAssumeCapacity(.new_regular, info.key_ptr.*);
     }
 
     fn updateTrackedRegularFile(
         local_fs: *LocalFilesystem,
+        global_fs: *GlobalFilesystem,
+        events: *Events,
         allocator: Allocator,
         path: Path,
-        local_file_id: w.LARGE_INTEGER,
         meta: LocalFilesystem.Repr.Metadata,
     ) !void {
         const info = local_fs.repr.files.getEntry(path).?;
         assert(!info.value_ptr.directory);
         const meta_ptr = local_fs.repr.meta.getPtr(path).?;
 
-        if (info.value_ptr.local_file_id == local_file_id and
+        if (meta_ptr.local_file_id == meta.local_file_id and
             meta_ptr.size == meta.size) return;
 
-        try local_fs.ensureEventCapacity(allocator);
+        try events.ensureSyncEventCapacity(allocator);
         errdefer comptime unreachable;
 
-        info.value_ptr.local_file_id = local_file_id;
         meta_ptr.* = meta;
-        local_fs.queueEventAssumeCapacity(.modified_regular, info.key_ptr.*);
+        const file_id = global_fs.path_to_id.get(path).?;
+        events.queueSyncEventAssumeCapacity(file_id);
     }
 
     fn updateTrackedDirectoryFile(
         local_fs: *LocalFilesystem,
         path: Path,
-        local_file_id: w.LARGE_INTEGER,
         meta: LocalFilesystem.Repr.Metadata,
     ) void {
         const info = local_fs.repr.files.getPtr(path).?;
         assert(info.directory);
-        info.local_file_id = local_file_id;
         local_fs.repr.meta.getPtr(path).?.* = meta;
         // TODO: Send an event?
     }
 
     fn deleteTrackedRegularFile(
         local_fs: *LocalFilesystem,
+        events: *Events,
         allocator: Allocator,
         path: Path,
     ) !void {
-        try local_fs.ensureEventCapacity(allocator);
+        // TODO: Delete/cancel any sync events associated with this file
+
+        try events.ensureLocalEventCapacity(allocator);
         errdefer comptime unreachable;
 
         const info = local_fs.repr.files.fetchRemove(path).?;
@@ -987,15 +1028,17 @@ const scan = struct {
         const parent = local_fs.repr.parent.fetchRemove(path).?.value;
         const parent_children = if (parent) |p| local_fs.repr.children.getPtr(p).? else &local_fs.repr.top_level_children;
         assert(parent_children.remove(path));
-        local_fs.queueEventAssumeCapacity(.delete_regular, info.key);
+        events.queueLocalEventAssumeCapacity(.delete_regular, info.key);
     }
 
     fn deleteTrackedDirectoryFile(
         local_fs: *LocalFilesystem,
+        events: *Events,
         allocator: Allocator,
         path: Path,
     ) !void {
-        try local_fs.ensureEventCapacity(allocator);
+        // TODO: Delete/cancel any sync events associated with this directory and its children
+        try events.ensureLocalEventCapacity(allocator);
         errdefer comptime unreachable;
 
         const StackItem = struct {
@@ -1048,22 +1091,25 @@ const scan = struct {
 
         assert(local_fs.repr.meta.remove(path));
 
-        local_fs.queueEventAssumeCapacity(.delete_directory, info.key);
+        events.queueLocalEventAssumeCapacity(.delete_directory, info.key);
     }
 
     fn changeTrackedRegularFileToUntracked(
         local_fs: *LocalFilesystem,
+        events: *Events,
         allocator: Allocator,
         path: Path,
     ) !void {
-        try local_fs.ensureEventCapacity(allocator);
+        // TODO: Delete/cancel any sync events associated with this file
+
+        try events.ensureLocalEventCapacity(allocator);
         errdefer comptime unreachable;
 
         const info = local_fs.repr.files.getEntry(path).?;
         assert(!info.value_ptr.directory);
         info.value_ptr.status = .untracked;
         local_fs.repr.meta.getPtr(path).?.* = undefined;
-        local_fs.queueEventAssumeCapacity(.delete_regular, info.key_ptr.*);
+        events.queueLocalEventAssumeCapacity(.delete_regular, info.key_ptr.*);
     }
 };
 
@@ -1167,7 +1213,6 @@ pub const Host = struct {
     };
 
     /// Blocks until the `Host` is finished running.
-    // TODO: Handle Writer.WriteFailed and Reader.ReadFailed errors
     pub fn run(
         host: *Host,
         diag: ?*Diagnostics,
