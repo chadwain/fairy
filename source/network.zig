@@ -1,6 +1,5 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const fairy = @import("fairy.zig");
@@ -8,34 +7,14 @@ const fairy = @import("fairy.zig");
 /// The endianness of message contents, except for file paths, which have their own encoding.
 pub const endian: std.builtin.Endian = .little;
 
-pub const MessageHeaderTag = enum(u2) {
+pub const MessageHeader = enum(u8) {
     disconnect,
-    new_tx,
-    new_tx_reply,
-    existing_tx,
-};
-
-pub const TransactionId = enum(u3) {
-    invalid = 7,
-    _,
-
-    pub fn format(tx_id: TransactionId, writer: *Io.Writer) Io.Writer.Error!void {
-        if (std.enums.tagName(TransactionId, tx_id)) |name| {
-            try writer.writeAll(name);
-        } else {
-            try writer.print("{}", .{@intFromEnum(tx_id)});
-        }
-    }
-};
-
-pub const MessageHeader = packed struct(u8) {
-    tag: MessageHeaderTag,
-    /// The transaction ID of the destination peer.
-    /// Not valid when tag is `new_tx`.
-    tx_id: TransactionId,
-    /// The transaction ID of the source peer.
-    /// Only valid when `tag` is `new_tx` or `new_tx_reply`.
-    peer_tx_id: TransactionId,
+    /// Sent when the host begins a new message thread.
+    new_thread,
+    /// Sent after receiving a `new_thread` message from the peer.
+    new_thread_reply,
+    /// Sent on any subsequent messages from the host in the same message thread.
+    existing_thread,
 };
 
 pub const Action = enum(u8) {
@@ -134,31 +113,8 @@ pub const Writer = struct {
         try writer.io.writeInt(@typeInfo(Enum).@"enum".tag_type, @intFromEnum(value), endian);
     }
 
-    pub fn sendMessageHeaderExistingTx(writer: Writer, peer_tx_id: TransactionId) !void {
-        const header = MessageHeader{
-            .tag = .existing_tx,
-            .tx_id = peer_tx_id,
-            .peer_tx_id = .invalid,
-        };
-        try writer.io.writeStruct(header, endian);
-    }
-
-    pub fn sendMessageHeaderNewTx(writer: Writer, tx_id: TransactionId) !void {
-        const header = MessageHeader{
-            .tag = .new_tx,
-            .tx_id = .invalid,
-            .peer_tx_id = tx_id,
-        };
-        try writer.io.writeStruct(header, endian);
-    }
-
-    pub fn sendMessageHeaderNewTxReply(writer: Writer, tx_id: TransactionId, peer_tx_id: TransactionId) !void {
-        const header = MessageHeader{
-            .tag = .new_tx_reply,
-            .tx_id = peer_tx_id,
-            .peer_tx_id = tx_id,
-        };
-        try writer.io.writeStruct(header, endian);
+    pub fn sendMessageHeader(writer: Writer, header: MessageHeader) !void {
+        try writer.writeEnum(MessageHeader, header);
     }
 
     pub fn sendAction(writer: Writer, action: Action) !void {
@@ -217,8 +173,10 @@ pub const Reader = struct {
         return std.enums.fromInt(Enum, int);
     }
 
-    pub fn receiveMessageHeader(reader: Reader) Io.Reader.Error!MessageHeader {
-        return reader.io.takeStruct(MessageHeader, endian);
+    pub const ReceiveMessageHeaderError = error{UnknownMessageHeader} || Io.Reader.Error;
+
+    pub fn receiveMessageHeader(reader: Reader) ReceiveMessageHeaderError!MessageHeader {
+        return try reader.readEnum(MessageHeader) orelse error.UnknownMessageHeader;
     }
 
     pub const ReceiveActionError = error{UnknownAction} || Io.Reader.Error;

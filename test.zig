@@ -42,7 +42,7 @@ fn runCli(io: Io, cdb: *fairy.client.Database, sdb: *fairy.server.Database) !voi
     const Command = enum {
         quit,
         client_print_files,
-        client_print_file_events,
+        client_print_local_events,
         client_scan,
         server_print_files_folders,
         help,
@@ -50,7 +50,7 @@ fn runCli(io: Io, cdb: *fairy.client.Database, sdb: *fairy.server.Database) !voi
     const commands = std.StaticStringMap(Command).initComptime(.{
         .{ "q", Command.quit },
         .{ "a", Command.client_print_files },
-        .{ "e", Command.client_print_file_events },
+        .{ "e", Command.client_print_local_events },
         .{ "s", Command.client_scan },
         .{ "sa", Command.server_print_files_folders },
         .{ "?", Command.help },
@@ -83,10 +83,10 @@ fn runCli(io: Io, cdb: *fairy.client.Database, sdb: *fairy.server.Database) !voi
                 try locked.debug.printFileEntries(stdout);
                 try stdout.flush();
             },
-            .client_print_file_events => {
+            .client_print_local_events => {
                 const locked = try cdb.lock(io);
                 defer locked.unlock(io);
-                try locked.debug.printFileEvents(stdout);
+                try locked.debug.printLocalEvents(stdout);
                 try stdout.flush();
             },
             .client_scan => {

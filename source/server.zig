@@ -405,42 +405,34 @@ pub const Database = struct {
 };
 
 pub const Host = struct {
-    tx: Transaction,
+    mt: MessageThread,
     // TODO: Don't store this here, instead make it an argument to `run`
     db: *Database,
     debug: Debug,
 
     pub const Debug = struct {
-        name: ?[]const u8 = null,
-    };
-
-    pub const Transaction = struct {
-        data: TxData,
-        peer_tx_id: network.TransactionId,
+        name: []const u8 = "<unnamed>",
     };
 
     pub const State = packed struct(u32) {
-        tx: TxStatus = .init,
+        mt: MtStatus = .init,
         padding: u30 = 0,
 
-        pub const TxStatus = enum(u2) {
-            /// The TX is free to use.
+        pub const MtStatus = enum(u2) {
+            /// The message thread is free to use.
             init,
-            /// The TX is locked and being initialized.
+            /// The message thread is locked and being initialized.
             acquired,
-            /// The TX is locked and owned by the outgoing task.
+            /// The message thread is locked and owned by the outgoing task.
             outgoing,
-            /// The TX is locked and owned by the incoming task.
+            /// The message thread is locked and owned by the incoming task.
             incoming,
         };
     };
 
     pub fn init(db: *Database, debug: Debug) Host {
         return .{
-            .tx = .{
-                .data = undefined,
-                .peer_tx_id = undefined,
-            },
+            .mt = undefined,
             .db = db,
             .debug = debug,
         };
@@ -485,8 +477,8 @@ pub const Host = struct {
         var select = Io.Select(ns.SelectUnion).init(io, &select_buffer);
         defer while (select.cancel()) |result| ns.addToDiagnostics(diag, result);
 
-        try select.concurrent(.send_error, sendOutgoingTxs, .{ host, .init(writer), io });
-        try select.concurrent(.recv_error, receiveIncomingTxs, .{ host, .init(reader), io });
+        try select.concurrent(.send_error, sendOutgoingMessages, .{ host, .init(writer), io });
+        try select.concurrent(.recv_error, receiveIncomingMessages, .{ host, .init(reader), io });
 
         host.debugLog("started", .{});
         ns.addToDiagnostics(diag, try select.await());
@@ -494,87 +486,79 @@ pub const Host = struct {
 
     pub const SendError = Io.Writer.Error || Io.Cancelable || fairy.windows.SendFileError;
 
-    fn sendOutgoingTxs(host: *Host, writer: network.Writer, io: Io) SendError!void {
+    fn sendOutgoingMessages(host: *Host, writer: network.Writer, io: Io) SendError!void {
         while (true) {
             while (true) {
                 const state = host.db.host_state.load(.monotonic);
-                if (state.tx == .outgoing) break;
+                if (state.mt == .outgoing) break;
                 try io.futexWait(State, &host.db.host_state.raw, state);
             }
 
-            const tx_id: network.TransactionId = @enumFromInt(0); // TODO hardcoded value
-            switch (host.tx.data) {
+            switch (host.mt) {
                 .in_new_file => |*in_new_file| {
-                    try in_new_file.sendDecision(host, tx_id, host.tx.peer_tx_id, io, writer);
+                    try in_new_file.sendDecision(host, io, writer);
                 },
                 .in_file_contents => |*in_file_contents| switch (in_file_contents.state) {
-                    .send_decision => try in_file_contents.sendDecision(host, tx_id, host.tx.peer_tx_id, io, writer),
-                    .send_result => try in_file_contents.sendResult(host, tx_id, host.tx.peer_tx_id, io, writer),
+                    .send_decision => try in_file_contents.sendDecision(host, io, writer),
+                    .send_result => try in_file_contents.sendResult(host, io, writer),
                     .receive_file_contents => unreachable,
                 },
                 .in_create_dir => |*in_create_dir| {
-                    try in_create_dir.sendResponse(host, tx_id, host.tx.peer_tx_id, io, writer);
+                    try in_create_dir.sendResponse(host, io, writer);
                 },
                 .in_delete_file => |*in_delete_file| {
-                    try in_delete_file.sendConfirmation(host, tx_id, host.tx.peer_tx_id, io, writer);
+                    try in_delete_file.sendConfirmation(host, io, writer);
                 },
             }
         }
     }
 
     pub const RecvError = error{
-        InvalidTxId,
-        InvalidPeerTxId,
-        WrongTxId,
-        WrongPeerTxId,
         InvalidAction,
         InvalidHeader,
+        UnexpectedIncomingMessage,
     } ||
         network.Reader.ReceiveActionError ||
+        network.Reader.ReceiveFileKindError ||
+        network.Reader.ReceiveMessageHeaderError ||
         network.Reader.ReceivePathEncodingError ||
         network.Reader.ReceiveWindowsPathByteCountError ||
         network.Reader.ReceiveWindowsPathError ||
-        network.Reader.ReceiveFileKindError ||
         Io.Cancelable ||
         Allocator.Error ||
-        AddOutgoingTxError ||
         fairy.windows.ReceiveFileError ||
         Database.CreateParentDirectoriesError;
 
-    fn receiveIncomingTxs(host: *Host, reader: network.Reader, io: Io) RecvError!void {
+    fn receiveIncomingMessages(host: *Host, reader: network.Reader, io: Io) RecvError!void {
         while (true) {
             const header = try reader.receiveMessageHeader();
-            if (header.tag == .disconnect) break;
+            if (header == .disconnect) break;
             const action = try reader.receiveAction();
-            host.logMessage(.incoming, header.tx_id, action, header.peer_tx_id);
+            host.logMessage(.incoming, action);
 
-            switch (header.tag) {
+            switch (header) {
                 .disconnect => unreachable,
-                .new_tx => {
-                    if (header.tx_id != .invalid) return error.InvalidTxId;
-                    if (header.peer_tx_id == .invalid) return error.InvalidPeerTxId;
+                .new_thread => {
                     switch (action) {
                         .resolve_path => {
-                            try TxData.InNewFile.newTx(host, header.peer_tx_id, io, reader);
+                            try MessageThread.InNewFile.initMessageThread(host, io, reader);
                         },
                         .transfer_file_id => {
-                            try TxData.InFileContents.newTx(host, header.peer_tx_id, io, reader);
+                            try MessageThread.InFileContents.initMessageThread(host, io, reader);
                         },
                         .create_dir => {
-                            try TxData.InCreateDir.newTx(host, header.peer_tx_id, io, reader);
+                            try MessageThread.InCreateDir.initMessageThread(host, io, reader);
                         },
                         .delete_file => {
-                            try TxData.InDeleteFile.newTx(host, header.peer_tx_id, io, reader);
+                            try MessageThread.InDeleteFile.initMessageThread(host, io, reader);
                         },
                         else => return error.InvalidAction,
                     }
                 },
-                .new_tx_reply => {
-                    if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
-                    if (host.db.host_state.load(.monotonic).tx != .incoming) return error.InvalidTxId;
-                    if (host.tx.peer_tx_id != .invalid) return error.WrongPeerTxId;
+                .new_thread_reply => {
+                    if (host.db.host_state.load(.monotonic).mt != .incoming) return error.UnexpectedIncomingMessage;
 
-                    switch (host.tx.data) {
+                    switch (host.mt) {
                         .in_new_file => unreachable,
                         .in_file_contents => |*in_file_contents| switch (in_file_contents.state) {
                             .receive_file_contents => return error.InvalidHeader,
@@ -584,16 +568,14 @@ pub const Host = struct {
                         .in_delete_file => unreachable,
                     }
                 },
-                .existing_tx => {
-                    if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
-                    if (host.db.host_state.load(.monotonic).tx != .incoming) return error.InvalidTxId;
-                    if (header.peer_tx_id != .invalid) return error.WrongPeerTxId;
+                .existing_thread => {
+                    if (host.db.host_state.load(.monotonic).mt != .incoming) return error.UnexpectedIncomingMessage;
 
-                    switch (host.tx.data) {
+                    switch (host.mt) {
                         .in_new_file => unreachable,
                         .in_file_contents => |*in_file_contents| switch (in_file_contents.state) {
                             .receive_file_contents => {
-                                try in_file_contents.receiveFileContents(host, reader, io, header.tx_id, action);
+                                try in_file_contents.receiveFileContents(host, reader, io, action);
                             },
                             .send_decision, .send_result => unreachable,
                         },
@@ -605,48 +587,31 @@ pub const Host = struct {
         }
     }
 
-    const AddOutgoingTxError = error{NoTxSlotsAvailable};
+    fn queueOutgoingMessage(host: *Host, io: Io, data: MessageThread) void {
+        host.acquireMessageThread() orelse std.debug.panic("TODO: Message thread could not be acquired", .{});
 
-    fn addOutgoingTx(
-        host: *Host,
-        io: Io,
-        data: TxData,
-        // TODO Make non-nullable
-        peer_tx_id: ?network.TransactionId,
-    ) AddOutgoingTxError!void {
-        _ = try host.acquireUnusedTx();
+        host.mt = data;
 
-        host.tx.data = data;
-        host.tx.peer_tx_id = peer_tx_id orelse .invalid;
-
-        host.releaseNewTxStatus(.acquired, .outgoing);
+        host.releaseNewMessageThreadStatus(.acquired, .outgoing);
         io.futexWake(State, &host.db.host_state.raw, 1);
     }
 
-    fn flipTransaction(
-        host: *Host,
-        comptime to: State.TxStatus,
-        tx_id: network.TransactionId,
-        io: Io,
-    ) void {
-        assert(@intFromEnum(tx_id) == 0); // TODO: hardcoded value
+    fn flipTransaction(host: *Host, comptime to: State.MtStatus, io: Io) void {
         switch (to) {
             .init, .acquired => unreachable,
             .outgoing => {
-                host.releaseNewTxStatus(.incoming, to);
+                host.releaseNewMessageThreadStatus(.incoming, to);
                 io.futexWake(State, &host.db.host_state.raw, 1);
             },
             .incoming => {
-                host.releaseNewTxStatus(.outgoing, to);
+                host.releaseNewMessageThreadStatus(.outgoing, to);
             },
         }
     }
 
-    fn deleteTransaction(host: *Host, tx_id: network.TransactionId, expected_status: State.TxStatus, io: Io) void {
-        assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
-        host.tx.data = undefined;
-        host.tx.peer_tx_id = undefined;
-        host.releaseNewTxStatus(expected_status, .init);
+    fn deleteTransaction(host: *Host, expected_status: State.MtStatus, io: Io) void {
+        host.mt = undefined;
+        host.releaseNewMessageThreadStatus(expected_status, .init);
 
         switch (expected_status) {
             .init, .acquired => unreachable,
@@ -655,58 +620,46 @@ pub const Host = struct {
         }
     }
 
-    fn acquireUnusedTx(host: *Host) !network.TransactionId {
+    /// Returns null if it could not be acquired.
+    fn acquireMessageThread(host: *Host) ?void {
         // TODO switch to using simple atomic stores/loads
         var old_state = host.db.host_state.load(.monotonic);
-        while (old_state.tx == .init) {
+        while (old_state.mt == .init) {
             var new_state = old_state;
-            new_state.tx = .acquired;
+            new_state.mt = .acquired;
             old_state = host.db.host_state.cmpxchgWeak(old_state, new_state, .acquire, .monotonic) orelse break;
-        } else return error.NoTxSlotsAvailable;
-        return @enumFromInt(0); // TODO hardcoded value
+        } else return null;
     }
 
-    fn releaseNewTxStatus(host: *Host, expected: State.TxStatus, new: State.TxStatus) void {
+    fn releaseNewMessageThreadStatus(host: *Host, expected: State.MtStatus, new: State.MtStatus) void {
         // TODO switch to using simple atomic stores/loads
         var old_state = host.db.host_state.load(.monotonic);
         while (true) {
-            assert(old_state.tx == expected);
+            assert(old_state.mt == expected);
             var new_state = old_state;
-            new_state.tx = new;
+            new_state.mt = new;
             old_state = host.db.host_state.cmpxchgWeak(old_state, new_state, .release, .monotonic) orelse break;
         }
     }
 
     fn debugLog(host: *const Host, comptime fmt: []const u8, args: anytype) void {
-        if (host.debug.name) |name| {
-            fairy.log.debug("(host:{s}) " ++ fmt, .{name} ++ args);
-        } else {
-            fairy.log.debug(fmt, args);
-        }
+        fairy.log.debug("(host:{s}) " ++ fmt, .{host.debug.name} ++ args);
     }
 
     fn logMessage(
         host: *const Host,
-        tx_status: Host.State.TxStatus,
-        tx_id: network.TransactionId,
+        comptime mt_status: Host.State.MtStatus,
         action: network.Action,
-        peer_tx_id: network.TransactionId,
     ) void {
-        switch (tx_status) {
+        switch (mt_status) {
             .init, .acquired => unreachable,
-            .outgoing => host.debugLog(
-                "{s} tx#{f} {s} -> peer tx#{f}",
-                .{ @tagName(tx_status), tx_id, @tagName(action), peer_tx_id },
-            ),
-            .incoming => host.debugLog(
-                "{s} tx#{f} <- peer tx#{f} {s}",
-                .{ @tagName(tx_status), tx_id, peer_tx_id, @tagName(action) },
-            ),
+            .outgoing => host.debugLog("outgoing: {s}", .{@tagName(action)}),
+            .incoming => host.debugLog("incoming: {s}", .{@tagName(action)}),
         }
     }
 };
 
-pub const TxData = union(enum) {
+pub const MessageThread = union(enum) {
     in_new_file: InNewFile,
     in_file_contents: InFileContents,
     in_create_dir: InCreateDir,
@@ -723,9 +676,8 @@ pub const TxData = union(enum) {
             wrong_file_kind,
         };
 
-        fn newTx(
+        fn initMessageThread(
             host: *Host,
-            peer_tx_id: network.TransactionId,
             io: Io,
             reader: network.Reader,
         ) !void {
@@ -736,17 +688,17 @@ pub const TxData = union(enum) {
             var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
             const path = reader.receiveWindowsPath(path_byte_count, encoding, &file_path_buffer) catch |err| switch (err) {
                 error.InvalidPath => {
-                    const data: TxData = .{
+                    const data: MessageThread = .{
                         .in_new_file = .{
                             .data = .invalid_path,
                         },
                     };
-                    return try host.addOutgoingTx(io, data, peer_tx_id);
+                    return host.queueOutgoingMessage(io, data);
                 },
                 error.ReadFailed, error.EndOfStream => |e| return e,
             };
 
-            const data: TxData = .{
+            const data: MessageThread = .{
                 .in_new_file = .{
                     .data = if (host.db.newFile(path, kind, io)) |file_id|
                         .{ .success = file_id }
@@ -758,32 +710,26 @@ pub const TxData = union(enum) {
                     },
                 },
             };
-            try host.addOutgoingTx(io, data, peer_tx_id);
+            host.queueOutgoingMessage(io, data);
         }
 
         fn sendDecision(
             in_new_file: *const InNewFile,
             host: *Host,
-            tx_id: network.TransactionId,
-            peer_tx_id: network.TransactionId,
             io: Io,
             writer: network.Writer,
         ) !void {
-            assert(peer_tx_id != .invalid);
-
-            const outgoing_tx_id: network.TransactionId = .invalid;
-
             const action: network.Action = .resolve_path_response;
-            host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+            host.logMessage(.outgoing, action);
 
             switch (in_new_file.data) {
                 .success => |file_id| {
                     var reverse_file_ids_buffer: [fairy.max_path_components]network.FileId = undefined;
                     const reversed_file_id_path = try host.db.getReverseFileIdPath(file_id, &reverse_file_ids_buffer, io);
 
-                    host.deleteTransaction(tx_id, .outgoing, io);
+                    host.deleteTransaction(.outgoing, io);
 
-                    try writer.sendMessageHeaderNewTxReply(outgoing_tx_id, peer_tx_id);
+                    try writer.sendMessageHeader(.new_thread_reply);
                     try writer.sendAction(action);
                     try writer.sendResolvePathResponse(.success);
                     for (0..reversed_file_id_path.len) |index| {
@@ -795,9 +741,9 @@ pub const TxData = union(enum) {
                 .invalid_folder,
                 .wrong_file_kind,
                 => {
-                    host.deleteTransaction(tx_id, .outgoing, io);
+                    host.deleteTransaction(.outgoing, io);
 
-                    try writer.sendMessageHeaderNewTxReply(outgoing_tx_id, peer_tx_id);
+                    try writer.sendMessageHeader(.new_thread_reply);
                     try writer.sendAction(action);
                     try writer.sendResolvePathResponse(in_new_file.data);
                 },
@@ -820,9 +766,8 @@ pub const TxData = union(enum) {
             pub const SendResult = enum { success, failure };
         };
 
-        fn newTx(
+        fn initMessageThread(
             host: *Host,
-            peer_tx_id: network.TransactionId,
             io: Io,
             reader: network.Reader,
         ) !void {
@@ -834,43 +779,39 @@ pub const TxData = union(enum) {
                 },
                 .file_doesnt_exist, .is_a_directory => std.debug.panic("TODO", .{}),
             };
-            const data: TxData = .{
+            const data: MessageThread = .{
                 .in_file_contents = .{
                     .state = .{ .send_decision = decision },
                     .file_id = file_id,
                     .path = path,
                 },
             };
-            try host.addOutgoingTx(io, data, peer_tx_id);
+            host.queueOutgoingMessage(io, data);
         }
 
         fn sendDecision(
             in_file_contents: *InFileContents,
             host: *Host,
-            tx_id: network.TransactionId,
-            peer_tx_id: network.TransactionId,
             io: Io,
             writer: network.Writer,
         ) !void {
             assert(in_file_contents.state == .send_decision);
-            assert(peer_tx_id != .invalid);
 
-            const actual_tx_id: network.TransactionId, const action: network.Action =
-                switch (in_file_contents.state.send_decision) {
-                    .accept => .{ tx_id, .transfer_file_accept },
-                    .decline => .{ .invalid, .transfer_file_decline },
-                };
-            host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+            const action: network.Action = switch (in_file_contents.state.send_decision) {
+                .accept => .transfer_file_accept,
+                .decline => .transfer_file_decline,
+            };
+            host.logMessage(.outgoing, action);
 
             switch (in_file_contents.state.send_decision) {
                 .accept => {
                     in_file_contents.state = .receive_file_contents;
-                    host.flipTransaction(.incoming, tx_id, io);
+                    host.flipTransaction(.incoming, io);
                 },
-                .decline => host.deleteTransaction(tx_id, .outgoing, io),
+                .decline => host.deleteTransaction(.outgoing, io),
             }
 
-            try writer.sendMessageHeaderNewTxReply(actual_tx_id, peer_tx_id);
+            try writer.sendMessageHeader(.new_thread_reply);
             try writer.sendAction(action);
             try writer.flush();
         }
@@ -880,7 +821,6 @@ pub const TxData = union(enum) {
             host: *Host,
             reader: network.Reader,
             io: Io,
-            tx_id: network.TransactionId,
             action: network.Action,
         ) !void {
             assert(in_file_contents.state == .receive_file_contents);
@@ -928,7 +868,7 @@ pub const TxData = union(enum) {
                     );
 
                     in_file_contents.state = .{ .send_result = .success };
-                    host.flipTransaction(.outgoing, tx_id, io);
+                    host.flipTransaction(.outgoing, io);
                 },
                 else => return error.InvalidAction,
             }
@@ -937,22 +877,19 @@ pub const TxData = union(enum) {
         fn sendResult(
             in_file_contents: *const InFileContents,
             host: *Host,
-            tx_id: network.TransactionId,
-            peer_tx_id: network.TransactionId,
             io: Io,
             writer: network.Writer,
         ) !void {
             assert(in_file_contents.state == .send_result);
-            assert(peer_tx_id != .invalid);
 
             const action: network.Action = switch (in_file_contents.state.send_result) {
                 .success => .transfer_file_success,
                 .failure => .transfer_file_failure,
             };
-            host.logMessage(.outgoing, tx_id, action, peer_tx_id);
-            host.deleteTransaction(tx_id, .outgoing, io);
+            host.logMessage(.outgoing, action);
+            host.deleteTransaction(.outgoing, io);
 
-            try writer.sendMessageHeaderExistingTx(peer_tx_id);
+            try writer.sendMessageHeader(.existing_thread);
             try writer.sendAction(action);
             try writer.flush();
         }
@@ -961,14 +898,13 @@ pub const TxData = union(enum) {
     pub const InCreateDir = struct {
         response: network.CreateDirResponse,
 
-        fn newTx(
+        fn initMessageThread(
             host: *Host,
-            peer_tx_id: network.TransactionId,
             io: Io,
             reader: network.Reader,
         ) !void {
             const file_id = try reader.receiveFileId();
-            const data: TxData = .{
+            const data: MessageThread = .{
                 .in_create_dir = .{
                     .response = if (host.db.createDir(file_id, io)) .success else |err| switch (err) {
                         error.NotADirectory => .not_a_directory,
@@ -978,28 +914,22 @@ pub const TxData = union(enum) {
                     },
                 },
             };
-            try host.addOutgoingTx(io, data, peer_tx_id);
+            host.queueOutgoingMessage(io, data);
         }
 
         fn sendResponse(
             in_create_dir: *const InCreateDir,
             host: *Host,
-            tx_id: network.TransactionId,
-            peer_tx_id: network.TransactionId,
             io: Io,
             writer: network.Writer,
         ) !void {
-            assert(peer_tx_id != .invalid);
-
-            const outgoing_tx_id: network.TransactionId = .invalid;
-
             const action: network.Action = .create_dir_response;
-            host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+            host.logMessage(.outgoing, action);
 
             const response = in_create_dir.response;
-            host.deleteTransaction(tx_id, .outgoing, io);
+            host.deleteTransaction(.outgoing, io);
 
-            try writer.sendMessageHeaderNewTxReply(outgoing_tx_id, peer_tx_id);
+            try writer.sendMessageHeader(.new_thread_reply);
             try writer.sendAction(action);
             try writer.sendCreateDirResponse(response);
             try writer.flush();
@@ -1007,9 +937,8 @@ pub const TxData = union(enum) {
     };
 
     pub const InDeleteFile = struct {
-        fn newTx(
+        fn initMessageThread(
             host: *Host,
-            peer_tx_id: network.TransactionId,
             io: Io,
             reader: network.Reader,
         ) !void {
@@ -1019,25 +948,23 @@ pub const TxData = union(enum) {
                 .unknown_file, .delete_file_err => std.debug.panic("TODO", .{}),
             }
 
-            const data: TxData = .{
+            const data: MessageThread = .{
                 .in_delete_file = .{},
             };
-            try host.addOutgoingTx(io, data, peer_tx_id);
+            host.queueOutgoingMessage(io, data);
         }
 
         fn sendConfirmation(
             _: *InDeleteFile,
             host: *Host,
-            tx_id: network.TransactionId,
-            peer_tx_id: network.TransactionId,
             io: Io,
             writer: network.Writer,
         ) !void {
             const action: network.Action = .delete_file_confirm;
-            host.logMessage(.outgoing, tx_id, action, peer_tx_id);
-            host.deleteTransaction(tx_id, .outgoing, io);
+            host.logMessage(.outgoing, action);
+            host.deleteTransaction(.outgoing, io);
 
-            try writer.sendMessageHeaderNewTxReply(.invalid, peer_tx_id);
+            try writer.sendMessageHeader(.new_thread_reply);
             try writer.sendAction(action);
             try writer.flush();
         }
