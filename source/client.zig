@@ -35,13 +35,17 @@ pub const Database = struct {
 
     // Database-Host synchronization fields
     host_state: std.atomic.Value(Host.State),
-    out_path: Path,
-    out_file_id: network.FileId,
-    out_directory: bool,
+    host_event_inputs: HostEventInputs,
 
     debug: Debug,
 
     pub const Alert = enum(u32) { off, on };
+
+    pub const HostEventInputs = struct {
+        path: Path,
+        file_id: network.FileId,
+        directory: bool,
+    };
 
     pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator, debug: Debug) !Database {
         // TODO: The length of this path must also be factored into path length calculations.
@@ -62,9 +66,7 @@ pub const Database = struct {
             .events = .{},
 
             .host_state = .init(.{}),
-            .out_path = undefined,
-            .out_file_id = undefined,
-            .out_directory = undefined,
+            .host_event_inputs = undefined,
 
             .debug = debug,
         };
@@ -107,7 +109,7 @@ pub const Database = struct {
                 continue;
             }
 
-            if (try db.sendHostEvents(io)) {
+            if (try db.sendHostEvent(io)) {
                 continue;
             }
 
@@ -117,7 +119,7 @@ pub const Database = struct {
     }
 
     /// Returns true if an event was sent.
-    fn sendHostEvents(db: *Database, io: Io) Io.Cancelable!bool {
+    fn sendHostEvent(db: *Database, io: Io) Io.Cancelable!bool {
         const Event = union(enum) {
             local: struct {
                 event: Events.Local,
@@ -159,19 +161,27 @@ pub const Database = struct {
                 db.debug.log("(local event) action: {s}, path: {f}", .{ @tagName(local.event.action), local.event.path.formatUtf8() });
                 switch (local.event.action) {
                     .new_regular => {
-                        db.out_path = local.event.path;
-                        db.out_directory = false;
+                        db.host_event_inputs = .{
+                            .path = local.event.path,
+                            .file_id = undefined,
+                            .directory = false,
+                        };
                         break :blk .get_global_file_id;
                     },
                     .new_directory => {
-                        db.out_path = local.event.path;
-                        db.out_directory = true;
+                        db.host_event_inputs = .{
+                            .path = local.event.path,
+                            .file_id = undefined,
+                            .directory = true,
+                        };
                         break :blk .get_global_file_id;
                     },
                     .delete_regular => {
-                        db.out_file_id = local.file_id.?;
-                        // TODO: It should not be necessary to set the path for this event
-                        db.out_path = local.event.path;
+                        db.host_event_inputs = .{
+                            .file_id = local.file_id.?,
+                            .path = undefined,
+                            .directory = undefined,
+                        };
                         break :blk .delete_file;
                     },
                     .delete_directory => {
@@ -181,9 +191,11 @@ pub const Database = struct {
             },
             .sync => |sync| {
                 db.debug.log("(sync event) path: {f}", .{sync.path.formatUtf8()});
-                db.out_file_id = sync.file_id;
-                // TODO: It should not be necessary to set the path for this event
-                db.out_path = sync.path;
+                db.host_event_inputs = .{
+                    .file_id = sync.file_id,
+                    .path = sync.path,
+                    .directory = undefined,
+                };
                 break :blk .sync_file;
             },
         };
@@ -1293,78 +1305,66 @@ pub const Host = struct {
                     error.NoTxSlotsAvailable => return null,
                 };
                 assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
-                host.debugLog("getting global file id for new file: {f}", .{host.db.out_path.formatUtf8()});
+                host.debugLog("getting global file id for new file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
 
                 host.tx.data = .{
                     .out_new_file = .{
                         .state = .send_path,
-                        .path = host.db.out_path,
-                        .kind = if (host.db.out_directory) .directory else .regular,
+                        .path = host.db.host_event_inputs.path,
+                        .kind = if (host.db.host_event_inputs.directory) .directory else .regular,
                     },
                 };
                 host.tx.peer_tx_id = .invalid;
-
-                host.db.out_path = undefined;
-                host.db.out_directory = undefined;
             },
             .sync_file => {
                 const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
                     error.NoTxSlotsAvailable => return null,
                 };
                 assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
-                host.debugLog("syncing file: {f}", .{host.db.out_path.formatUtf8()});
+                host.debugLog("syncing file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
 
                 host.tx.data = .{
                     .out_file_contents = .{
                         .state = .send_file_id,
-                        .file_id = host.db.out_file_id,
-                        .path = host.db.out_path,
+                        .file_id = host.db.host_event_inputs.file_id,
+                        .path = host.db.host_event_inputs.path,
                     },
                 };
                 host.tx.peer_tx_id = .invalid;
-
-                host.db.out_file_id = undefined;
-                host.db.out_path = undefined;
             },
             .create_dir => {
                 const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
                     error.NoTxSlotsAvailable => return null,
                 };
                 assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
-                host.debugLog("creating dir: {f}", .{host.db.out_path.formatUtf8()});
+                host.debugLog("creating dir: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
 
                 host.tx.data = .{
                     .out_create_dir = .{
                         .state = .send_id,
-                        .file_id = host.db.out_file_id,
-                        .path = host.db.out_path,
+                        .file_id = host.db.host_event_inputs.file_id,
+                        .path = host.db.host_event_inputs.path,
                     },
                 };
                 host.tx.peer_tx_id = .invalid;
-
-                host.db.out_file_id = undefined;
-                host.db.out_path = undefined;
             },
             .delete_file => {
                 const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
                     error.NoTxSlotsAvailable => return null,
                 };
                 assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
-                host.debugLog("deleting file: {f}", .{host.db.out_path.formatUtf8()});
+                host.debugLog("deleting file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
 
                 host.tx.data = .{
                     .out_delete_file = .{
                         .state = .send_file_id,
-                        .file_id = host.db.out_file_id,
-                        .path = host.db.out_path,
+                        .file_id = host.db.host_event_inputs.file_id,
                     },
                 };
                 host.tx.peer_tx_id = .invalid;
-
-                host.db.out_file_id = undefined;
-                host.db.out_path = undefined;
             },
         }
+        host.db.host_event_inputs = undefined;
 
         var old_state = state;
         while (true) {
@@ -1899,7 +1899,6 @@ pub const TxData = union(enum) {
     pub const OutDeleteFile = struct {
         state: enum { send_file_id, receive_confirmation },
         file_id: network.FileId,
-        path: Path,
 
         fn sendFileId(
             out_delete_file: *OutDeleteFile,
