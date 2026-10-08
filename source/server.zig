@@ -596,9 +596,9 @@ pub const Host = struct {
         io.futexWake(State, &host.db.host_state.raw, 1);
     }
 
-    fn flipTransaction(host: *Host, comptime to: State.MtStatus, io: Io) void {
+    fn flipMessageThreadOwner(host: *Host, comptime to: State.MtStatus, io: Io) void {
         switch (to) {
-            .init, .acquired => unreachable,
+            .init, .acquired => comptime unreachable,
             .outgoing => {
                 host.releaseNewMessageThreadStatus(.incoming, to);
                 io.futexWake(State, &host.db.host_state.raw, 1);
@@ -609,7 +609,7 @@ pub const Host = struct {
         }
     }
 
-    fn deleteTransaction(host: *Host, expected_status: State.MtStatus, io: Io) void {
+    fn deleteMessageThread(host: *Host, expected_status: State.MtStatus, io: Io) void {
         host.mt = undefined;
         host.releaseNewMessageThreadStatus(expected_status, .init);
 
@@ -727,7 +727,7 @@ pub const MessageThread = union(enum) {
                     var reverse_file_ids_buffer: [fairy.max_path_components]network.FileId = undefined;
                     const reversed_file_id_path = try host.db.getReverseFileIdPath(file_id, &reverse_file_ids_buffer, io);
 
-                    host.deleteTransaction(.outgoing, io);
+                    host.deleteMessageThread(.outgoing, io);
 
                     try writer.sendMessageHeader(.new_thread_reply);
                     try writer.sendAction(action);
@@ -741,7 +741,7 @@ pub const MessageThread = union(enum) {
                 .invalid_folder,
                 .wrong_file_kind,
                 => {
-                    host.deleteTransaction(.outgoing, io);
+                    host.deleteMessageThread(.outgoing, io);
 
                     try writer.sendMessageHeader(.new_thread_reply);
                     try writer.sendAction(action);
@@ -806,9 +806,9 @@ pub const MessageThread = union(enum) {
             switch (in_file_contents.state.send_decision) {
                 .accept => {
                     in_file_contents.state = .receive_file_contents;
-                    host.flipTransaction(.incoming, io);
+                    host.flipMessageThreadOwner(.incoming, io);
                 },
-                .decline => host.deleteTransaction(.outgoing, io),
+                .decline => host.deleteMessageThread(.outgoing, io),
             }
 
             try writer.sendMessageHeader(.new_thread_reply);
@@ -868,7 +868,7 @@ pub const MessageThread = union(enum) {
                     );
 
                     in_file_contents.state = .{ .send_result = .success };
-                    host.flipTransaction(.outgoing, io);
+                    host.flipMessageThreadOwner(.outgoing, io);
                 },
                 else => return error.InvalidAction,
             }
@@ -887,7 +887,7 @@ pub const MessageThread = union(enum) {
                 .failure => .transfer_file_failure,
             };
             host.logMessage(.outgoing, action);
-            host.deleteTransaction(.outgoing, io);
+            host.deleteMessageThread(.outgoing, io);
 
             try writer.sendMessageHeader(.existing_thread);
             try writer.sendAction(action);
@@ -927,7 +927,7 @@ pub const MessageThread = union(enum) {
             host.logMessage(.outgoing, action);
 
             const response = in_create_dir.response;
-            host.deleteTransaction(.outgoing, io);
+            host.deleteMessageThread(.outgoing, io);
 
             try writer.sendMessageHeader(.new_thread_reply);
             try writer.sendAction(action);
@@ -962,7 +962,7 @@ pub const MessageThread = union(enum) {
         ) !void {
             const action: network.Action = .delete_file_confirm;
             host.logMessage(.outgoing, action);
-            host.deleteTransaction(.outgoing, io);
+            host.deleteMessageThread(.outgoing, io);
 
             try writer.sendMessageHeader(.new_thread_reply);
             try writer.sendAction(action);

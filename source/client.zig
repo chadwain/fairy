@@ -34,7 +34,7 @@ pub const Database = struct {
     // End fields protected by mutex
 
     // Database-Host synchronization fields
-    host_state: std.atomic.Value(Host.State),
+    host_send_event: std.atomic.Value(Host.SendEvent),
     host_event_inputs: HostEventInputs,
 
     debug: Debug,
@@ -65,7 +65,7 @@ pub const Database = struct {
             .global_fs = .{},
             .events = .{},
 
-            .host_state = .init(.{}),
+            .host_send_event = .init(.none),
             .host_event_inputs = undefined,
 
             .debug = debug,
@@ -120,6 +120,8 @@ pub const Database = struct {
 
     /// Returns true if an event was sent.
     fn sendHostEvent(db: *Database, io: Io) Io.Cancelable!bool {
+        if (db.host_send_event.load(.monotonic) != .none) return false;
+
         const Event = union(enum) {
             local: struct {
                 event: Events.Local,
@@ -153,10 +155,7 @@ pub const Database = struct {
             return false;
         };
 
-        db.acquireHostEvent() orelse return false;
-        errdefer comptime unreachable;
-
-        const host_event: Host.State.Event = blk: switch (event) {
+        const host_send_event: Host.SendEvent = blk: switch (event) {
             .local => |local| {
                 db.debug.log("(local event) action: {s}, path: {f}", .{ @tagName(local.event.action), local.event.path.formatUtf8() });
                 switch (local.event.action) {
@@ -202,33 +201,14 @@ pub const Database = struct {
         };
 
         db.events.in_progress = true;
-        db.releaseHostEvent(host_event);
-        io.futexWake(Host.State, &db.host_state.raw, 1);
+        db.host_send_event.store(host_send_event, .release);
+        io.futexWake(Host.SendEvent, &db.host_send_event.raw, 1);
         return true;
     }
 
-    fn sendAlert(db: *Database, io: Io) void {
+    fn wake(db: *Database, io: Io) void {
         db.alert.store(.on, .release);
         io.futexWake(Alert, &db.alert.raw, 1);
-    }
-
-    fn acquireHostEvent(db: *Database) ?void {
-        var host_state = db.host_state.load(.monotonic);
-        while (host_state.event == .none) {
-            var new_host_state = host_state;
-            new_host_state.event = .acquired;
-            host_state = db.host_state.cmpxchgWeak(host_state, new_host_state, .acquire, .monotonic) orelse break;
-        } else return null;
-    }
-
-    fn releaseHostEvent(db: *Database, event: Host.State.Event) void {
-        var host_state = db.host_state.load(.monotonic);
-        while (true) {
-            assert(host_state.event == .acquired);
-            var new_host_state = host_state;
-            new_host_state.event = event;
-            host_state = db.host_state.cmpxchgWeak(host_state, new_host_state, .release, .monotonic) orelse break;
-        }
     }
 
     pub fn lock(db: *Database, io: Io) !LockedDatabase {
@@ -395,7 +375,7 @@ pub const LockedDatabase = struct {
     pub fn manualScan(locked: LockedDatabase, io: Io) !void {
         // TODO delay the next automatic scan
         try scan.run(locked);
-        locked.db.sendAlert(io);
+        locked.db.wake(io);
     }
 
     // called from Host
@@ -1156,43 +1136,36 @@ fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash
 
 pub const Host = struct {
     mt: MessageThread,
+    mt_lock: std.atomic.Value(MtLock),
     // TODO: Don't store this here, instead make it an argument to `run`
     db: *Database,
     debug: Debug,
+
+    pub const MtLock = enum(u8) {
+        /// The message thread is unlocked.
+        unlocked,
+        /// The message thread is locked and owned by the outgoing task.
+        outgoing,
+        /// The message thread is locked and owned by the incoming task.
+        incoming,
+    };
+
+    pub const SendEvent = enum(u32) {
+        none,
+        get_global_file_id,
+        sync_file,
+        create_dir,
+        delete_file,
+    };
 
     pub const Debug = struct {
         name: []const u8 = "<unnamed>",
     };
 
-    pub const State = packed struct(u32) {
-        mt: MtStatus = .init,
-        event: Event = .none,
-        padding: u27 = 0,
-
-        pub const MtStatus = enum(u2) {
-            /// The message thread is free to use.
-            init,
-            /// The message thread is locked and being initialized.
-            acquired,
-            /// The message thread is locked and owned by the outgoing task.
-            outgoing,
-            /// The message thread is locked and owned by the incoming task.
-            incoming,
-        };
-
-        pub const Event = enum(u3) {
-            none,
-            acquired,
-            get_global_file_id,
-            sync_file,
-            create_dir,
-            delete_file,
-        };
-    };
-
     pub fn init(db: *Database, debug: Debug) Host {
         return .{
             .mt = undefined,
+            .mt_lock = .init(.unlocked),
             .db = db,
             .debug = debug,
         };
@@ -1209,7 +1182,7 @@ pub const Host = struct {
         recv_error: ?ReceiveMessagesError = null,
     };
 
-    /// Blocks until the `Host` is finished running.
+    /// Blocks until canceled.
     pub fn run(
         host: *Host,
         diag: ?*Diagnostics,
@@ -1249,13 +1222,30 @@ pub const Host = struct {
     fn sendMessages(host: *Host, writer: network.Writer, io: Io) SendMessagesError!void {
         host.debugLog("sending on thread {}", .{std.os.windows.GetCurrentThreadId()});
         // TODO: Send an initial message containing protocol version, etc.
-        // TODO: Send a nonce value with each transaction
+        // TODO: Send a nonce value with each message thread
         while (true) {
             while (true) {
-                const state = host.db.host_state.load(.monotonic);
-                if (state.mt == .outgoing) break;
-                host.handleEvents(state, io) orelse
-                    try io.futexWait(State, &host.db.host_state.raw, state);
+                // First, check if we own the current message thread.
+                // If not, check for events.
+
+                if (host.mt_lock.cmpxchgStrong(.unlocked, .outgoing, .acquire, .monotonic)) |previous_value| {
+                    if (previous_value == .outgoing) break; // We already had the lock
+                    try io.futexWait(SendEvent, &host.db.host_send_event.raw, .none);
+                    continue;
+                }
+
+                const event = host.db.host_send_event.load(.monotonic);
+                if (event == .none) {
+                    assert(host.mt_lock.swap(.unlocked, .monotonic) == .outgoing);
+                    try io.futexWait(SendEvent, &host.db.host_send_event.raw, .none);
+                    continue;
+                }
+
+                host.readEvent(event);
+                host.db.host_event_inputs = undefined;
+                assert(host.db.host_send_event.swap(.none, .release) == event);
+                host.db.wake(io);
+                break;
             }
 
             switch (host.mt) {
@@ -1280,14 +1270,11 @@ pub const Host = struct {
         }
     }
 
-    /// Returns null if no event was handled.
-    fn handleEvents(host: *Host, state: State, io: Io) ?void {
-        switch (state.event) {
-            .none, .acquired => return null,
+    fn readEvent(host: *Host, event: SendEvent) void {
+        switch (event) {
+            .none => unreachable,
             .get_global_file_id => {
-                host.acquireMessageThread() orelse return null;
                 host.debugLog("getting global file id for new file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
-
                 host.mt = .{
                     .out_new_file = .{
                         .state = .send_path,
@@ -1297,9 +1284,7 @@ pub const Host = struct {
                 };
             },
             .sync_file => {
-                host.acquireMessageThread() orelse return null;
                 host.debugLog("syncing file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
-
                 host.mt = .{
                     .out_file_contents = .{
                         .state = .send_file_id,
@@ -1309,9 +1294,7 @@ pub const Host = struct {
                 };
             },
             .create_dir => {
-                host.acquireMessageThread() orelse return null;
                 host.debugLog("creating dir: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
-
                 host.mt = .{
                     .out_create_dir = .{
                         .state = .send_id,
@@ -1321,9 +1304,7 @@ pub const Host = struct {
                 };
             },
             .delete_file => {
-                host.acquireMessageThread() orelse return null;
-                host.debugLog("deleting file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
-
+                host.debugLog("deleting file: {f}", .{host.db.host_event_inputs.file_id});
                 host.mt = .{
                     .out_delete_file = .{
                         .state = .send_file_id,
@@ -1332,16 +1313,6 @@ pub const Host = struct {
                 };
             },
         }
-        host.db.host_event_inputs = undefined;
-
-        var old_state = state;
-        while (true) {
-            var new_state = state;
-            new_state.mt = .outgoing;
-            new_state.event = .none;
-            old_state = host.db.host_state.cmpxchgWeak(old_state, new_state, .release, .monotonic) orelse break;
-        }
-        host.db.sendAlert(io);
     }
 
     pub const ReceiveMessagesError = error{
@@ -1371,7 +1342,7 @@ pub const Host = struct {
                     return error.InvalidAction;
                 },
                 .new_thread_reply => {
-                    if (host.db.host_state.load(.monotonic).mt != .incoming) return error.UnexpectedIncomingMessage;
+                    if (host.mt_lock.load(.monotonic) != .incoming) return error.UnexpectedIncomingMessage;
 
                     switch (host.mt) {
                         .out_new_file => |*out_new_file| switch (out_new_file.state) {
@@ -1418,7 +1389,7 @@ pub const Host = struct {
                     }
                 },
                 .existing_thread => {
-                    if (host.db.host_state.load(.monotonic).mt != .incoming) return error.UnexpectedIncomingMessage;
+                    if (host.mt_lock.load(.monotonic) != .incoming) return error.UnexpectedIncomingMessage;
 
                     switch (host.mt) {
                         .out_new_file => |*out_new_file| switch (out_new_file.state) {
@@ -1446,56 +1417,33 @@ pub const Host = struct {
         }
     }
 
-    fn flipTransaction(
-        host: *Host,
-        comptime to: State.MtStatus,
-        io: Io,
-    ) void {
+    fn setMessageThreadLock(host: *Host, comptime expected: MtLock, new: MtLock) void {
+        assert(host.mt_lock.cmpxchgStrong(expected, new, .release, .monotonic) == null);
+    }
+
+    fn flipMessageThreadOwner(host: *Host, comptime to: MtLock, io: Io) void {
         // TODO: This function might need to be `acq_rel` instead of `release`
         switch (to) {
-            .init, .acquired => comptime unreachable,
+            .unlocked => comptime unreachable,
             .outgoing => {
-                host.releaseNewMessageThreadStatus(.incoming, to);
-                io.futexWake(State, &host.db.host_state.raw, 1);
+                host.setMessageThreadLock(.incoming, to);
+                host.wakeSendTask(io);
             },
             .incoming => {
-                host.releaseNewMessageThreadStatus(.outgoing, to);
+                host.setMessageThreadLock(.outgoing, to);
             },
         }
     }
 
-    fn deleteTransaction(host: *Host, comptime expected_status: State.MtStatus, io: Io) void {
+    fn deleteMessageThread(host: *Host, io: Io) void {
         host.mt = undefined;
-        host.releaseNewMessageThreadStatus(expected_status, .init);
-
-        switch (expected_status) {
-            .init, .acquired => comptime unreachable,
-            .outgoing => comptime unreachable,
-            .incoming => {
-                host.db.sendAlert(io);
-                io.futexWake(State, &host.db.host_state.raw, 1);
-            },
-        }
+        host.setMessageThreadLock(.incoming, .unlocked);
+        host.db.wake(io);
+        host.wakeSendTask(io);
     }
 
-    /// Returns null if it could not be acquired.
-    fn acquireMessageThread(host: *Host) ?void {
-        var old_state = host.db.host_state.load(.monotonic);
-        while (old_state.mt == .init) {
-            var new_state = old_state;
-            new_state.mt = .acquired;
-            old_state = host.db.host_state.cmpxchgWeak(old_state, new_state, .acquire, .monotonic) orelse break;
-        } else return null;
-    }
-
-    fn releaseNewMessageThreadStatus(host: *Host, expected: State.MtStatus, new: State.MtStatus) void {
-        var old_state = host.db.host_state.load(.monotonic);
-        while (true) {
-            assert(old_state.mt == expected);
-            var new_state = old_state;
-            new_state.mt = new;
-            old_state = host.db.host_state.cmpxchgWeak(old_state, new_state, .release, .monotonic) orelse break;
-        }
+    fn wakeSendTask(host: *Host, io: Io) void {
+        io.futexWake(SendEvent, &host.db.host_send_event.raw, 1);
     }
 
     fn debugLog(host: *const Host, comptime fmt: []const u8, args: anytype) void {
@@ -1504,14 +1452,10 @@ pub const Host = struct {
 
     fn logMessage(
         host: *const Host,
-        comptime mt_status: Host.State.MtStatus,
+        comptime direction: enum { outgoing, incoming },
         action: network.Action,
     ) void {
-        switch (mt_status) {
-            .init, .acquired => unreachable,
-            .outgoing => host.debugLog("outgoing: {s}", .{@tagName(action)}),
-            .incoming => host.debugLog("incoming: {s}", .{@tagName(action)}),
-        }
+        host.debugLog(@tagName(direction) ++ ": {s}", .{@tagName(action)});
     }
 };
 
@@ -1543,7 +1487,7 @@ pub const MessageThread = union(enum) {
             host.logMessage(.outgoing, action);
 
             out_new_file.state = .receive_decision;
-            host.flipTransaction(.incoming, io);
+            host.flipMessageThreadOwner(.incoming, io);
 
             try writer.sendMessageHeader(.new_thread);
             try writer.sendAction(action);
@@ -1584,7 +1528,7 @@ pub const MessageThread = union(enum) {
                     }
 
                     host.debugLog("received {f} for file {f}\n", .{ file_id_list.items[file_id_list.items.len - 1], out_new_file.path.formatUtf8() });
-                    host.deleteTransaction(.incoming, io);
+                    host.deleteMessageThread(io);
                 },
                 .invalid_path,
                 .exhausted_file_ids,
@@ -1592,7 +1536,7 @@ pub const MessageThread = union(enum) {
                 .wrong_file_kind,
                 => {
                     host.debugLog("error '{s}' while resolving path {f}\n", .{ @tagName(response), out_new_file.path.formatUtf8() });
-                    host.deleteTransaction(.incoming, io);
+                    host.deleteMessageThread(io);
                 },
             }
         }
@@ -1622,7 +1566,7 @@ pub const MessageThread = union(enum) {
             host.logMessage(.outgoing, action);
 
             out_file_contents.state = .receive_decision;
-            host.flipTransaction(.incoming, io);
+            host.flipMessageThreadOwner(.incoming, io);
 
             try writer.sendMessageHeader(.new_thread);
             try writer.sendAction(action);
@@ -1642,10 +1586,10 @@ pub const MessageThread = union(enum) {
             switch (action) {
                 .transfer_file_accept => {
                     out_file_contents.state = .send_file_contents;
-                    host.flipTransaction(.outgoing, io);
+                    host.flipMessageThreadOwner(.outgoing, io);
                 },
                 .transfer_file_decline => {
-                    host.deleteTransaction(.incoming, io);
+                    host.deleteMessageThread(io);
                 },
                 else => return error.InvalidAction,
             }
@@ -1678,7 +1622,7 @@ pub const MessageThread = union(enum) {
             const file_hash = network.FileHash{ .blake3 = @splat(0) }; // TODO: compute the hash while sending data
 
             out_file_contents.state = .receive_result;
-            host.flipTransaction(.incoming, io);
+            host.flipMessageThreadOwner(.incoming, io);
 
             try writer.sendMessageHeader(.existing_thread);
             try writer.sendAction(action);
@@ -1715,7 +1659,7 @@ pub const MessageThread = union(enum) {
                 },
                 else => return error.InvalidAction,
             }
-            host.deleteTransaction(.incoming, io);
+            host.deleteMessageThread(io);
         }
     };
 
@@ -1741,7 +1685,7 @@ pub const MessageThread = union(enum) {
             host.logMessage(.outgoing, action);
 
             out_create_dir.state = .receive_confirmation;
-            host.flipTransaction(.incoming, io);
+            host.flipMessageThreadOwner(.incoming, io);
 
             try writer.sendMessageHeader(.new_thread);
             try writer.sendAction(action);
@@ -1771,7 +1715,7 @@ pub const MessageThread = union(enum) {
                         "create dir with id {} name {f}\n",
                         .{ @intFromEnum(out_create_dir.file_id), out_create_dir.path.formatUtf8() },
                     );
-                    host.deleteTransaction(.incoming, io);
+                    host.deleteMessageThread(io);
                 },
                 .not_a_directory, .unknown_file, .unexpected => {
                     // TODO handle this error
@@ -1784,7 +1728,7 @@ pub const MessageThread = union(enum) {
                         "error '{s}' while creating dir {} {f}\n",
                         .{ @tagName(response), @intFromEnum(out_create_dir.file_id), out_create_dir.path.formatUtf8() },
                     );
-                    host.deleteTransaction(.incoming, io);
+                    host.deleteMessageThread(io);
                 },
             }
         }
@@ -1806,7 +1750,7 @@ pub const MessageThread = union(enum) {
             host.logMessage(.outgoing, action);
 
             out_delete_file.state = .receive_confirmation;
-            host.flipTransaction(.incoming, io);
+            host.flipMessageThreadOwner(.incoming, io);
 
             try writer.sendMessageHeader(.new_thread);
             try writer.sendAction(action);
@@ -1830,7 +1774,7 @@ pub const MessageThread = union(enum) {
                         defer locked.unlock(io);
                         locked.confirmDeleteFile(out_delete_file.file_id);
                     }
-                    host.deleteTransaction(.incoming, io);
+                    host.deleteMessageThread(io);
                 },
                 else => return error.InvalidAction,
             }
