@@ -35,10 +35,6 @@ pub const Action = enum(u8) {
     transfer_file_success,
     transfer_file_failure,
 
-    /// The client asks the server to locally create a directory.
-    create_dir,
-    create_dir_response,
-
     /// A client has seen a file get deleted on its local filesystem.
     delete_file,
     /// The server notifies that a file has been globally deleted.

@@ -503,9 +503,6 @@ pub const Host = struct {
                     .send_result => try in_file_contents.sendResult(host, io, writer),
                     .receive_file_contents => unreachable,
                 },
-                .in_create_dir => |*in_create_dir| {
-                    try in_create_dir.sendResponse(host, io, writer);
-                },
                 .in_delete_file => |*in_delete_file| {
                     try in_delete_file.sendConfirmation(host, io, writer);
                 },
@@ -546,9 +543,6 @@ pub const Host = struct {
                         .transfer_file_id => {
                             try MessageThread.InFileContents.initMessageThread(host, io, reader);
                         },
-                        .create_dir => {
-                            try MessageThread.InCreateDir.initMessageThread(host, io, reader);
-                        },
                         .delete_file => {
                             try MessageThread.InDeleteFile.initMessageThread(host, io, reader);
                         },
@@ -564,7 +558,6 @@ pub const Host = struct {
                             .receive_file_contents => return error.InvalidHeader,
                             .send_decision, .send_result => unreachable,
                         },
-                        .in_create_dir => unreachable,
                         .in_delete_file => unreachable,
                     }
                 },
@@ -579,7 +572,6 @@ pub const Host = struct {
                             },
                             .send_decision, .send_result => unreachable,
                         },
-                        .in_create_dir => unreachable,
                         .in_delete_file => unreachable,
                     }
                 },
@@ -662,7 +654,6 @@ pub const Host = struct {
 pub const MessageThread = union(enum) {
     in_new_file: InNewFile,
     in_file_contents: InFileContents,
-    in_create_dir: InCreateDir,
     in_delete_file: InDeleteFile,
 
     pub const InNewFile = struct {
@@ -891,47 +882,6 @@ pub const MessageThread = union(enum) {
 
             try writer.sendMessageHeader(.existing_thread);
             try writer.sendAction(action);
-            try writer.flush();
-        }
-    };
-
-    pub const InCreateDir = struct {
-        response: network.CreateDirResponse,
-
-        fn initMessageThread(
-            host: *Host,
-            io: Io,
-            reader: network.Reader,
-        ) !void {
-            const file_id = try reader.receiveFileId();
-            const data: MessageThread = .{
-                .in_create_dir = .{
-                    .response = if (host.db.createDir(file_id, io)) .success else |err| switch (err) {
-                        error.NotADirectory => .not_a_directory,
-                        error.UnknownFile => .unknown_file,
-                        error.Unexpected, error.CreateParentDirFail => .unexpected,
-                        error.Canceled => |e| return e,
-                    },
-                },
-            };
-            host.queueOutgoingMessage(io, data);
-        }
-
-        fn sendResponse(
-            in_create_dir: *const InCreateDir,
-            host: *Host,
-            io: Io,
-            writer: network.Writer,
-        ) !void {
-            const action: network.Action = .create_dir_response;
-            host.logMessage(.outgoing, action);
-
-            const response = in_create_dir.response;
-            host.deleteMessageThread(.outgoing, io);
-
-            try writer.sendMessageHeader(.new_thread_reply);
-            try writer.sendAction(action);
-            try writer.sendCreateDirResponse(response);
             try writer.flush();
         }
     };

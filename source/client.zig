@@ -1154,7 +1154,6 @@ pub const Host = struct {
         none,
         get_global_file_id,
         sync_file,
-        create_dir,
         delete_file,
     };
 
@@ -1213,14 +1212,14 @@ pub const Host = struct {
         try select.concurrent(.send_error, sendMessages, .{ host, .init(writer), io });
         try select.concurrent(.recv_error, receiveMessages, .{ host, .init(reader), io });
 
-        host.debugLog("started", .{});
+        host.log(.info, "started", .{});
         ns.addToDiagnostics(diag, try select.await());
     }
 
     pub const SendMessagesError = Io.Writer.Error || Io.Cancelable || fairy.windows.SendFileError;
 
     fn sendMessages(host: *Host, writer: network.Writer, io: Io) SendMessagesError!void {
-        host.debugLog("sending on thread {}", .{std.os.windows.GetCurrentThreadId()});
+        host.log(.info, "sending on thread {}", .{std.os.windows.GetCurrentThreadId()});
         // TODO: Send an initial message containing protocol version, etc.
         // TODO: Send a nonce value with each message thread
         while (true) {
@@ -1258,10 +1257,6 @@ pub const Host = struct {
                     .send_file_contents => try out_file_contents.sendFileContents(host, io, writer),
                     .receive_decision, .receive_result => unreachable,
                 },
-                .out_create_dir => |*out_create_dir| switch (out_create_dir.state) {
-                    .send_id => try out_create_dir.sendId(host, io, writer),
-                    .receive_confirmation => unreachable,
-                },
                 .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
                     .send_file_id => try out_delete_file.sendFileId(host, io, writer),
                     .receive_confirmation => unreachable,
@@ -1274,7 +1269,7 @@ pub const Host = struct {
         switch (event) {
             .none => unreachable,
             .get_global_file_id => {
-                host.debugLog("getting global file id for new file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
+                host.log(.info, "getting global file id for new file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
                 host.mt = .{
                     .out_new_file = .{
                         .state = .send_path,
@@ -1284,7 +1279,7 @@ pub const Host = struct {
                 };
             },
             .sync_file => {
-                host.debugLog("syncing file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
+                host.log(.info, "syncing file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
                 host.mt = .{
                     .out_file_contents = .{
                         .state = .send_file_id,
@@ -1293,18 +1288,8 @@ pub const Host = struct {
                     },
                 };
             },
-            .create_dir => {
-                host.debugLog("creating dir: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
-                host.mt = .{
-                    .out_create_dir = .{
-                        .state = .send_id,
-                        .file_id = host.db.host_event_inputs.file_id,
-                        .path = host.db.host_event_inputs.path,
-                    },
-                };
-            },
             .delete_file => {
-                host.debugLog("deleting file: {f}", .{host.db.host_event_inputs.file_id});
+                host.log(.info, "deleting file: {f}", .{host.db.host_event_inputs.file_id});
                 host.mt = .{
                     .out_delete_file = .{
                         .state = .send_file_id,
@@ -1329,12 +1314,12 @@ pub const Host = struct {
         fairy.windows.ReceiveFileError;
 
     fn receiveMessages(host: *Host, reader: network.Reader, io: Io) ReceiveMessagesError!void {
-        host.debugLog("receiving on thread {}", .{std.os.windows.GetCurrentThreadId()});
+        host.log(.info, "receiving on thread {}", .{std.os.windows.GetCurrentThreadId()});
         while (true) {
             const header = try reader.receiveMessageHeader();
             if (header == .disconnect) break;
             const action = try reader.receiveAction();
-            host.logMessage(.incoming, action);
+            host.logNetworkAction(.incoming, action);
 
             switch (header) {
                 .disconnect => unreachable,
@@ -1368,15 +1353,6 @@ pub const Host = struct {
                             .receive_result => return error.InvalidHeader,
                             .send_file_id, .send_file_contents => unreachable,
                         },
-                        .out_create_dir => |*out_create_dir| switch (out_create_dir.state) {
-                            .receive_confirmation => try out_create_dir.receiveConfirmation(
-                                host,
-                                reader,
-                                io,
-                                action,
-                            ),
-                            .send_id => unreachable,
-                        },
                         .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
                             .send_file_id => unreachable,
                             .receive_confirmation => try out_delete_file.receiveConfirmation(
@@ -1402,10 +1378,6 @@ pub const Host = struct {
                                 try out_file_contents.receiveResult(host, reader, io, action);
                             },
                             .send_file_id, .send_file_contents => unreachable,
-                        },
-                        .out_create_dir => |*out_create_dir| switch (out_create_dir.state) {
-                            .receive_confirmation => return error.InvalidHeader,
-                            .send_id => unreachable,
                         },
                         .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
                             .send_file_id => unreachable,
@@ -1446,23 +1418,22 @@ pub const Host = struct {
         io.futexWake(SendEvent, &host.db.host_send_event.raw, 1);
     }
 
-    fn debugLog(host: *const Host, comptime fmt: []const u8, args: anytype) void {
-        fairy.log.debug("(host:{s}) " ++ fmt, .{host.debug.name} ++ args);
+    fn log(host: *const Host, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype) void {
+        @field(fairy.log, @tagName(level))("(host:{s}) " ++ fmt, .{host.debug.name} ++ args);
     }
 
-    fn logMessage(
+    fn logNetworkAction(
         host: *const Host,
         comptime direction: enum { outgoing, incoming },
         action: network.Action,
     ) void {
-        host.debugLog(@tagName(direction) ++ ": {s}", .{@tagName(action)});
+        host.log(.debug, @tagName(direction) ++ ": {s}", .{@tagName(action)});
     }
 };
 
 pub const MessageThread = union(enum) {
     out_new_file: OutNewFile,
     out_file_contents: OutFileContents,
-    out_create_dir: OutCreateDir,
     out_delete_file: OutDeleteFile,
 
     pub const OutNewFile = struct {
@@ -1484,7 +1455,7 @@ pub const MessageThread = union(enum) {
             assert(out_new_file.state == .send_path);
 
             const action: network.Action = .resolve_path;
-            host.logMessage(.outgoing, action);
+            host.logNetworkAction(.outgoing, action);
 
             out_new_file.state = .receive_decision;
             host.flipMessageThreadOwner(.incoming, io);
@@ -1527,7 +1498,11 @@ pub const MessageThread = union(enum) {
                         try locked.setNewFileId(out_new_file.path, out_new_file.kind, file_id_list.items);
                     }
 
-                    host.debugLog("received {f} for file {f}\n", .{ file_id_list.items[file_id_list.items.len - 1], out_new_file.path.formatUtf8() });
+                    host.log(
+                        .info,
+                        "received {f} for file {f}",
+                        .{ file_id_list.items[file_id_list.items.len - 1], out_new_file.path.formatUtf8() },
+                    );
                     host.deleteMessageThread(io);
                 },
                 .invalid_path,
@@ -1535,7 +1510,11 @@ pub const MessageThread = union(enum) {
                 .invalid_folder,
                 .wrong_file_kind,
                 => {
-                    host.debugLog("error '{s}' while resolving path {f}\n", .{ @tagName(response), out_new_file.path.formatUtf8() });
+                    host.log(
+                        .err,
+                        "error '{s}' while resolving path {f}",
+                        .{ @tagName(response), out_new_file.path.formatUtf8() },
+                    );
                     host.deleteMessageThread(io);
                 },
             }
@@ -1563,7 +1542,7 @@ pub const MessageThread = union(enum) {
             assert(out_file_contents.state == .send_file_id);
 
             const action: network.Action = .transfer_file_id;
-            host.logMessage(.outgoing, action);
+            host.logNetworkAction(.outgoing, action);
 
             out_file_contents.state = .receive_decision;
             host.flipMessageThreadOwner(.incoming, io);
@@ -1604,7 +1583,7 @@ pub const MessageThread = union(enum) {
             assert(out_file_contents.state == .send_file_contents);
 
             const action: network.Action = .transfer_file_contents;
-            host.logMessage(.outgoing, action);
+            host.logNetworkAction(.outgoing, action);
 
             const file = try host.db.openFileReadOnly(out_file_contents.path);
             defer host.db.closeFile(file);
@@ -1646,7 +1625,7 @@ pub const MessageThread = union(enum) {
                         defer locked.unlock(io);
                         locked.markFileAsSynced(out_file_contents.file_id);
                     }
-                    host.debugLog("successfully synced file: {f}\n", .{out_file_contents.path.formatUtf8()});
+                    host.log(.info, "successfully synced file: {f}", .{out_file_contents.path.formatUtf8()});
                 },
                 .transfer_file_failure => {
                     // TODO mark file as failed to sync
@@ -1655,82 +1634,11 @@ pub const MessageThread = union(enum) {
                         defer locked.unlock(io);
                         locked.markFileAsSynced(out_file_contents.file_id);
                     }
-                    host.debugLog("failed to sync file: {f}\n", .{out_file_contents.path.formatUtf8()});
+                    host.log(.err, "failed to sync file: {f}", .{out_file_contents.path.formatUtf8()});
                 },
                 else => return error.InvalidAction,
             }
             host.deleteMessageThread(io);
-        }
-    };
-
-    pub const OutCreateDir = struct {
-        state: State,
-        file_id: network.FileId,
-        path: Path,
-
-        pub const State = enum {
-            send_id,
-            receive_confirmation,
-        };
-
-        fn sendId(
-            out_create_dir: *OutCreateDir,
-            host: *Host,
-            io: Io,
-            writer: network.Writer,
-        ) !void {
-            assert(out_create_dir.state == .send_id);
-
-            const action: network.Action = .create_dir;
-            host.logMessage(.outgoing, action);
-
-            out_create_dir.state = .receive_confirmation;
-            host.flipMessageThreadOwner(.incoming, io);
-
-            try writer.sendMessageHeader(.new_thread);
-            try writer.sendAction(action);
-            try writer.sendFileId(out_create_dir.file_id);
-            try writer.flush();
-        }
-
-        fn receiveConfirmation(
-            out_create_dir: *const OutCreateDir,
-            host: *Host,
-            reader: network.Reader,
-            io: Io,
-            action: network.Action,
-        ) !void {
-            assert(out_create_dir.state == .receive_confirmation);
-            if (action != .create_dir_response) return error.InvalidAction;
-
-            const response = try reader.receiveCreateDirResponse();
-            switch (response) {
-                .success => {
-                    {
-                        const locked = try host.db.lock(io);
-                        defer locked.unlock(io);
-                        locked.acknowledgeCreateDir(out_create_dir.file_id);
-                    }
-                    host.debugLog(
-                        "create dir with id {} name {f}\n",
-                        .{ @intFromEnum(out_create_dir.file_id), out_create_dir.path.formatUtf8() },
-                    );
-                    host.deleteMessageThread(io);
-                },
-                .not_a_directory, .unknown_file, .unexpected => {
-                    // TODO handle this error
-                    {
-                        const locked = try host.db.lock(io);
-                        defer locked.unlock(io);
-                        locked.acknowledgeCreateDir(out_create_dir.file_id);
-                    }
-                    host.debugLog(
-                        "error '{s}' while creating dir {} {f}\n",
-                        .{ @tagName(response), @intFromEnum(out_create_dir.file_id), out_create_dir.path.formatUtf8() },
-                    );
-                    host.deleteMessageThread(io);
-                },
-            }
         }
     };
 
@@ -1747,7 +1655,7 @@ pub const MessageThread = union(enum) {
             assert(out_delete_file.state == .send_file_id);
 
             const action: network.Action = .delete_file;
-            host.logMessage(.outgoing, action);
+            host.logNetworkAction(.outgoing, action);
 
             out_delete_file.state = .receive_confirmation;
             host.flipMessageThreadOwner(.incoming, io);
