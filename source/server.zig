@@ -18,11 +18,14 @@ pub const Database = struct {
     mutex: Io.Mutex, // TODO: Compare with RwLock
     allocator: Allocator,
     path_arena: std.heap.ArenaAllocator.State,
+    children_arena: std.heap.ArenaAllocator.State,
 
     path_map: PathHashMap(network.FileId),
     next_file_id: ?std.meta.Tag(network.FileId),
     files: std.AutoHashMapUnmanaged(network.FileId, FileInfo),
     regular_file_info: std.AutoHashMapUnmanaged(network.FileId, RegularFileEntry),
+    directory_file_info: std.AutoArrayHashMapUnmanaged(network.FileId, DirectoryFileEntry),
+    top_level_children: std.AutoArrayHashMapUnmanaged(network.FileId, void),
 
     host_state: std.atomic.Value(Host.State),
 
@@ -44,6 +47,10 @@ pub const Database = struct {
         pub const Status = enum { unsynced, synced };
     };
 
+    pub const DirectoryFileEntry = struct {
+        children: std.AutoArrayHashMapUnmanaged(network.FileId, void),
+    };
+
     pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
         // TODO: The length of this path must also be factored into path length calculations.
         const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
@@ -56,10 +63,13 @@ pub const Database = struct {
             .mutex = .init,
 
             .path_arena = .{},
+            .children_arena = .{},
             .path_map = .empty,
-            .next_file_id = 1,
+            .next_file_id = 0,
             .files = .empty,
             .regular_file_info = .empty,
+            .directory_file_info = .empty,
+            .top_level_children = .empty,
 
             .host_state = .init(.{}),
 
@@ -73,9 +83,14 @@ pub const Database = struct {
         var path_arena = db.path_arena.promote(db.allocator);
         path_arena.deinit();
 
+        var children_arena = db.children_arena.promote(db.allocator);
+        children_arena.deinit();
+
         db.path_map.deinit(db.allocator);
         db.files.deinit(db.allocator);
         db.regular_file_info.deinit(db.allocator);
+        db.directory_file_info.deinit(db.allocator);
+        db.top_level_children.deinit(db.allocator);
 
         db.* = undefined;
     }
@@ -84,95 +99,119 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        const initial_file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
-        errdefer {
-            var file_id_tag: ?std.meta.Tag(network.FileId) = initial_file_id_tag;
-            while (file_id_tag) |tag| : (file_id_tag = std.math.add(std.meta.Tag(network.FileId), tag, 1) catch null) {
-                if (tag == db.next_file_id) break;
-                const file_id: network.FileId = @enumFromInt(tag);
-                const info = db.files.fetchRemove(file_id).?;
-                if (!info.value.directory) {
-                    assert(db.regular_file_info.remove(file_id));
-                }
-                assert(db.path_map.remove(info.value.path));
+        if (db.path_map.get(path)) |file_id| {
+            const file_info = db.files.get(file_id).?;
+            switch (kind) {
+                .regular => if (file_info.directory) return error.WrongFileKind,
+                .directory => if (!file_info.directory) return error.WrongFileKind,
             }
-            db.next_file_id = initial_file_id_tag;
+            return file_id;
         }
-
-        var file_id_buffer: [fairy.max_path_components]network.FileId = undefined;
-        var file_id_list: std.ArrayList(network.FileId) = .initBuffer(&file_id_buffer);
 
         var path_arena = db.path_arena.promote(db.allocator);
         defer db.path_arena = path_arena.state;
         const path_allocator = path_arena.allocator();
 
+        var children_arena = db.children_arena.promote(db.allocator);
+        defer db.children_arena = children_arena.state;
+        const children_allocator = children_arena.allocator();
+
         var it = path.componentIterator();
-        var is_last = true;
-        var parent: ?network.FileId = first_known_directory: while (if (is_last) it.last() else it.previous()) |item| : (is_last = false) {
-            const sub_path: Path = .assumeValidPath(item.path);
-            const gop = try db.path_map.getOrPut(db.allocator, sub_path);
-            if (gop.found_existing) {
-                // TODO: This is a server/client conflict.
-                const file_info = db.files.getEntry(gop.value_ptr.*).?;
-                if (is_last) {
-                    switch (kind) {
-                        .regular => if (file_info.value_ptr.directory) return error.WrongFileKind,
-                        .directory => if (!file_info.value_ptr.directory) return error.WrongFileKind,
-                    }
-                    return gop.value_ptr.*;
+        const first_known_directory: ?network.FileId, const num_new_files: fairy.PathComponentCount = blk: {
+            _ = it.last();
+            var num_new_files: fairy.PathComponentCount = 1;
+            while (it.previous()) |component| : (num_new_files += 1) {
+                const sub_path: Path = .assumeValidPath(component.path);
+                const gop = try db.path_map.getOrPut(db.allocator, sub_path);
+                if (gop.found_existing) {
+                    const file_info = db.files.getEntry(gop.value_ptr.*).?;
+                    if (!file_info.value_ptr.directory) return error.InvalidFolder;
+                    break :blk .{ gop.value_ptr.*, num_new_files };
                 }
-                if (!file_info.value_ptr.directory) return error.InvalidFolder;
-                break :first_known_directory gop.value_ptr.*;
-            }
-            errdefer db.path_map.removeByPtr(gop.key_ptr);
+            } else break :blk .{ null, num_new_files };
+        };
 
-            const list_item_ptr = file_id_list.addOneBounded() catch unreachable;
-            const file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
+        const is_directory = switch (kind) {
+            .directory => true,
+            .regular => false,
+        };
+        try db.ensureUnusedFileIds(num_new_files);
+        try db.files.ensureUnusedCapacity(db.allocator, num_new_files);
+        try db.path_map.ensureUnusedCapacity(db.allocator, num_new_files);
+        try db.regular_file_info.ensureUnusedCapacity(db.allocator, @intFromBool(!is_directory));
+        try db.directory_file_info.ensureUnusedCapacity(db.allocator, num_new_files - @intFromBool(!is_directory));
+        if (first_known_directory == null) try db.top_level_children.ensureUnusedCapacity(db.allocator, 1);
+        errdefer comptime unreachable;
 
-            const sub_path_copy = try sub_path.dupe(path_allocator);
-            errdefer path_allocator.free(sub_path_copy.slice);
-
-            try db.files.ensureUnusedCapacity(db.allocator, 1);
-            const is_regular = switch (kind) {
-                .regular => is_last,
-                .directory => false,
+        var parent_file_id = first_known_directory;
+        var parent_children = if (parent_file_id) |file_id| &db.directory_file_info.getPtr(file_id).?.children else &db.top_level_children;
+        var component = if (parent_file_id == null) it.first().? else it.next().?;
+        while (true) {
+            const sub_path = Path.assumeValidPath(component.path).dupe(path_allocator) catch std.debug.panic("TODO: Out of memory", .{});
+            const file_id = db.nextFileIdAssumeInRange();
+            db.path_map.putAssumeCapacityNoClobber(sub_path, file_id);
+            parent_children.putNoClobber(children_allocator, file_id, {}) catch |err| switch (err) {
+                error.OutOfMemory => std.debug.panic("TODO: Out of memory", .{}),
             };
-            if (is_regular) try db.regular_file_info.ensureUnusedCapacity(db.allocator, 1);
-            errdefer comptime unreachable;
-
-            const file_id: network.FileId = @enumFromInt(file_id_tag);
-            db.next_file_id = std.math.add(std.meta.Tag(network.FileId), file_id_tag, 1) catch null;
-            db.files.putAssumeCapacityNoClobber(file_id, .{
-                .directory = !is_regular,
-                .path = sub_path_copy,
-                .parent = undefined,
-            });
-            if (is_regular) db.regular_file_info.putAssumeCapacityNoClobber(file_id, .{
-                .status = .unsynced,
-                .local_file_id = undefined,
-                .hash = undefined,
-                .modified_time = undefined,
-                .size = undefined,
-            });
-            gop.key_ptr.* = sub_path_copy;
-            gop.value_ptr.* = file_id;
-            list_item_ptr.* = file_id;
-        } else break :first_known_directory null;
-
-        const file_id_range = file_id_list.items;
-
-        while (it.previous()) |_| {
-            _ = file_id_list.addOneBounded() catch unreachable;
+            if (it.next()) |next_component| {
+                const entry = db.initDirectoryFile(file_id, sub_path, parent_file_id);
+                parent_file_id = file_id;
+                parent_children = &entry.children;
+                component = next_component;
+            } else {
+                switch (kind) {
+                    .regular => db.initRegularFile(file_id, sub_path, parent_file_id),
+                    .directory => _ = db.initDirectoryFile(file_id, sub_path, parent_file_id),
+                }
+                return file_id;
+            }
         }
+    }
 
-        for (0..file_id_range.len) |i| {
-            const file_id = file_id_range[file_id_range.len - 1 - i];
-            const file_info = db.files.getPtr(file_id).?;
-            file_info.parent = parent;
-            parent = file_id;
-        }
+    // Database must be locked.
+    fn ensureUnusedFileIds(db: *const Database, num: std.meta.Tag(network.FileId)) error{ExhaustedFileIds}!void {
+        assert(num > 0);
+        const next = db.next_file_id orelse return error.ExhaustedFileIds;
+        _ = std.math.add(std.meta.Tag(network.FileId), next, num - 1) catch return error.ExhaustedFileIds;
+    }
 
-        return file_id_range[0];
+    // Database must be locked.
+    fn nextFileIdAssumeInRange(db: *Database) network.FileId {
+        const next = db.next_file_id.?;
+        db.next_file_id = std.math.add(std.meta.Tag(network.FileId), next, 1) catch null;
+        return @enumFromInt(next);
+    }
+
+    // Database must be locked.
+    fn initRegularFile(db: *Database, file_id: network.FileId, path: Path, parent_file_id: ?network.FileId) void {
+        db.files.putAssumeCapacityNoClobber(file_id, .{
+            .directory = false,
+            .path = path,
+            .parent = parent_file_id,
+        });
+        db.regular_file_info.putAssumeCapacityNoClobber(file_id, .{
+            .status = .unsynced,
+            .local_file_id = undefined,
+            .hash = undefined,
+            .modified_time = undefined,
+            .size = undefined,
+        });
+    }
+
+    // Database must be locked.
+    fn initDirectoryFile(db: *Database, file_id: network.FileId, path: Path, parent_file_id: ?network.FileId) *DirectoryFileEntry {
+        db.files.putAssumeCapacityNoClobber(file_id, .{
+            .directory = true,
+            .path = path,
+            .parent = parent_file_id,
+        });
+
+        const gop = db.directory_file_info.getOrPutAssumeCapacity(file_id);
+        assert(!gop.found_existing);
+        gop.value_ptr.* = .{
+            .children = .empty,
+        };
+        return gop.value_ptr;
     }
 
     fn getReverseFileIdPath(db: *Database, file_id: network.FileId, buffer: *[fairy.max_path_components]network.FileId, io: Io) ![]network.FileId {
@@ -375,6 +414,11 @@ pub const Database = struct {
 
         // TODO maybe don't perform the delete right away, but just queue it
         if (fairy.windows.deleteFile(db.sync_dir, file_info.value_ptr.path)) |_| {
+            const parent_children = if (file_info.value_ptr.parent) |parent_file_id|
+                &db.directory_file_info.getPtr(parent_file_id).?.children
+            else
+                &db.top_level_children;
+            assert(parent_children.swapRemove(file_id));
             db.files.removeByPtr(file_info.key_ptr);
             db.regular_file_info.removeByPtr(regular_info.key_ptr);
             db.path_map.removeByPtr(path_info_entry.key_ptr);
