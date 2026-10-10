@@ -6,10 +6,23 @@ const Io = std.Io;
 
 const fairy = @import("fairy");
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const io = init.io;
-    const args = try Args.init(init.minimal.args, init.arena);
+pub fn main(init: std.process.Init.Minimal) !void {
+    var debug_allocator = std.heap.DebugAllocator(.{}).init;
+    defer switch (debug_allocator.deinit()) {
+        .leak => unreachable,
+        .ok => {},
+    };
+    const allocator = debug_allocator.allocator();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // TODO: Much of our code does I/O outside of the std.Io interface, so using Io.Threaded is necessary for now.
+    var threaded_io = std.Io.Threaded.init(allocator, .{});
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    const args = try Args.init(init.args, &arena);
 
     const sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir());
     defer allocator.free(sync_dir);
