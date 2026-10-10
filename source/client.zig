@@ -184,7 +184,12 @@ pub const Database = struct {
                         break :blk .delete_file;
                     },
                     .delete_directory => {
-                        std.debug.panic("TODO: Handle the '{s}' local filesystem event", .{@tagName(local.event.action)});
+                        db.host_event_inputs = .{
+                            .file_id = local.file_id.?,
+                            .path = undefined,
+                            .directory = undefined,
+                        };
+                        break :blk .delete_dir;
                     },
                 }
             },
@@ -280,22 +285,91 @@ pub const LocalFilesystem = struct {
 pub const GlobalFilesystem = struct {
     // An entry in this map implies the existence of a corresponding entry in `path_to_id`.
     files: std.AutoHashMapUnmanaged(network.FileId, FileInfo) = .empty,
+    children: std.AutoHashMapUnmanaged(network.FileId, std.AutoArrayHashMapUnmanaged(network.FileId, void)) = .empty,
+    top_level_children: std.AutoArrayHashMapUnmanaged(network.FileId, void) = .empty,
     path_to_id: PathHashMap(network.FileId) = .empty,
+    children_arena: std.heap.ArenaAllocator.State = .init,
 
     pub const FileInfo = struct {
         directory: bool,
         path: Path,
+        parent: ?network.FileId,
     };
+
+    pub fn deinit(global_fs: *GlobalFilesystem, allocator: Allocator) void {
+        global_fs.files.deinit(allocator);
+        global_fs.children.deinit(allocator);
+        global_fs.path_to_id.deinit(allocator);
+
+        var children_arena = global_fs.children_arena.promote(allocator);
+        children_arena.deinit();
+    }
 
     fn deleteRegularFile(global_fs: *GlobalFilesystem, file_id: network.FileId) void {
         const info = global_fs.files.fetchRemove(file_id).?;
         assert(!info.value.directory);
         assert(global_fs.path_to_id.remove(info.value.path));
+        const parent_children = if (info.value.parent) |parent_file_id|
+            global_fs.children.getPtr(parent_file_id).?
+        else
+            &global_fs.top_level_children;
+        assert(parent_children.swapRemove(file_id));
     }
 
-    pub fn deinit(global_fs: *GlobalFilesystem, allocator: Allocator) void {
-        global_fs.files.deinit(allocator);
-        global_fs.path_to_id.deinit(allocator);
+    fn deleteDirectoryFile(global_fs: *GlobalFilesystem, file_id: network.FileId) void {
+        const Item = struct {
+            children: []const network.FileId,
+            index: Index,
+            state: State,
+
+            const Index = u32; // TODO: Temporary, decide on an index type to use for iterating over children
+            const State = enum { iterate, delete };
+        };
+        var stack: [fairy.max_path_components]Item = undefined;
+
+        const root_info = global_fs.files.fetchRemove(file_id).?;
+        assert(root_info.value.directory);
+        const root_children = global_fs.children.fetchRemove(file_id).?;
+        stack[0] = .{ .children = root_children.value.keys(), .index = 0, .state = .iterate };
+
+        var stack_len: fairy.PathComponentCount = 1;
+        while (stack_len > 0) {
+            const item = &stack[stack_len - 1];
+            if (item.index == item.children.len) {
+                item.* = undefined;
+                stack_len -= 1;
+                continue;
+            }
+
+            const child_file_id = item.children[item.index];
+            const child_info = global_fs.files.getEntry(child_file_id).?;
+
+            if (child_info.value_ptr.directory and item.state == .iterate) enter_dir: {
+                const children = global_fs.children.getPtr(child_file_id).?.keys();
+                if (children.len == 0) break :enter_dir;
+
+                item.state = .delete;
+                stack[stack_len] = .{ .children = children, .index = 0, .state = .iterate };
+                stack_len += 1;
+                continue;
+            }
+
+            assert(global_fs.path_to_id.fetchRemove(child_info.value_ptr.path).?.value == child_file_id);
+            if (child_info.value_ptr.directory) {
+                item.state = .iterate;
+                assert(global_fs.children.remove(child_file_id));
+            }
+            global_fs.files.removeByPtr(child_info.key_ptr);
+
+            item.index += 1;
+        }
+
+        assert(global_fs.path_to_id.fetchRemove(root_info.value.path).?.value == file_id);
+        const parent_children = if (root_info.value.parent) |parent_file_id|
+            global_fs.children.getPtr(parent_file_id).?
+        else
+            &global_fs.top_level_children;
+        assert(parent_children.swapRemove(file_id));
     }
 };
 
@@ -389,11 +463,16 @@ pub const LockedDatabase = struct {
         const component_count: fairy.PathComponentCount = @intCast(file_id_list.len);
         try locked.db.global_fs.files.ensureUnusedCapacity(locked.db.allocator, component_count);
         try locked.db.global_fs.path_to_id.ensureUnusedCapacity(locked.db.allocator, component_count);
+        try locked.db.global_fs.children.ensureUnusedCapacity(locked.db.allocator, component_count - @intFromBool(kind != .directory));
         switch (kind) {
             .regular => try locked.db.events.ensureSyncEventCapacity(locked.db.allocator),
             .directory => {},
         }
         errdefer comptime unreachable;
+
+        var children_arena = locked.db.global_fs.children_arena.promote(locked.db.allocator);
+        defer locked.db.global_fs.children_arena = children_arena.state;
+        const children_allocator = children_arena.allocator();
 
         const Iterator = std.fs.path.ComponentIterator(.windows, u16);
         var it = Iterator.init(path.slice);
@@ -416,14 +495,26 @@ pub const LockedDatabase = struct {
                     // TODO This assumes that new file events are always handled in order from shallow to deep directories.
                     std.debug.panic("TODO", .{});
                 }
+
+                const parent_file_id: ?network.FileId = if (index == 0) null else file_id_list[index - 1];
                 gop.value_ptr.* = .{
                     .directory = switch (kind) {
                         .directory => true,
                         .regular => false,
                     },
                     .path = path,
+                    .parent = parent_file_id,
                 };
-                locked.db.global_fs.path_to_id.putAssumeCapacity(path, file_id);
+                locked.db.global_fs.path_to_id.putAssumeCapacityNoClobber(path, file_id);
+                switch (kind) {
+                    .directory => locked.db.global_fs.children.putAssumeCapacityNoClobber(file_id, .empty),
+                    .regular => {},
+                }
+                const parent_children = if (parent_file_id) |id|
+                    locked.db.global_fs.children.getPtr(id).?
+                else
+                    &locked.db.global_fs.top_level_children;
+                parent_children.putNoClobber(children_allocator, file_id, {}) catch |err| std.debug.panic("TODO: {s}", .{@errorName(err)});
             }
         }
         assert(it.peekNext() == null);
@@ -438,6 +529,12 @@ pub const LockedDatabase = struct {
     fn confirmDeleteFile(locked: LockedDatabase, file_id: network.FileId) void {
         locked.db.events.finishLocalEventWithFileId(.delete_regular, file_id);
         locked.db.global_fs.deleteRegularFile(file_id);
+    }
+
+    // called from Host
+    fn confirmDeleteDir(locked: LockedDatabase, file_id: network.FileId) void {
+        locked.db.events.finishLocalEventWithFileId(.delete_directory, file_id);
+        locked.db.global_fs.deleteDirectoryFile(file_id);
     }
 
     // called from Host
@@ -872,8 +969,7 @@ const scan = struct {
                     switch (info.status) {
                         .tracked => switch (info.directory) {
                             false => try deleteTrackedRegularFile(ctx.local_fs, ctx.events, ctx.db_allocator, child.*),
-                            // TODO: try deleteTrackedDirectoryFile(ctx, ctx.locked.db.allocator, path),
-                            true => std.debug.panic("TODO delete a tracked directory: {f}", .{child.formatUtf8()}),
+                            true => try deleteTrackedDirectoryFile(ctx.local_fs, ctx.events, ctx.db_allocator, child.*),
                         },
                         .untracked => std.debug.panic("TODO delete an untracked file: {f}", .{child.formatUtf8()}),
                     }
@@ -1155,6 +1251,7 @@ pub const Host = struct {
         get_global_file_id,
         sync_file,
         delete_file,
+        delete_dir,
     };
 
     pub const Debug = struct {
@@ -1261,6 +1358,10 @@ pub const Host = struct {
                     .send_file_id => try out_delete_file.sendFileId(host, io, writer),
                     .receive_confirmation => unreachable,
                 },
+                .out_delete_dir => |*out_delete_dir| switch (out_delete_dir.state) {
+                    .send_file_id => try out_delete_dir.sendFileId(host, io, writer),
+                    .receive_confirmation => unreachable,
+                },
             }
         }
     }
@@ -1292,6 +1393,15 @@ pub const Host = struct {
                 host.log(.info, "deleting file: {f}", .{host.db.host_event_inputs.file_id});
                 host.mt = .{
                     .out_delete_file = .{
+                        .state = .send_file_id,
+                        .file_id = host.db.host_event_inputs.file_id,
+                    },
+                };
+            },
+            .delete_dir => {
+                host.log(.info, "deleting directory: {f}", .{host.db.host_event_inputs.file_id});
+                host.mt = .{
+                    .out_delete_dir = .{
                         .state = .send_file_id,
                         .file_id = host.db.host_event_inputs.file_id,
                     },
@@ -1362,6 +1472,10 @@ pub const Host = struct {
                                 action,
                             ),
                         },
+                        .out_delete_dir => |*out_delete_dir| switch (out_delete_dir.state) {
+                            .send_file_id => unreachable,
+                            .receive_confirmation => try out_delete_dir.receiveConfirmation(host, reader, io, action),
+                        },
                     }
                 },
                 .existing_thread => {
@@ -1380,6 +1494,10 @@ pub const Host = struct {
                             .send_file_id, .send_file_contents => unreachable,
                         },
                         .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
+                            .send_file_id => unreachable,
+                            .receive_confirmation => return error.InvalidHeader,
+                        },
+                        .out_delete_dir => |*out_delete_dir| switch (out_delete_dir.state) {
                             .send_file_id => unreachable,
                             .receive_confirmation => return error.InvalidHeader,
                         },
@@ -1435,6 +1553,7 @@ pub const MessageThread = union(enum) {
     out_new_file: OutNewFile,
     out_file_contents: OutFileContents,
     out_delete_file: OutDeleteFile,
+    out_delete_dir: OutDeleteDir,
 
     pub const OutNewFile = struct {
         state: State,
@@ -1682,6 +1801,55 @@ pub const MessageThread = union(enum) {
                         defer locked.unlock(io);
                         locked.confirmDeleteFile(out_delete_file.file_id);
                     }
+                    host.log(.info, "successfully deleted file: {f}", .{out_delete_file.file_id});
+                    host.deleteMessageThread(io);
+                },
+                else => return error.InvalidAction,
+            }
+        }
+    };
+
+    pub const OutDeleteDir = struct {
+        state: enum { send_file_id, receive_confirmation },
+        file_id: network.FileId,
+
+        fn sendFileId(
+            out_delete_dir: *OutDeleteDir,
+            host: *Host,
+            io: Io,
+            writer: network.Writer,
+        ) !void {
+            assert(out_delete_dir.state == .send_file_id);
+
+            const action: network.Action = .delete_dir;
+            host.logNetworkAction(.outgoing, action);
+
+            out_delete_dir.state = .receive_confirmation;
+            host.flipMessageThreadOwner(.incoming, io);
+
+            try writer.sendMessageHeader(.new_thread);
+            try writer.sendAction(action);
+            try writer.sendFileId(out_delete_dir.file_id);
+            try writer.flush();
+        }
+
+        fn receiveConfirmation(
+            out_delete_dir: *OutDeleteDir,
+            host: *Host,
+            _: network.Reader,
+            io: Io,
+            action: network.Action,
+        ) !void {
+            assert(out_delete_dir.state == .receive_confirmation);
+
+            switch (action) {
+                .delete_dir_confirm => {
+                    {
+                        const locked = try host.db.lock(io);
+                        defer locked.unlock(io);
+                        locked.confirmDeleteDir(out_delete_dir.file_id);
+                    }
+                    host.log(.info, "successfully deleted directory: {f}", .{out_delete_dir.file_id});
                     host.deleteMessageThread(io);
                 },
                 else => return error.InvalidAction,

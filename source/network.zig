@@ -39,6 +39,9 @@ pub const Action = enum(u8) {
     delete_file,
     /// The server notifies that a file has been globally deleted.
     delete_file_confirm,
+
+    delete_dir,
+    delete_dir_confirm,
 };
 
 pub const FileHash = struct {

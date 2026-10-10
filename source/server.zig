@@ -24,7 +24,7 @@ pub const Database = struct {
     next_file_id: ?std.meta.Tag(network.FileId),
     files: std.AutoHashMapUnmanaged(network.FileId, FileInfo),
     regular_file_info: std.AutoHashMapUnmanaged(network.FileId, RegularFileEntry),
-    directory_file_info: std.AutoArrayHashMapUnmanaged(network.FileId, DirectoryFileEntry),
+    directory_file_info: std.AutoHashMapUnmanaged(network.FileId, DirectoryFileEntry),
     top_level_children: std.AutoArrayHashMapUnmanaged(network.FileId, void),
 
     host_state: std.atomic.Value(Host.State),
@@ -90,7 +90,6 @@ pub const Database = struct {
         db.files.deinit(db.allocator);
         db.regular_file_info.deinit(db.allocator);
         db.directory_file_info.deinit(db.allocator);
-        db.top_level_children.deinit(db.allocator);
 
         db.* = undefined;
     }
@@ -140,7 +139,6 @@ pub const Database = struct {
         try db.path_map.ensureUnusedCapacity(db.allocator, num_new_files);
         try db.regular_file_info.ensureUnusedCapacity(db.allocator, @intFromBool(!is_directory));
         try db.directory_file_info.ensureUnusedCapacity(db.allocator, num_new_files - @intFromBool(!is_directory));
-        if (first_known_directory == null) try db.top_level_children.ensureUnusedCapacity(db.allocator, 1);
         errdefer comptime unreachable;
 
         var parent_file_id = first_known_directory;
@@ -363,36 +361,6 @@ pub const Database = struct {
         };
     }
 
-    fn createDir(db: *Database, file_id: network.FileId, io: Io) !void {
-        try db.mutex.lock(io);
-        defer db.mutex.unlock(io);
-
-        const file_info = db.files.getPtr(file_id) orelse return error.UnknownFile;
-        if (!file_info.directory) return error.NotADirectory;
-
-        const create_result = try db.createParentDirectories(file_info.path);
-        defer switch (create_result.parent) {
-            .handle => |handle| db.closeHandle(handle),
-            .sync_dir => {},
-        };
-
-        const parent = switch (create_result.parent) {
-            .handle => |handle| handle,
-            .sync_dir => db.sync_dir,
-        };
-        const handle = fairy.windows.createDir(parent, create_result.name) catch |err| switch (err) {
-            error.ParentDirNotFound => {
-                // TODO: The directory we just created was deleted.
-                //       Either try to re-create it, or obtain exclusive delete access to it.
-                return error.CreateParentDirFail;
-            },
-            error.Unexpected => |e| return e,
-        };
-        db.closeHandle(handle);
-
-        // TODO file_info.status = .synced;
-    }
-
     const DeleteGlobalFileResult = union(enum) {
         success,
         unknown_file,
@@ -428,6 +396,74 @@ pub const Database = struct {
             // TODO: retry the deletion
             return .delete_file_err;
         }
+    }
+
+    fn deleteGlobalDir(db: *Database, file_id: network.FileId, io: Io) (error{ UnknownFile, Unexpected } || Io.Cancelable)!void {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        const Item = struct {
+            children: []const network.FileId,
+            index: Index,
+            state: State,
+
+            const Index = u32; // TODO: Temporary, decide on an index type to use for iterating over children
+            const State = enum { iterate, delete };
+        };
+        var stack: [fairy.max_path_components]Item = undefined;
+
+        const root_info = db.files.getEntry(file_id) orelse return error.UnknownFile;
+        assert(root_info.value_ptr.directory);
+        const root_dir_entry = db.directory_file_info.getEntry(file_id).?;
+        stack[0] = .{ .children = root_dir_entry.value_ptr.children.keys(), .index = 0, .state = .iterate };
+
+        var stack_len: fairy.PathComponentCount = 1;
+        while (stack_len > 0) {
+            const item = &stack[stack_len - 1];
+            if (item.index == item.children.len) {
+                item.* = undefined;
+                stack_len -= 1;
+                continue;
+            }
+
+            const child_file_id = item.children[item.index];
+            const child_info = db.files.getEntry(child_file_id).?;
+
+            if (child_info.value_ptr.directory and item.state == .iterate) enter_dir: {
+                const dir_entry = db.directory_file_info.getPtr(child_file_id).?;
+                const children = dir_entry.children.keys();
+                if (children.len == 0) break :enter_dir;
+
+                item.state = .delete;
+                stack[stack_len] = .{ .children = children, .index = 0, .state = .iterate };
+                stack_len += 1;
+                continue;
+            }
+
+            try fairy.windows.deleteFile(db.sync_dir, child_info.value_ptr.path);
+
+            assert(db.path_map.fetchRemove(child_info.value_ptr.path).?.value == child_file_id);
+            if (child_info.value_ptr.directory) {
+                item.state = .iterate;
+                assert(db.directory_file_info.remove(child_file_id));
+            } else {
+                assert(db.regular_file_info.remove(child_file_id));
+            }
+            db.files.removeByPtr(child_info.key_ptr);
+
+            item.index += 1;
+        }
+
+        try fairy.windows.deleteFile(db.sync_dir, root_info.value_ptr.path);
+
+        assert(db.path_map.fetchRemove(root_info.value_ptr.path).?.value == file_id);
+        const parent_children = if (root_info.value_ptr.parent) |parent_file_id|
+            &db.directory_file_info.getPtr(parent_file_id).?.children
+        else
+            &db.top_level_children;
+        assert(parent_children.swapRemove(file_id));
+        db.files.removeByPtr(root_info.key_ptr);
+        db.directory_file_info.removeByPtr(root_dir_entry.key_ptr);
     }
 
     pub const Debug = struct {
@@ -550,6 +586,9 @@ pub const Host = struct {
                 .in_delete_file => |*in_delete_file| {
                     try in_delete_file.sendConfirmation(host, io, writer);
                 },
+                .in_delete_dir => |*in_delete_dir| {
+                    try in_delete_dir.sendConfirmation(host, io, writer);
+                },
             }
         }
     }
@@ -590,6 +629,9 @@ pub const Host = struct {
                         .delete_file => {
                             try MessageThread.InDeleteFile.initMessageThread(host, io, reader);
                         },
+                        .delete_dir => {
+                            try MessageThread.InDeleteDir.initMessageThread(host, io, reader);
+                        },
                         else => return error.InvalidAction,
                     }
                 },
@@ -603,6 +645,7 @@ pub const Host = struct {
                             .send_decision, .send_result => unreachable,
                         },
                         .in_delete_file => unreachable,
+                        .in_delete_dir => unreachable,
                     }
                 },
                 .existing_thread => {
@@ -617,6 +660,7 @@ pub const Host = struct {
                             .send_decision, .send_result => unreachable,
                         },
                         .in_delete_file => unreachable,
+                        .in_delete_dir => unreachable,
                     }
                 },
             }
@@ -699,6 +743,7 @@ pub const MessageThread = union(enum) {
     in_new_file: InNewFile,
     in_file_contents: InFileContents,
     in_delete_file: InDeleteFile,
+    in_delete_dir: InDeleteDir,
 
     pub const InNewFile = struct {
         data: NewFileResult,
@@ -955,6 +1000,40 @@ pub const MessageThread = union(enum) {
             writer: network.Writer,
         ) !void {
             const action: network.Action = .delete_file_confirm;
+            host.logMessage(.outgoing, action);
+            host.deleteMessageThread(.outgoing, io);
+
+            try writer.sendMessageHeader(.new_thread_reply);
+            try writer.sendAction(action);
+            try writer.flush();
+        }
+    };
+
+    pub const InDeleteDir = struct {
+        fn initMessageThread(
+            host: *Host,
+            io: Io,
+            reader: network.Reader,
+        ) !void {
+            const file_id = try reader.receiveFileId();
+            host.db.deleteGlobalDir(file_id, io) catch |err| switch (err) {
+                error.UnknownFile, error.Unexpected => std.debug.panic("TODO", .{}),
+                error.Canceled => |e| return e,
+            };
+
+            const data: MessageThread = .{
+                .in_delete_dir = .{},
+            };
+            host.queueOutgoingMessage(io, data);
+        }
+
+        fn sendConfirmation(
+            _: *InDeleteDir,
+            host: *Host,
+            io: Io,
+            writer: network.Writer,
+        ) !void {
+            const action: network.Action = .delete_dir_confirm;
             host.logMessage(.outgoing, action);
             host.deleteMessageThread(.outgoing, io);
 
