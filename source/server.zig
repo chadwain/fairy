@@ -635,28 +635,13 @@ pub const Host = struct {
                         else => return error.InvalidAction,
                     }
                 },
-                .new_thread_reply => {
+                .thread_reply => {
                     if (host.db.host_state.load(.monotonic).mt != .incoming) return error.UnexpectedIncomingMessage;
 
                     switch (host.mt) {
                         .in_new_file => unreachable,
                         .in_file_contents => |*in_file_contents| switch (in_file_contents.state) {
-                            .receive_file_contents => return error.InvalidHeader,
-                            .send_decision, .send_result => unreachable,
-                        },
-                        .in_delete_file => unreachable,
-                        .in_delete_dir => unreachable,
-                    }
-                },
-                .existing_thread => {
-                    if (host.db.host_state.load(.monotonic).mt != .incoming) return error.UnexpectedIncomingMessage;
-
-                    switch (host.mt) {
-                        .in_new_file => unreachable,
-                        .in_file_contents => |*in_file_contents| switch (in_file_contents.state) {
-                            .receive_file_contents => {
-                                try in_file_contents.receiveFileContents(host, reader, io, action);
-                            },
+                            .receive_file_contents => try in_file_contents.receiveFileContents(host, reader, io, action),
                             .send_decision, .send_result => unreachable,
                         },
                         .in_delete_file => unreachable,
@@ -809,7 +794,7 @@ pub const MessageThread = union(enum) {
 
                     host.deleteMessageThread(.outgoing, io);
 
-                    try writer.sendMessageHeader(.new_thread_reply);
+                    try writer.sendMessageHeader(.thread_reply);
                     try writer.sendAction(action);
                     try writer.sendResolvePathResponse(.success);
                     for (0..reversed_file_id_path.len) |index| {
@@ -823,7 +808,7 @@ pub const MessageThread = union(enum) {
                 => {
                     host.deleteMessageThread(.outgoing, io);
 
-                    try writer.sendMessageHeader(.new_thread_reply);
+                    try writer.sendMessageHeader(.thread_reply);
                     try writer.sendAction(action);
                     try writer.sendResolvePathResponse(in_new_file.data);
                 },
@@ -891,7 +876,7 @@ pub const MessageThread = union(enum) {
                 .decline => host.deleteMessageThread(.outgoing, io),
             }
 
-            try writer.sendMessageHeader(.new_thread_reply);
+            try writer.sendMessageHeader(.thread_reply);
             try writer.sendAction(action);
             try writer.flush();
         }
@@ -969,7 +954,7 @@ pub const MessageThread = union(enum) {
             host.logMessage(.outgoing, action);
             host.deleteMessageThread(.outgoing, io);
 
-            try writer.sendMessageHeader(.existing_thread);
+            try writer.sendMessageHeader(.thread_reply);
             try writer.sendAction(action);
             try writer.flush();
         }
@@ -1003,7 +988,7 @@ pub const MessageThread = union(enum) {
             host.logMessage(.outgoing, action);
             host.deleteMessageThread(.outgoing, io);
 
-            try writer.sendMessageHeader(.new_thread_reply);
+            try writer.sendMessageHeader(.thread_reply);
             try writer.sendAction(action);
             try writer.flush();
         }
@@ -1037,7 +1022,7 @@ pub const MessageThread = union(enum) {
             host.logMessage(.outgoing, action);
             host.deleteMessageThread(.outgoing, io);
 
-            try writer.sendMessageHeader(.new_thread_reply);
+            try writer.sendMessageHeader(.thread_reply);
             try writer.sendAction(action);
             try writer.flush();
         }

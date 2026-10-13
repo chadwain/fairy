@@ -11,10 +11,8 @@ pub const MessageHeader = enum(u8) {
     disconnect,
     /// Sent when the host begins a new message thread.
     new_thread,
-    /// Sent after receiving a `new_thread` message from the peer.
-    new_thread_reply,
     /// Sent on any subsequent messages from the host in the same message thread.
-    existing_thread,
+    thread_reply,
 };
 
 pub const Action = enum(u8) {

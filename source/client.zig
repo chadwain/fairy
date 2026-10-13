@@ -1316,7 +1316,7 @@ pub const Host = struct {
     pub const SendMessagesError = Io.Writer.Error || Io.Cancelable || fairy.windows.SendFileError;
 
     fn sendMessages(host: *Host, writer: network.Writer, io: Io) SendMessagesError!void {
-        host.log(.info, "sending on thread {}", .{std.os.windows.GetCurrentThreadId()});
+        host.log(.debug, "sending on thread {}", .{std.os.windows.GetCurrentThreadId()});
         // TODO: Send an initial message containing protocol version, etc.
         // TODO: Send a nonce value with each message thread
         while (true) {
@@ -1324,8 +1324,8 @@ pub const Host = struct {
                 // First, check if we own the current message thread.
                 // If not, check for events.
 
-                if (host.mt_lock.cmpxchgStrong(.unlocked, .outgoing, .acquire, .monotonic)) |previous_value| {
-                    if (previous_value == .outgoing) break; // We already had the lock
+                if (host.mt_lock.cmpxchgStrong(.unlocked, .outgoing, .acquire, .monotonic)) |current_value| {
+                    if (current_value == .outgoing) break; // We already had the lock
                     try io.futexWait(SendEvent, &host.db.host_send_event.raw, .none);
                     continue;
                 }
@@ -1424,7 +1424,7 @@ pub const Host = struct {
         fairy.windows.ReceiveFileError;
 
     fn receiveMessages(host: *Host, reader: network.Reader, io: Io) ReceiveMessagesError!void {
-        host.log(.info, "receiving on thread {}", .{std.os.windows.GetCurrentThreadId()});
+        host.log(.debug, "receiving on thread {}", .{std.os.windows.GetCurrentThreadId()});
         while (true) {
             const header = try reader.receiveMessageHeader();
             if (header == .disconnect) break;
@@ -1436,70 +1436,26 @@ pub const Host = struct {
                 .new_thread => {
                     return error.InvalidAction;
                 },
-                .new_thread_reply => {
+                .thread_reply => {
                     if (host.mt_lock.load(.monotonic) != .incoming) return error.UnexpectedIncomingMessage;
 
                     switch (host.mt) {
                         .out_new_file => |*out_new_file| switch (out_new_file.state) {
-                            .receive_decision => {
-                                try out_new_file.receiveDecision(
-                                    host,
-                                    reader,
-                                    io,
-                                    action,
-                                );
-                            },
+                            .receive_decision => try out_new_file.receiveDecision(host, reader, io, action),
                             .send_path => unreachable,
                         },
                         .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
-                            .receive_decision => {
-                                try out_file_contents.receiveDecision(
-                                    host,
-                                    reader,
-                                    io,
-                                    action,
-                                );
-                            },
-                            .receive_result => return error.InvalidHeader,
+                            .receive_decision => try out_file_contents.receiveDecision(host, reader, io, action),
+                            .receive_result => try out_file_contents.receiveResult(host, reader, io, action),
                             .send_file_id, .send_file_contents => unreachable,
                         },
                         .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
                             .send_file_id => unreachable,
-                            .receive_confirmation => try out_delete_file.receiveConfirmation(
-                                host,
-                                reader,
-                                io,
-                                action,
-                            ),
+                            .receive_confirmation => try out_delete_file.receiveConfirmation(host, reader, io, action),
                         },
                         .out_delete_dir => |*out_delete_dir| switch (out_delete_dir.state) {
                             .send_file_id => unreachable,
                             .receive_confirmation => try out_delete_dir.receiveConfirmation(host, reader, io, action),
-                        },
-                    }
-                },
-                .existing_thread => {
-                    if (host.mt_lock.load(.monotonic) != .incoming) return error.UnexpectedIncomingMessage;
-
-                    switch (host.mt) {
-                        .out_new_file => |*out_new_file| switch (out_new_file.state) {
-                            .receive_decision => return error.InvalidHeader,
-                            .send_path => unreachable,
-                        },
-                        .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
-                            .receive_decision => return error.InvalidHeader,
-                            .receive_result => {
-                                try out_file_contents.receiveResult(host, reader, io, action);
-                            },
-                            .send_file_id, .send_file_contents => unreachable,
-                        },
-                        .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
-                            .send_file_id => unreachable,
-                            .receive_confirmation => return error.InvalidHeader,
-                        },
-                        .out_delete_dir => |*out_delete_dir| switch (out_delete_dir.state) {
-                            .send_file_id => unreachable,
-                            .receive_confirmation => return error.InvalidHeader,
                         },
                     }
                 },
@@ -1512,7 +1468,10 @@ pub const Host = struct {
     }
 
     fn flipMessageThreadOwner(host: *Host, comptime to: MtLock, io: Io) void {
-        // TODO: This function might need to be `acq_rel` instead of `release`
+        // TODO: This function might need to be `acq_rel` instead of `release`.
+        //       It must be called before doing any reads/writes with the network,
+        //       but without acquire semantics, is it possible for the compiler to
+        //       reorder this to happen after doing network I/O?
         switch (to) {
             .unlocked => comptime unreachable,
             .outgoing => {
@@ -1722,7 +1681,7 @@ pub const MessageThread = union(enum) {
             out_file_contents.state = .receive_result;
             host.flipMessageThreadOwner(.incoming, io);
 
-            try writer.sendMessageHeader(.existing_thread);
+            try writer.sendMessageHeader(.thread_reply);
             try writer.sendAction(action);
             try writer.sendFileSize(file_size);
             try fairy.windows.sendFile(writer.io, file, file_size);
