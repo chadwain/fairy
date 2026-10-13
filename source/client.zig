@@ -474,21 +474,19 @@ pub const LockedDatabase = struct {
         defer locked.db.global_fs.children_arena = children_arena.state;
         const children_allocator = children_arena.allocator();
 
-        const Iterator = std.fs.path.ComponentIterator(.windows, u16);
-        var it = Iterator.init(path.slice);
+        var it = path.pathIterator();
 
         for (file_id_list, 0..) |file_id, index| {
             const component = it.next().?;
-            const component_as_path = Path.assumeValidPath(component.path);
             const gop = locked.db.global_fs.files.getOrPutAssumeCapacity(file_id);
             if (gop.found_existing) {
                 if (index < file_id_list.len - 1 and !gop.value_ptr.directory) std.debug.panic(
                     "TODO client/server conflict: {f}: client says regular file, server says directory",
                     .{file_id},
                 );
-                if (!gop.value_ptr.path.eql(component_as_path)) std.debug.panic(
+                if (!gop.value_ptr.path.eql(component)) std.debug.panic(
                     "TODO client/server conflict: {f}: client path '{f}', server path '{f}'",
-                    .{ file_id, gop.value_ptr.path.formatUtf8(), component_as_path.formatUtf8() },
+                    .{ file_id, gop.value_ptr.path.formatUtf8(), component.formatUtf8() },
                 );
             } else {
                 if (index != file_id_list.len - 1) {
@@ -517,7 +515,7 @@ pub const LockedDatabase = struct {
                 parent_children.putNoClobber(children_allocator, file_id, {}) catch |err| std.debug.panic("TODO: {s}", .{@errorName(err)});
             }
         }
-        assert(it.peekNext() == null);
+        assert(it.next() == null);
 
         switch (kind) {
             .regular => locked.db.events.queueSyncEventAssumeCapacity(file_id_list[file_id_list.len - 1]),
@@ -1563,8 +1561,7 @@ pub const MessageThread = union(enum) {
                     // TODO Store this in Database somewhere instead
                     var file_id_buffer: [fairy.max_path_components]network.FileId = undefined;
                     var file_id_list: std.ArrayList(network.FileId) = .initBuffer(&file_id_buffer);
-                    const Iterator = std.fs.path.ComponentIterator(.windows, u16);
-                    var it = Iterator.init(out_new_file.path.slice);
+                    var it = out_new_file.path.pathIterator();
                     while (it.next()) |_| {
                         const ptr = file_id_list.addOneBounded() catch unreachable;
                         ptr.* = try reader.receiveFileId();

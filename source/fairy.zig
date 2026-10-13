@@ -21,4 +21,8 @@ comptime {
         // In particular, the Windows and Unicode parts of the stdlib have poor big endian support.
         @compileError("non-little endian CPUs are not supported");
     }
+
+    if (@import("builtin").is_test) {
+        _ = windows.Path;
+    }
 }

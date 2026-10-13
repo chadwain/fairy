@@ -11,8 +11,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const test_exe = b.addExecutable(.{
-        .name = "test",
+    const unit_tests = b.addTest(.{
+        .name = "fairy-unit-tests",
+        .root_module = fairy,
+        .use_llvm = use_llvm,
+    });
+    b.installArtifact(unit_tests);
+
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    const unit_tests_step = b.step("unit-tests", "Run unit tests");
+    unit_tests_step.dependOn(&run_unit_tests.step);
+
+    const test_app = b.addExecutable(.{
+        .name = "test-app",
         .root_module = b.createModule(.{
             .root_source_file = b.path("test.zig"),
             .target = target,
@@ -23,5 +34,10 @@ pub fn build(b: *std.Build) void {
         }),
         .use_llvm = use_llvm,
     });
-    b.installArtifact(test_exe);
+    b.installArtifact(test_app);
+
+    const run_test_app = b.addRunArtifact(test_app);
+    if (b.args) |args| run_test_app.addArgs(args);
+    const test_app_step = b.step("test-app", "Run a test app");
+    test_app_step.dependOn(&run_test_app.step);
 }

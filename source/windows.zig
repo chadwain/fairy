@@ -48,6 +48,11 @@ pub const Path = struct {
         return .{ .slice = try allocator.dupe(u16, path.slice) };
     }
 
+    pub fn parent(path: Path) ?Path {
+        var it = backwardsPathIterator(path);
+        return it.previous();
+    }
+
     /// Does a potentially lossy conversion from WTF-16 to UTF-8.
     pub fn formatUtf8(path: Path) std.fmt.Alt([]const u16, formatWtf16AsUtf8) {
         return .{ .data = path.slice };
@@ -58,10 +63,95 @@ pub const Path = struct {
         try writer.print("{f}", .{std.unicode.fmtUtf16Le(slice)});
     }
 
-    pub const ComponentIterator = std.fs.path.ComponentIterator(.windows, u16);
+    pub const PathIterator = struct {
+        slice: []const u16,
+        /// `Path.max_len` is used to represent the entirety of `slice`.
+        end: u16,
+        was_null: bool,
 
-    pub fn componentIterator(path: Path) ComponentIterator {
-        return .init(path.slice);
+        pub fn next(it: *PathIterator) ?Path {
+            if (it.end == max_len) {
+                it.was_null = true;
+                return null;
+            }
+            it.was_null = false;
+
+            const start = if (it.end != 0) it.end + 1 else 0;
+            if (std.mem.findScalarPos(u16, it.slice, start, '\\')) |new_end| {
+                it.end = @intCast(new_end);
+                return .{ .slice = it.slice[0..it.end] };
+            } else {
+                it.end = max_len;
+                return .{ .slice = it.slice };
+            }
+        }
+
+        pub fn previous(it: *PathIterator) ?Path {
+            if (it.end == 0) {
+                it.was_null = true;
+                return null;
+            }
+            it.was_null = false;
+
+            const end = if (it.end == max_len) it.slice.len else it.end;
+            if (std.mem.findScalarLast(u16, it.slice[0..end], '\\')) |new_end| {
+                it.end = @intCast(new_end);
+            } else {
+                it.end = 0;
+            }
+            return .{ .slice = it.slice[0..end] };
+        }
+
+        pub const Direction = enum { forwards, backwards };
+
+        pub fn setDirection(it: *PathIterator, direction: Direction) void {
+            switch (direction) {
+                .forwards => {
+                    if (!it.was_null) _ = it.next();
+                },
+                .backwards => {
+                    if (!it.was_null) _ = it.previous();
+                },
+            }
+        }
+    };
+
+    pub fn pathIterator(path: Path) PathIterator {
+        return .{ .slice = path.slice, .end = 0, .was_null = false };
+    }
+
+    pub fn backwardsPathIterator(path: Path) PathIterator {
+        return .{ .slice = path.slice, .end = max_len, .was_null = false };
+    }
+
+    test PathIterator {
+        const wtf16 = std.unicode.wtf8ToWtf16LeStringLiteral;
+        const expect = std.testing.expect;
+        const expectEqualSlices = std.testing.expectEqualSlices;
+        {
+            const path = try fromSlice(wtf16("a\\b\\c"));
+            var it = path.pathIterator();
+            try expectEqualSlices(u16, wtf16("a"), it.next().?.slice);
+            try expectEqualSlices(u16, wtf16("a\\b"), it.next().?.slice);
+            it.setDirection(.backwards);
+            try expectEqualSlices(u16, wtf16("a"), it.previous().?.slice);
+            it.setDirection(.forwards);
+            try expectEqualSlices(u16, wtf16("a\\b"), it.next().?.slice);
+            try expectEqualSlices(u16, wtf16("a\\b\\c"), it.next().?.slice);
+            try expect(it.next() == null);
+        }
+        {
+            const path = try fromSlice(wtf16("a\\b\\c"));
+            var it = path.backwardsPathIterator();
+            try expectEqualSlices(u16, wtf16("a\\b\\c"), it.previous().?.slice);
+            try expectEqualSlices(u16, wtf16("a\\b"), it.previous().?.slice);
+            it.setDirection(.forwards);
+            try expectEqualSlices(u16, wtf16("a\\b\\c"), it.next().?.slice);
+            it.setDirection(.backwards);
+            try expectEqualSlices(u16, wtf16("a\\b"), it.previous().?.slice);
+            try expectEqualSlices(u16, wtf16("a"), it.previous().?.slice);
+            try expect(it.previous() == null);
+        }
     }
 
     // TODO: Unicode case mappings???
@@ -451,6 +541,7 @@ pub fn openFile(parent: w.HANDLE, path: Path, options: OpenFileOptions) !w.HANDL
     }
 }
 
+// TODO: replace usage of this with NtCreateFile -> NtSetInformationFile -> NtClose
 extern "ntdll" fn NtDeleteFile(
     ObjectAttributes: *const w.OBJECT.ATTRIBUTES,
 ) callconv(.winapi) w.NTSTATUS;

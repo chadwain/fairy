@@ -115,12 +115,11 @@ pub const Database = struct {
         defer db.children_arena = children_arena.state;
         const children_allocator = children_arena.allocator();
 
-        var it = path.componentIterator();
+        var it = path.backwardsPathIterator();
         const first_known_directory: ?network.FileId, const num_new_files: fairy.PathComponentCount = blk: {
-            _ = it.last();
+            _ = it.previous();
             var num_new_files: fairy.PathComponentCount = 1;
-            while (it.previous()) |component| : (num_new_files += 1) {
-                const sub_path: Path = .assumeValidPath(component.path);
+            while (it.previous()) |sub_path| : (num_new_files += 1) {
                 const gop = try db.path_map.getOrPut(db.allocator, sub_path);
                 if (gop.found_existing) {
                     const file_info = db.files.getEntry(gop.value_ptr.*).?;
@@ -141,12 +140,13 @@ pub const Database = struct {
         try db.directory_file_info.ensureUnusedCapacity(db.allocator, num_new_files - @intFromBool(!is_directory));
         errdefer comptime unreachable;
 
+        it.setDirection(.forwards);
         var parent_file_id = first_known_directory;
         var parent_children = if (parent_file_id) |file_id| &db.directory_file_info.getPtr(file_id).?.children else &db.top_level_children;
-        var component = if (parent_file_id == null) it.first().? else it.next().?;
+        var component = it.next().?;
         while (true) {
-            const sub_path = Path.assumeValidPath(component.path).dupe(path_allocator) catch std.debug.panic("TODO: Out of memory", .{});
-            const file_id = db.nextFileIdAssumeInRange();
+            const sub_path = component.dupe(path_allocator) catch std.debug.panic("TODO: Out of memory", .{});
+            const file_id = db.nextFileIdAssumeAvailable();
             db.path_map.putAssumeCapacityNoClobber(sub_path, file_id);
             parent_children.putNoClobber(children_allocator, file_id, {}) catch |err| switch (err) {
                 error.OutOfMemory => std.debug.panic("TODO: Out of memory", .{}),
@@ -174,7 +174,7 @@ pub const Database = struct {
     }
 
     // Database must be locked.
-    fn nextFileIdAssumeInRange(db: *Database) network.FileId {
+    fn nextFileIdAssumeAvailable(db: *Database) network.FileId {
         const next = db.next_file_id.?;
         db.next_file_id = std.math.add(std.meta.Tag(network.FileId), next, 1) catch null;
         return @enumFromInt(next);
@@ -266,7 +266,8 @@ pub const Database = struct {
     };
 
     fn createParentDirectories(db: *const Database, path: Path) CreateParentDirectoriesError!CreateParentDirectoriesResult {
-        var it = path.componentIterator();
+        const ComponentIterator = std.fs.path.ComponentIterator(.windows, u16);
+        var it = ComponentIterator.init(path.slice);
         const first = it.first().?;
         const last = it.last().?;
         if (first.path.len == last.path.len) return .{ .parent = .sync_dir, .name = .assumeValidPath(last.name) };
