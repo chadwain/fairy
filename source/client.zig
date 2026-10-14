@@ -1230,16 +1230,18 @@ fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash
 
 pub const Host = struct {
     mt: MessageThread,
-    mt_lock: std.atomic.Value(MtLock),
+    mt_status: std.atomic.Value(MtStatus),
     // TODO: Don't store this here, instead make it an argument to `run`
     db: *Database,
     debug: Debug,
 
-    pub const MtLock = enum(u8) {
+    pub const MtStatus = enum(u32) {
         /// The message thread is unlocked.
         unlocked,
         /// The message thread is locked and owned by the outgoing task.
         outgoing,
+        /// The message thread is locked and owned by the outgoing task, which is currently transmitting data.
+        transmitting,
         /// The message thread is locked and owned by the incoming task.
         incoming,
     };
@@ -1259,7 +1261,7 @@ pub const Host = struct {
     pub fn init(db: *Database, debug: Debug) Host {
         return .{
             .mt = undefined,
-            .mt_lock = .init(.unlocked),
+            .mt_status = .init(.unlocked),
             .db = db,
             .debug = debug,
         };
@@ -1318,20 +1320,19 @@ pub const Host = struct {
         // TODO: Send an initial message containing protocol version, etc.
         // TODO: Send a nonce value with each message thread
         while (true) {
-            while (true) {
+            while (true) : (try io.futexWait(SendEvent, &host.db.host_send_event.raw, .none)) {
                 // First, check if we own the current message thread.
                 // If not, check for events.
 
-                if (host.mt_lock.cmpxchgStrong(.unlocked, .outgoing, .acquire, .monotonic)) |current_value| {
+                if (host.mt_status.cmpxchgStrong(.unlocked, .outgoing, .acquire, .monotonic)) |current_value| {
+                    assert(current_value != .transmitting);
                     if (current_value == .outgoing) break; // We already had the lock
-                    try io.futexWait(SendEvent, &host.db.host_send_event.raw, .none);
                     continue;
                 }
 
                 const event = host.db.host_send_event.load(.monotonic);
                 if (event == .none) {
-                    assert(host.mt_lock.swap(.unlocked, .monotonic) == .outgoing);
-                    try io.futexWait(SendEvent, &host.db.host_send_event.raw, .none);
+                    assert(host.mt_status.swap(.unlocked, .release) == .outgoing);
                     continue;
                 }
 
@@ -1435,7 +1436,13 @@ pub const Host = struct {
                     return error.InvalidAction;
                 },
                 .thread_reply => {
-                    if (host.mt_lock.load(.monotonic) != .incoming) return error.UnexpectedIncomingMessage;
+                    while (true) : (try io.futexWait(MtStatus, &host.mt_status.raw, .incoming)) {
+                        switch (host.mt_status.load(.monotonic)) {
+                            .unlocked, .outgoing => return error.UnexpectedIncomingMessage,
+                            .transmitting => continue,
+                            .incoming => break,
+                        }
+                    }
 
                     switch (host.mt) {
                         .out_new_file => |*out_new_file| switch (out_new_file.state) {
@@ -1461,36 +1468,42 @@ pub const Host = struct {
         }
     }
 
-    fn setMessageThreadLock(host: *Host, comptime expected: MtLock, new: MtLock) void {
-        assert(host.mt_lock.cmpxchgStrong(expected, new, .release, .monotonic) == null);
+    fn setMessageThreadStatus(host: *Host, comptime expected: MtStatus, new: MtStatus) void {
+        assert(host.mt_status.cmpxchgStrong(expected, new, .release, .monotonic) == null);
     }
 
-    fn flipMessageThreadOwner(host: *Host, comptime to: MtLock, io: Io) void {
-        // TODO: This function might need to be `acq_rel` instead of `release`.
-        //       It must be called before doing any reads/writes with the network,
-        //       but without acquire semantics, is it possible for the compiler to
-        //       reorder this to happen after doing network I/O?
-        switch (to) {
+    fn beginTransmitting(host: *Host) void {
+        assert(host.mt_status.cmpxchgStrong(.outgoing, .transmitting, .acq_rel, .monotonic) == null);
+    }
+
+    fn flipMessageThreadOwner(host: *Host, comptime current_value: MtStatus, io: Io) void {
+        switch (current_value) {
             .unlocked => comptime unreachable,
-            .outgoing => {
-                host.setMessageThreadLock(.incoming, to);
+            .incoming => {
+                host.setMessageThreadStatus(.incoming, .outgoing);
                 host.wakeSendTask(io);
             },
-            .incoming => {
-                host.setMessageThreadLock(.outgoing, to);
+            .outgoing => comptime unreachable,
+            .transmitting => {
+                host.setMessageThreadStatus(.transmitting, .incoming);
+                host.wakeReceiveTask(io);
             },
         }
     }
 
     fn deleteMessageThread(host: *Host, io: Io) void {
         host.mt = undefined;
-        host.setMessageThreadLock(.incoming, .unlocked);
+        host.setMessageThreadStatus(.incoming, .unlocked);
         host.db.wake(io);
         host.wakeSendTask(io);
     }
 
     fn wakeSendTask(host: *Host, io: Io) void {
         io.futexWake(SendEvent, &host.db.host_send_event.raw, 1);
+    }
+
+    fn wakeReceiveTask(host: *Host, io: Io) void {
+        io.futexWake(MtStatus, &host.mt_status.raw, 1);
     }
 
     fn log(host: *const Host, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype) void {
@@ -1534,7 +1547,8 @@ pub const MessageThread = union(enum) {
             host.logNetworkAction(.outgoing, action);
 
             out_new_file.state = .receive_decision;
-            host.flipMessageThreadOwner(.incoming, io);
+
+            host.beginTransmitting();
 
             try writer.sendMessageHeader(.new_thread);
             try writer.sendAction(action);
@@ -1543,6 +1557,8 @@ pub const MessageThread = union(enum) {
             try writer.sendWindowsPathByteCount(out_new_file.path.byteCount());
             try writer.sendWindowsPath(out_new_file.path);
             try writer.flush();
+
+            host.flipMessageThreadOwner(.transmitting, io);
         }
 
         fn receiveDecision(
@@ -1620,12 +1636,15 @@ pub const MessageThread = union(enum) {
             host.logNetworkAction(.outgoing, action);
 
             out_file_contents.state = .receive_decision;
-            host.flipMessageThreadOwner(.incoming, io);
+
+            host.beginTransmitting();
 
             try writer.sendMessageHeader(.new_thread);
             try writer.sendAction(action);
             try writer.sendFileId(out_file_contents.file_id);
             try writer.flush();
+
+            host.flipMessageThreadOwner(.transmitting, io);
         }
 
         fn receiveDecision(
@@ -1640,7 +1659,7 @@ pub const MessageThread = union(enum) {
             switch (action) {
                 .transfer_file_accept => {
                     out_file_contents.state = .send_file_contents;
-                    host.flipMessageThreadOwner(.outgoing, io);
+                    host.flipMessageThreadOwner(.incoming, io);
                 },
                 .transfer_file_decline => {
                     host.deleteMessageThread(io);
@@ -1676,7 +1695,8 @@ pub const MessageThread = union(enum) {
             const file_hash = network.FileHash{ .blake3 = @splat(0) }; // TODO: compute the hash while sending data
 
             out_file_contents.state = .receive_result;
-            host.flipMessageThreadOwner(.incoming, io);
+
+            host.beginTransmitting();
 
             try writer.sendMessageHeader(.thread_reply);
             try writer.sendAction(action);
@@ -1684,6 +1704,8 @@ pub const MessageThread = union(enum) {
             try fairy.windows.sendFile(writer.io, file, file_size);
             try writer.sendFileHash(&file_hash);
             try writer.flush();
+
+            host.flipMessageThreadOwner(.transmitting, io);
         }
 
         fn receiveResult(
@@ -1733,12 +1755,15 @@ pub const MessageThread = union(enum) {
             host.logNetworkAction(.outgoing, action);
 
             out_delete_file.state = .receive_confirmation;
-            host.flipMessageThreadOwner(.incoming, io);
+
+            host.beginTransmitting();
 
             try writer.sendMessageHeader(.new_thread);
             try writer.sendAction(action);
             try writer.sendFileId(out_delete_file.file_id);
             try writer.flush();
+
+            host.flipMessageThreadOwner(.transmitting, io);
         }
 
         fn receiveConfirmation(
@@ -1781,12 +1806,15 @@ pub const MessageThread = union(enum) {
             host.logNetworkAction(.outgoing, action);
 
             out_delete_dir.state = .receive_confirmation;
-            host.flipMessageThreadOwner(.incoming, io);
+
+            host.beginTransmitting();
 
             try writer.sendMessageHeader(.new_thread);
             try writer.sendAction(action);
             try writer.sendFileId(out_delete_dir.file_id);
             try writer.flush();
+
+            host.flipMessageThreadOwner(.transmitting, io);
         }
 
         fn receiveConfirmation(
