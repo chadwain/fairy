@@ -19,6 +19,9 @@ const cpu_endian = @import("builtin").cpu.arch.endian();
 
 pub const Database = struct {
     sync_dir: w.HANDLE,
+    // TODO: The alert system should be improved.
+    //       Database alerts are multiple-producer, single-consumer.
+    //       Currently, alerters may get stuck in a spin loop for a long time.
     alert: std.atomic.Value(Alert),
     mutex: Io.Mutex, // TODO: Compare with RwLock
 
@@ -33,19 +36,25 @@ pub const Database = struct {
 
     // End fields protected by mutex
 
-    // Database-Host synchronization fields
+    num_auto_scan_disablers: std.atomic.Value(u8),
+    next_scan_time_mutex: std.atomic.Mutex,
+    next_scan_time: Io.Clock.Timestamp,
+
     host_send_event: std.atomic.Value(Host.SendEvent),
     host_event_inputs: HostEventInputs,
 
     debug: Debug,
 
-    pub const Alert = enum(u32) { off, on };
+    pub const Alert = enum(u32) { off, on, new_scan_deadline };
 
     pub const HostEventInputs = struct {
         path: Path,
         file_id: network.FileId,
         directory: bool,
     };
+
+    const clock: Io.Clock = .boot;
+    const max_wait_time = Io.Clock.Duration{ .raw = .fromSeconds(10), .clock = clock };
 
     pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator, debug: Debug) !Database {
         // TODO: The length of this path must also be factored into path length calculations.
@@ -64,6 +73,10 @@ pub const Database = struct {
             .local_fs = .{},
             .global_fs = .{},
             .events = .{},
+
+            .num_auto_scan_disablers = .init(0),
+            .next_scan_time_mutex = .unlocked,
+            .next_scan_time = .{ .raw = .zero, .clock = clock }, // First scan happens immediately
 
             .host_send_event = .init(.none),
             .host_event_inputs = undefined,
@@ -91,21 +104,37 @@ pub const Database = struct {
         db.debug.log("running on thread {}", .{std.os.windows.GetCurrentThreadId()});
         var stderr = Io.File.stderr().writer(io, &.{});
 
-        const clock: Io.Clock = .boot;
-        const max_wait_time = Io.Clock.Duration{ .raw = .fromSeconds(15), .clock = clock };
-        var next_scan_time = Io.Clock.Timestamp.now(io, clock); // First scan happens immediately
+        var next_scan_time_cached, _ = db.setNextAutoScanDeadline(.{ .raw = .zero, .clock = clock });
 
         while (true) {
+            const alert = db.alert.load(.acquire);
+            switch (alert) {
+                .off => {},
+                .on => db.alert.store(.off, .release),
+                else => {
+                    errdefer comptime unreachable;
+                    defer db.alert.store(.off, .release);
+                    switch (alert) {
+                        .off, .on => unreachable,
+                        .new_scan_deadline => {
+                            next_scan_time_cached, _ = db.setNextAutoScanDeadline(next_scan_time_cached);
+                        },
+                    }
+                },
+            }
+
             // If enough time has passed, do a scan
-            if (Io.Clock.Timestamp.now(io, clock).compare(.gte, next_scan_time)) {
+            const auto_scanning_disabled = db.num_auto_scan_disablers.load(.monotonic) != 0;
+            if (!auto_scanning_disabled and Io.Clock.Timestamp.now(io, clock).compare(.gte, next_scan_time_cached)) {
                 const locked = try db.lock(io);
                 defer locked.unlock(io);
 
                 try scan.run(locked);
+                // TODO: Handle WriteFailed
                 try stderr.interface.writeAll("Scan complete\n");
                 try locked.debug.printLocalEvents(&stderr.interface);
                 try stderr.interface.flush();
-                next_scan_time = Io.Clock.Timestamp.now(io, clock).addDuration(max_wait_time);
+                next_scan_time_cached, _ = db.setNextAutoScanDeadline(Io.Clock.Timestamp.now(io, clock).addDuration(max_wait_time));
                 continue;
             }
 
@@ -113,8 +142,11 @@ pub const Database = struct {
                 continue;
             }
 
-            db.alert.store(.off, .release);
-            try io.futexWaitTimeout(Alert, &db.alert.raw, .off, .{ .deadline = next_scan_time });
+            if (auto_scanning_disabled) {
+                try io.futexWait(Alert, &db.alert.raw, .off);
+            } else {
+                try io.futexWaitTimeout(Alert, &db.alert.raw, .off, .{ .deadline = next_scan_time_cached });
+            }
         }
     }
 
@@ -212,8 +244,63 @@ pub const Database = struct {
     }
 
     fn wake(db: *Database, io: Io) void {
-        db.alert.store(.on, .release);
+        db.wakeWithAlert(io, .on);
+    }
+
+    fn wakeWithAlert(db: *Database, io: Io, alert: Alert) void {
+        assert(alert != .off);
+        while (db.alert.cmpxchgWeak(.off, alert, .release, .monotonic)) |_| {
+            // TODO: We could be spinning for a very long time
+            std.atomic.spinLoopHint();
+        }
         io.futexWake(Alert, &db.alert.raw, 1);
+    }
+
+    pub fn disableAutoScanning(db: *Database) void {
+        const value = db.num_auto_scan_disablers.fetchAdd(1, .monotonic);
+        if (value == std.math.maxInt(@TypeOf(value))) std.debug.panic("TODO: # of auto-scan disablers overflowed", .{});
+        db.debug.log("Automatic scanning disabled ({} disablers)", .{value + 1});
+    }
+
+    /// Wakes up the Database if the number of disablers becomes 0.
+    /// This may cause an automatic scan to happen immediately upon returning.
+    /// If this is not desired, be sure to use `setNextAutoScanDeadline` before calling this.
+    pub fn enableAutoScanning(db: *Database, io: Io) void {
+        const value = db.num_auto_scan_disablers.fetchSub(1, .monotonic);
+        assert(value != 0);
+        if (value == 1) {
+            db.debug.log("Automatic scanning enabled", .{});
+            db.wake(io);
+        } else {
+            db.debug.log("Automatic scanning disabled ({} disablers)", .{value - 1});
+        }
+    }
+
+    pub fn enableAutoScanningNoWake(db: *Database) void {
+        const value = db.num_auto_scan_disablers.fetchSub(1, .monotonic);
+        assert(value != 0);
+        if (value == 1) {
+            db.debug.log("Automatic scanning enabled", .{});
+        } else {
+            db.debug.log("Automatic scanning disabled ({} disablers)", .{value - 1});
+        }
+    }
+
+    /// If `deadline` is later than the current deadline, then the current deadline is set to `deadline`.
+    /// Otherwise, the current deadline does not change.
+    /// The return value is (the latest of the two deadlines, a bool that is true if the current deadline was updated).
+    fn setNextAutoScanDeadline(db: *Database, deadline: Io.Clock.Timestamp) struct { Io.Clock.Timestamp, bool } {
+        while (!db.next_scan_time_mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+        defer db.next_scan_time_mutex.unlock();
+
+        if (db.next_scan_time.compare(.lt, deadline)) {
+            db.next_scan_time = deadline;
+            return .{ deadline, true };
+        } else {
+            return .{ db.next_scan_time, false };
+        }
     }
 
     pub fn lock(db: *Database, io: Io) !LockedDatabase {
@@ -447,9 +534,22 @@ pub const LockedDatabase = struct {
     }
 
     pub fn manualScan(locked: LockedDatabase, io: Io) !void {
-        // TODO delay the next automatic scan
+        locked.db.disableAutoScanning();
+        errdefer {
+            _ = locked.db.setNextAutoScanDeadline(Io.Clock.Timestamp.now(io, Database.clock).addDuration(Database.max_wait_time));
+            locked.db.enableAutoScanning(io);
+        }
+
         try scan.run(locked);
-        locked.db.wake(io);
+        errdefer comptime unreachable;
+
+        _, const should_alert = locked.db.setNextAutoScanDeadline(Io.Clock.Timestamp.now(io, Database.clock).addDuration(Database.max_wait_time));
+        locked.db.enableAutoScanningNoWake();
+        if (should_alert) {
+            locked.db.wakeWithAlert(io, .new_scan_deadline);
+        } else {
+            locked.db.wake(io);
+        }
     }
 
     // called from Host

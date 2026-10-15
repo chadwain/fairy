@@ -58,6 +58,7 @@ fn runCli(io: Io, cdb: *fairy.client.Database, sdb: *fairy.server.Database) !voi
         client_print_local_events,
         client_scan,
         server_print_files_folders,
+        toggle_auto_scanning,
         help,
     };
     const commands = std.StaticStringMap(Command).initComptime(.{
@@ -66,6 +67,7 @@ fn runCli(io: Io, cdb: *fairy.client.Database, sdb: *fairy.server.Database) !voi
         .{ "e", Command.client_print_local_events },
         .{ "s", Command.client_scan },
         .{ "sa", Command.server_print_files_folders },
+        .{ "t", Command.toggle_auto_scanning },
         .{ "?", Command.help },
     });
 
@@ -77,6 +79,7 @@ fn runCli(io: Io, cdb: *fairy.client.Database, sdb: *fairy.server.Database) !voi
         break :blk msg;
     };
     print("{s}", .{help});
+    var disabled_auto_scanning = false;
     while (true) {
         var line: []const u8 = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.ReadFailed, error.EndOfStream => |e| return e,
@@ -112,6 +115,15 @@ fn runCli(io: Io, cdb: *fairy.client.Database, sdb: *fairy.server.Database) !voi
             .server_print_files_folders => {
                 try sdb.debug.printFileEntries(stdout, io);
                 try stdout.flush();
+            },
+            .toggle_auto_scanning => {
+                if (disabled_auto_scanning) {
+                    disabled_auto_scanning = false;
+                    cdb.enableAutoScanning(io);
+                } else {
+                    disabled_auto_scanning = true;
+                    cdb.disableAutoScanning();
+                }
             },
             .help => print("{s}", .{help}),
         }
