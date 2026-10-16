@@ -19,10 +19,7 @@ const cpu_endian = @import("builtin").cpu.arch.endian();
 
 pub const Database = struct {
     sync_dir: w.HANDLE,
-    // TODO: The alert system should be improved.
-    //       Database alerts are multiple-producer, single-consumer.
-    //       Currently, alerters may get stuck in a spin loop for a long time.
-    alert: std.atomic.Value(Alert),
+    alert: std.atomic.Value(std.meta.Tag(Alert)),
     mutex: Io.Mutex, // TODO: Compare with RwLock
 
     // Begin fields protected by mutex
@@ -37,15 +34,18 @@ pub const Database = struct {
     // End fields protected by mutex
 
     num_auto_scan_disablers: std.atomic.Value(u8),
-    next_scan_time_mutex: std.atomic.Mutex,
-    next_scan_time: Io.Clock.Timestamp,
+    next_auto_scan_time_mutex: std.atomic.Mutex,
+    next_auto_scan_time: Io.Clock.Timestamp,
 
     host_send_event: std.atomic.Value(Host.SendEvent),
     host_event_inputs: HostEventInputs,
 
     debug: Debug,
 
-    pub const Alert = enum(u32) { off, on, new_scan_deadline };
+    pub const Alert = enum(u32) {
+        /// The database will observe the latest auto-scan deadline.
+        new_scan_deadline,
+    };
 
     pub const HostEventInputs = struct {
         path: Path,
@@ -64,7 +64,7 @@ pub const Database = struct {
 
         return .{
             .sync_dir = sync_dir,
-            .alert = .init(.off),
+            .alert = .init(0),
             .mutex = .init,
 
             .allocator = allocator,
@@ -75,8 +75,8 @@ pub const Database = struct {
             .events = .{},
 
             .num_auto_scan_disablers = .init(0),
-            .next_scan_time_mutex = .unlocked,
-            .next_scan_time = .{ .raw = .zero, .clock = clock }, // First scan happens immediately
+            .next_auto_scan_time_mutex = .unlocked,
+            .next_auto_scan_time = .{ .raw = .zero, .clock = clock }, // First scan happens immediately
 
             .host_send_event = .init(.none),
             .host_event_inputs = undefined,
@@ -107,20 +107,16 @@ pub const Database = struct {
         var next_scan_time_cached, _ = db.setNextAutoScanDeadline(.{ .raw = .zero, .clock = clock });
 
         while (true) {
-            const alert = db.alert.load(.acquire);
-            switch (alert) {
-                .off => {},
-                .on => db.alert.store(.off, .release),
-                else => {
-                    errdefer comptime unreachable;
-                    defer db.alert.store(.off, .release);
-                    switch (alert) {
-                        .off, .on => unreachable,
+            // Handle alerts
+            const alert = db.alert.swap(0, .monotonic);
+            inline for (std.meta.fields(Alert)) |field| {
+                if ((alert & comptime (1 << field.value)) != 0) {
+                    switch (@field(Alert, field.name)) {
                         .new_scan_deadline => {
                             next_scan_time_cached, _ = db.setNextAutoScanDeadline(next_scan_time_cached);
                         },
                     }
-                },
+                }
             }
 
             // If enough time has passed, do a scan
@@ -138,14 +134,15 @@ pub const Database = struct {
                 continue;
             }
 
+            // Communicate with the network Host
             if (try db.sendHostEvent(io)) {
                 continue;
             }
 
             if (auto_scanning_disabled) {
-                try io.futexWait(Alert, &db.alert.raw, .off);
+                try io.futexWait(std.meta.Tag(Alert), &db.alert.raw, 0);
             } else {
-                try io.futexWaitTimeout(Alert, &db.alert.raw, .off, .{ .deadline = next_scan_time_cached });
+                try io.futexWaitTimeout(std.meta.Tag(Alert), &db.alert.raw, 0, .{ .deadline = next_scan_time_cached });
             }
         }
     }
@@ -244,16 +241,11 @@ pub const Database = struct {
     }
 
     fn wake(db: *Database, io: Io) void {
-        db.wakeWithAlert(io, .on);
+        io.futexWake(std.meta.Tag(Alert), &db.alert.raw, 1);
     }
 
-    fn wakeWithAlert(db: *Database, io: Io, alert: Alert) void {
-        assert(alert != .off);
-        while (db.alert.cmpxchgWeak(.off, alert, .release, .monotonic)) |_| {
-            // TODO: We could be spinning for a very long time
-            std.atomic.spinLoopHint();
-        }
-        io.futexWake(Alert, &db.alert.raw, 1);
+    fn setAlert(db: *Database, comptime alert: Alert) void {
+        _ = db.alert.bitSet(comptime (1 << @intFromEnum(alert)), .monotonic);
     }
 
     pub fn disableAutoScanning(db: *Database) void {
@@ -264,7 +256,7 @@ pub const Database = struct {
 
     /// Wakes up the Database if the number of disablers becomes 0.
     /// This may cause an automatic scan to happen immediately upon returning.
-    /// If this is not desired, be sure to use `setNextAutoScanDeadline` before calling this.
+    /// If this is not desired, then before calling this function, use `setNextAutoScanDeadline`.
     pub fn enableAutoScanning(db: *Database, io: Io) void {
         const value = db.num_auto_scan_disablers.fetchSub(1, .monotonic);
         assert(value != 0);
@@ -276,30 +268,22 @@ pub const Database = struct {
         }
     }
 
-    pub fn enableAutoScanningNoWake(db: *Database) void {
-        const value = db.num_auto_scan_disablers.fetchSub(1, .monotonic);
-        assert(value != 0);
-        if (value == 1) {
-            db.debug.log("Automatic scanning enabled", .{});
-        } else {
-            db.debug.log("Automatic scanning disabled ({} disablers)", .{value - 1});
-        }
-    }
-
     /// If `deadline` is later than the current deadline, then the current deadline is set to `deadline`.
     /// Otherwise, the current deadline does not change.
     /// The return value is (the latest of the two deadlines, a bool that is true if the current deadline was updated).
+    ///
+    /// Even if the current deadline was updated, it may not have any effect until the Database is alerted with `new_scan_deadline`.
     fn setNextAutoScanDeadline(db: *Database, deadline: Io.Clock.Timestamp) struct { Io.Clock.Timestamp, bool } {
-        while (!db.next_scan_time_mutex.tryLock()) {
+        while (!db.next_auto_scan_time_mutex.tryLock()) {
             std.atomic.spinLoopHint();
         }
-        defer db.next_scan_time_mutex.unlock();
+        defer db.next_auto_scan_time_mutex.unlock();
 
-        if (db.next_scan_time.compare(.lt, deadline)) {
-            db.next_scan_time = deadline;
+        if (db.next_auto_scan_time.compare(.lt, deadline)) {
+            db.next_auto_scan_time = deadline;
             return .{ deadline, true };
         } else {
-            return .{ db.next_scan_time, false };
+            return .{ db.next_auto_scan_time, false };
         }
     }
 
@@ -535,21 +519,16 @@ pub const LockedDatabase = struct {
 
     pub fn manualScan(locked: LockedDatabase, io: Io) !void {
         locked.db.disableAutoScanning();
+        defer locked.db.enableAutoScanning(io);
         errdefer {
             _ = locked.db.setNextAutoScanDeadline(Io.Clock.Timestamp.now(io, Database.clock).addDuration(Database.max_wait_time));
-            locked.db.enableAutoScanning(io);
         }
 
         try scan.run(locked);
         errdefer comptime unreachable;
 
         _, const should_alert = locked.db.setNextAutoScanDeadline(Io.Clock.Timestamp.now(io, Database.clock).addDuration(Database.max_wait_time));
-        locked.db.enableAutoScanningNoWake();
-        if (should_alert) {
-            locked.db.wakeWithAlert(io, .new_scan_deadline);
-        } else {
-            locked.db.wake(io);
-        }
+        if (should_alert) locked.db.setAlert(.new_scan_deadline);
     }
 
     // called from Host
@@ -638,13 +617,6 @@ pub const LockedDatabase = struct {
     // called from Host
     fn markFileAsSynced(locked: LockedDatabase, file_id: network.FileId) void {
         locked.db.events.finishSyncEvent(file_id);
-    }
-
-    // called from Host
-    fn acknowledgeCreateDir(locked: LockedDatabase, file_id: network.FileId) void {
-        _ = locked;
-        _ = file_id;
-        std.debug.panic("TODO", .{});
     }
 
     pub const Debug = struct {
