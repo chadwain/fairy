@@ -25,7 +25,7 @@ pub const Database = struct {
     files: std.AutoHashMapUnmanaged(network.FileId, FileInfo),
     regular_file_info: std.AutoHashMapUnmanaged(network.FileId, RegularFileEntry),
     directory_file_info: std.AutoHashMapUnmanaged(network.FileId, DirectoryFileEntry),
-    top_level_children: std.AutoArrayHashMapUnmanaged(network.FileId, void),
+    sync_dir_entry: DirectoryFileEntry,
 
     host_state: std.atomic.Value(Host.State),
 
@@ -34,6 +34,7 @@ pub const Database = struct {
     pub const FileInfo = struct {
         directory: bool,
         path: Path,
+        component: []const u16,
         parent: ?network.FileId,
     };
 
@@ -48,7 +49,25 @@ pub const Database = struct {
     };
 
     pub const DirectoryFileEntry = struct {
+        // Uses children_arena
         children: std.AutoArrayHashMapUnmanaged(network.FileId, void),
+        // Uses children_arena
+        children_by_component: std.ArrayHashMapUnmanaged([]const u16, void, ComponentHashMapContext, true),
+    };
+
+    pub const ComponentHashMapContext = struct {
+        pub fn hash(_: ComponentHashMapContext, component: []const u16) u32 {
+            // TODO: more efficient hashing
+            var hasher = std.hash.Wyhash.init(0);
+            for (component) |c| {
+                std.hash.autoHash(&hasher, c);
+            }
+            return @truncate(hasher.final());
+        }
+
+        pub fn eql(_: ComponentHashMapContext, a: []const u16, b: []const u16, _: usize) bool {
+            return std.mem.eql(u16, a, b);
+        }
     };
 
     pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
@@ -69,7 +88,10 @@ pub const Database = struct {
             .files = .empty,
             .regular_file_info = .empty,
             .directory_file_info = .empty,
-            .top_level_children = .empty,
+            .sync_dir_entry = .{
+                .children = .empty,
+                .children_by_component = .empty,
+            },
 
             .host_state = .init(.{}),
 
@@ -125,6 +147,9 @@ pub const Database = struct {
                     const file_info = db.files.getEntry(gop.value_ptr.*).?;
                     if (!file_info.value_ptr.directory) return error.InvalidFolder;
                     break :blk .{ gop.value_ptr.*, num_new_files };
+                } else {
+                    // TODO: Put something here
+                    // TODO: On error, this needs to be deleted
                 }
             } else break :blk .{ null, num_new_files };
         };
@@ -142,24 +167,28 @@ pub const Database = struct {
 
         it.setDirection(.forwards);
         var parent_file_id = first_known_directory;
-        var parent_children = if (parent_file_id) |file_id| &db.directory_file_info.getPtr(file_id).?.children else &db.top_level_children;
-        var component = it.next().?;
+        var parent_dir_entry = if (parent_file_id) |file_id| db.directory_file_info.getPtr(file_id).? else &db.sync_dir_entry;
+        var item = it.nextWithComponent().?;
         while (true) {
-            const sub_path = component.dupe(path_allocator) catch std.debug.panic("TODO: Out of memory", .{});
+            const sub_path = item.path.dupe(path_allocator) catch std.debug.panic("TODO: Out of memory", .{});
+            const component = path_allocator.dupe(u16, item.component) catch std.debug.panic("TODO: Out of memory", .{});
             const file_id = db.nextFileIdAssumeAvailable();
             db.path_map.putAssumeCapacityNoClobber(sub_path, file_id);
-            parent_children.putNoClobber(children_allocator, file_id, {}) catch |err| switch (err) {
+            parent_dir_entry.children.putNoClobber(children_allocator, file_id, {}) catch |err| switch (err) {
                 error.OutOfMemory => std.debug.panic("TODO: Out of memory", .{}),
             };
-            if (it.next()) |next_component| {
-                const entry = db.initDirectoryFile(file_id, sub_path, parent_file_id);
+            parent_dir_entry.children_by_component.putNoClobber(children_allocator, component, {}) catch |err| switch (err) {
+                error.OutOfMemory => std.debug.panic("TODO: Out of memory", .{}),
+            };
+            if (it.nextWithComponent()) |next_component| {
+                const entry = db.initDirectoryFile(file_id, component, sub_path, parent_file_id);
                 parent_file_id = file_id;
-                parent_children = &entry.children;
-                component = next_component;
+                parent_dir_entry = entry;
+                item = next_component;
             } else {
                 switch (kind) {
-                    .regular => db.initRegularFile(file_id, sub_path, parent_file_id),
-                    .directory => _ = db.initDirectoryFile(file_id, sub_path, parent_file_id),
+                    .regular => db.initRegularFile(file_id, component, sub_path, parent_file_id),
+                    .directory => _ = db.initDirectoryFile(file_id, component, sub_path, parent_file_id),
                 }
                 return file_id;
             }
@@ -181,9 +210,10 @@ pub const Database = struct {
     }
 
     // Database must be locked.
-    fn initRegularFile(db: *Database, file_id: network.FileId, path: Path, parent_file_id: ?network.FileId) void {
+    fn initRegularFile(db: *Database, file_id: network.FileId, component: []const u16, path: Path, parent_file_id: ?network.FileId) void {
         db.files.putAssumeCapacityNoClobber(file_id, .{
             .directory = false,
+            .component = component,
             .path = path,
             .parent = parent_file_id,
         });
@@ -197,9 +227,10 @@ pub const Database = struct {
     }
 
     // Database must be locked.
-    fn initDirectoryFile(db: *Database, file_id: network.FileId, path: Path, parent_file_id: ?network.FileId) *DirectoryFileEntry {
+    fn initDirectoryFile(db: *Database, file_id: network.FileId, component: []const u16, path: Path, parent_file_id: ?network.FileId) *DirectoryFileEntry {
         db.files.putAssumeCapacityNoClobber(file_id, .{
             .directory = true,
+            .component = component,
             .path = path,
             .parent = parent_file_id,
         });
@@ -208,6 +239,7 @@ pub const Database = struct {
         assert(!gop.found_existing);
         gop.value_ptr.* = .{
             .children = .empty,
+            .children_by_component = .empty,
         };
         return gop.value_ptr;
     }
@@ -386,7 +418,7 @@ pub const Database = struct {
             const parent_children = if (file_info.value_ptr.parent) |parent_file_id|
                 &db.directory_file_info.getPtr(parent_file_id).?.children
             else
-                &db.top_level_children;
+                &db.sync_dir_entry.children;
             assert(parent_children.swapRemove(file_id));
             db.files.removeByPtr(file_info.key_ptr);
             db.regular_file_info.removeByPtr(regular_info.key_ptr);
@@ -461,8 +493,13 @@ pub const Database = struct {
         const parent_children = if (root_info.value_ptr.parent) |parent_file_id|
             &db.directory_file_info.getPtr(parent_file_id).?.children
         else
-            &db.top_level_children;
+            &db.sync_dir_entry.children;
+        const parent_children_by_component = if (root_info.value_ptr.parent) |parent_file_id|
+            &db.directory_file_info.getPtr(parent_file_id).?.children_by_component
+        else
+            &db.sync_dir_entry.children_by_component;
         assert(parent_children.swapRemove(file_id));
+        assert(parent_children_by_component.swapRemove(root_info.value_ptr.component));
         db.files.removeByPtr(root_info.key_ptr);
         db.directory_file_info.removeByPtr(root_dir_entry.key_ptr);
     }

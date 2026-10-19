@@ -86,6 +86,13 @@ pub const Path = struct {
             }
         }
 
+        pub fn nextWithComponent(it: *PathIterator) ?struct { path: Path, component: []const u16 } {
+            const previous_end = it.end;
+            const path = it.next() orelse return null;
+            const component_end = if (it.end == max_len) it.slice.len else it.end;
+            return .{ .path = path, .component = it.slice[previous_end..component_end] };
+        }
+
         pub fn previous(it: *PathIterator) ?Path {
             if (it.end == 0) {
                 it.was_null = true;
