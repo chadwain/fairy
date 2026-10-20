@@ -15,8 +15,6 @@ const PathArrayHashMap = fairy.windows.PathArrayHashMap;
 
 const cpu_endian = @import("builtin").cpu.arch.endian();
 
-// TODO: Stop using std.fs.path.ComponentIterator, because it assumes Win32 paths, but fairy.windows.Path is not necessarily so.
-
 pub const Database = struct {
     sync_dir: w.HANDLE,
     alert: std.atomic.Value(std.meta.Tag(Alert)),
@@ -1421,9 +1419,8 @@ pub const Host = struct {
                     .receive_decision => unreachable,
                 },
                 .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
-                    .send_file_id => try out_file_contents.sendFileId(host, io, writer),
-                    .send_file_contents => try out_file_contents.sendFileContents(host, io, writer),
-                    .receive_decision, .receive_result => unreachable,
+                    .send_file => try out_file_contents.sendFileContents(host, io, writer),
+                    .receive_result => unreachable,
                 },
                 .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
                     .send_file_id => try out_delete_file.sendFileId(host, io, writer),
@@ -1454,7 +1451,7 @@ pub const Host = struct {
                 host.log(.info, "syncing file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
                 host.mt = .{
                     .out_file_contents = .{
-                        .state = .send_file_id,
+                        .state = .send_file,
                         .file_id = host.db.host_event_inputs.file_id,
                         .path = host.db.host_event_inputs.path,
                     },
@@ -1522,9 +1519,8 @@ pub const Host = struct {
                             .send_path => unreachable,
                         },
                         .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
-                            .receive_decision => try out_file_contents.receiveDecision(host, reader, io, action),
                             .receive_result => try out_file_contents.receiveResult(host, reader, io, action),
-                            .send_file_id, .send_file_contents => unreachable,
+                            .send_file => unreachable,
                         },
                         .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
                             .send_file_id => unreachable,
@@ -1689,55 +1685,9 @@ pub const MessageThread = union(enum) {
         path: Path,
 
         pub const State = enum {
-            send_file_id,
-            receive_decision,
-            send_file_contents,
+            send_file,
             receive_result,
         };
-
-        fn sendFileId(
-            out_file_contents: *OutFileContents,
-            host: *Host,
-            io: Io,
-            writer: network.Writer,
-        ) !void {
-            assert(out_file_contents.state == .send_file_id);
-
-            const action: network.Action = .transfer_file_id;
-            host.logNetworkAction(.outgoing, action);
-
-            out_file_contents.state = .receive_decision;
-
-            host.beginTransmitting();
-
-            try writer.sendMessageHeader(.new_thread);
-            try writer.sendAction(action);
-            try writer.sendFileId(out_file_contents.file_id);
-            try writer.flush();
-
-            host.flipMessageThreadOwner(.transmitting, io);
-        }
-
-        fn receiveDecision(
-            out_file_contents: *OutFileContents,
-            host: *Host,
-            _: network.Reader,
-            io: Io,
-            action: network.Action,
-        ) !void {
-            assert(out_file_contents.state == .receive_decision);
-
-            switch (action) {
-                .transfer_file_accept => {
-                    out_file_contents.state = .send_file_contents;
-                    host.flipMessageThreadOwner(.incoming, io);
-                },
-                .transfer_file_decline => {
-                    host.deleteMessageThread(io);
-                },
-                else => return error.InvalidAction,
-            }
-        }
 
         fn sendFileContents(
             out_file_contents: *OutFileContents,
@@ -1745,7 +1695,7 @@ pub const MessageThread = union(enum) {
             io: Io,
             writer: network.Writer,
         ) !void {
-            assert(out_file_contents.state == .send_file_contents);
+            assert(out_file_contents.state == .send_file);
 
             const action: network.Action = .transfer_file_contents;
             host.logNetworkAction(.outgoing, action);
@@ -1762,15 +1712,15 @@ pub const MessageThread = union(enum) {
                     );
                 break :blk casted_size;
             };
-
             const file_hash = network.FileHash{ .blake3 = @splat(0) }; // TODO: compute the hash while sending data
 
             out_file_contents.state = .receive_result;
 
             host.beginTransmitting();
 
-            try writer.sendMessageHeader(.thread_reply);
+            try writer.sendMessageHeader(.new_thread);
             try writer.sendAction(action);
+            try writer.sendFileId(out_file_contents.file_id);
             try writer.sendFileSize(file_size);
             try fairy.windows.sendFile(writer.io, file, file_size);
             try writer.sendFileHash(&file_hash);

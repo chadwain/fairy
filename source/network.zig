@@ -26,9 +26,6 @@ pub const Action = enum(u8) {
     /// Payload(success): A sequence of `FileId`, one for each component of the requested path.
     resolve_path_response,
 
-    transfer_file_id,
-    transfer_file_accept,
-    transfer_file_decline,
     transfer_file_contents,
     transfer_file_success,
     transfer_file_failure,

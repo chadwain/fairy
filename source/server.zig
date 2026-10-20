@@ -31,7 +31,7 @@ pub const Database = struct {
     pub const FileInfo = struct {
         directory: bool,
         path: Path,
-        component: []const u16,
+        component: Path,
         parent: ?network.FileId,
     };
 
@@ -53,18 +53,18 @@ pub const Database = struct {
 
         pub const ComponentArrayHashMap = blk: {
             const Context = struct {
-                pub fn hash(_: @This(), component: []const u16) u32 {
+                pub fn hash(_: @This(), component: Path) u32 {
                     // TODO: better hashing
                     var hasher = std.hash.Wyhash.init(0);
-                    for (component) |c| std.hash.autoHash(&hasher, c);
+                    for (component.slice) |c| std.hash.autoHash(&hasher, c);
                     return @truncate(hasher.final());
                 }
 
-                pub fn eql(_: @This(), a: []const u16, b: []const u16, _: usize) bool {
-                    return std.mem.eql(u16, a, b);
+                pub fn eql(_: @This(), a: Path, b: Path, _: usize) bool {
+                    return std.mem.eql(u16, a.slice, b.slice);
                 }
             };
-            break :blk std.array_hash_map.Custom([]const u16, network.FileId, Context, true);
+            break :blk std.array_hash_map.Custom(Path, network.FileId, Context, true);
         };
     };
 
@@ -117,19 +117,26 @@ pub const Database = struct {
         defer db.mutex.unlock(io);
 
         var it = path_unowned.pathIterator();
-        var item = it.nextWithComponent().?;
-        var parent_dir_entry = &db.sync_dir_entry;
         var parent_file_id: ?network.FileId = null;
-        while (true) {
-            const file_id = parent_dir_entry.children_by_component.get(item.component) orelse break;
-            const file_info = db.files.get(file_id).?;
-            if (it.nextWithComponent()) |next| {
-                if (!file_info.directory) return error.ClientOutOfSync;
-                item = next;
-                parent_dir_entry = db.directory_file_info.getPtr(file_id).?;
-                parent_file_id = file_id;
-            } else {
-                return error.ClientOutOfSync;
+        {
+            var component = it.nextComponent().?;
+            var parent_dir_entry = &db.sync_dir_entry;
+            while (true) {
+                const file_id = parent_dir_entry.children_by_component.get(component) orelse {
+                    it.setDirection(.backwards);
+                    _ = it.previous();
+                    it.setDirection(.forwards);
+                    break;
+                };
+                const file_info = db.files.get(file_id).?;
+                if (it.nextComponent()) |next| {
+                    if (!file_info.directory) return error.ClientOutOfSync;
+                    component = next;
+                    parent_dir_entry = db.directory_file_info.getPtr(file_id).?;
+                    parent_file_id = file_id;
+                } else {
+                    return error.ClientOutOfSync;
+                }
             }
         }
 
@@ -156,13 +163,14 @@ pub const Database = struct {
         errdefer comptime unreachable;
 
         it.replacePath(path);
-        parent_dir_entry = if (parent_file_id) |file_id| db.directory_file_info.getPtr(file_id).? else &db.sync_dir_entry;
+        var item = it.nextPathComponent().?;
+        var parent_dir_entry = if (parent_file_id) |file_id| db.directory_file_info.getPtr(file_id).? else &db.sync_dir_entry;
         while (true) {
             const file_id = db.nextFileIdAssumeAvailable();
             parent_dir_entry.children.putNoClobber(children_allocator, file_id, {}) catch |err| std.debug.panic("TODO: {s}", .{@errorName(err)});
             parent_dir_entry.children_by_component.putNoClobber(children_allocator, item.component, file_id) catch |err| std.debug.panic("TODO: {s}", .{@errorName(err)});
 
-            if (it.nextWithComponent()) |next| {
+            if (it.nextPathComponent()) |next| {
                 const entry = db.initDirectoryFile(file_id, item.component, item.path, parent_file_id);
                 parent_file_id = file_id;
                 parent_dir_entry = entry;
@@ -192,7 +200,7 @@ pub const Database = struct {
     }
 
     // Database must be locked.
-    fn initRegularFile(db: *Database, file_id: network.FileId, component: []const u16, path: Path, parent_file_id: ?network.FileId) void {
+    fn initRegularFile(db: *Database, file_id: network.FileId, component: Path, path: Path, parent_file_id: ?network.FileId) void {
         db.files.putAssumeCapacityNoClobber(file_id, .{
             .directory = false,
             .component = component,
@@ -209,7 +217,7 @@ pub const Database = struct {
     }
 
     // Database must be locked.
-    fn initDirectoryFile(db: *Database, file_id: network.FileId, component: []const u16, path: Path, parent_file_id: ?network.FileId) *DirectoryFileEntry {
+    fn initDirectoryFile(db: *Database, file_id: network.FileId, component: Path, path: Path, parent_file_id: ?network.FileId) *DirectoryFileEntry {
         db.files.putAssumeCapacityNoClobber(file_id, .{
             .directory = true,
             .component = component,
@@ -242,84 +250,52 @@ pub const Database = struct {
         return list.items;
     }
 
-    const CanTransferDataResult = union(enum) {
-        file_exists: struct {
-            path: Path,
-        },
-        file_doesnt_exist,
-        is_a_directory,
-    };
+    /// Opens a regular file for writing to. Creates parent directories as necessary.
+    fn openRegularFile(db: *Database, io: Io, file_id: network.FileId, file_size: w.LARGE_INTEGER) !w.HANDLE {
+        const full_path = blk: {
+            try db.mutex.lock(io);
+            defer db.mutex.unlock(io);
 
-    fn canTransferData(
-        db: *Database,
-        file_id: network.FileId,
-        io: Io,
-    ) !CanTransferDataResult {
-        try db.mutex.lock(io);
-        defer db.mutex.unlock(io);
+            const info = db.files.getPtr(file_id) orelse return error.FileDoesNotExist;
+            if (info.directory) return error.IsDirectory;
+            break :blk info.path;
+        };
 
-        const info = db.files.getPtr(file_id) orelse return .file_doesnt_exist;
-        if (info.directory) return .is_a_directory;
-        return .{ .file_exists = .{
-            .path = info.path,
-        } };
-    }
+        var it = full_path.backwardsPathIterator();
+        const last_component = it.previousComponent().?;
+        const top_level = it.empty();
+        var dir_handle = if (top_level) db.sync_dir else blk: {
+            while (it.previous()) |path| {
+                const handle = fairy.windows.createDir(db.sync_dir, path) catch |err| switch (err) {
+                    error.ParentDirNotFound => continue,
+                    error.Unexpected => |e| return e,
+                };
+                break :blk handle;
+            } else std.debug.panic("TODO: Could not create a file in the sync directory", .{});
+        };
+        errdefer std.debug.panic("TODO: Delete intermediate directories and files", .{});
 
-    fn openFileReadOnly(db: *const Database, path: Path) !w.HANDLE {
-        return fairy.windows.openFile(db.sync_dir, path, .read);
-    }
-
-    const CreateParentDirectoriesError = error{ CreateParentDirFail, Unexpected };
-
-    const CreateParentDirectoriesResult = struct {
-        parent: union(enum) {
-            handle: w.HANDLE,
-            sync_dir,
-        },
-        name: Path,
-    };
-
-    fn createParentDirectories(db: *const Database, path: Path) CreateParentDirectoriesError!CreateParentDirectoriesResult {
-        const ComponentIterator = std.fs.path.ComponentIterator(.windows, u16);
-        var it = ComponentIterator.init(path.slice);
-        const first = it.first().?;
-        const last = it.last().?;
-        if (first.path.len == last.path.len) return .{ .parent = .sync_dir, .name = .assumeValidPath(last.name) };
-        var handle = blk: while (it.previous()) |component| {
-            const handle = fairy.windows.createDir(db.sync_dir, .assumeValidPath(component.path)) catch |err| switch (err) {
-                error.ParentDirNotFound => continue,
-                error.Unexpected => |e| return e,
-            };
-            if (component.path.len != first.path.len) _ = it.next().?;
-            break :blk handle;
-        } else return error.CreateParentDirFail;
-        errdefer fairy.windows.closeHandle(handle);
-
-        // TODO errdefer delete whatever we created
-        while (it.next()) |component| {
-            if (component.path.len == last.path.len) break;
-            const child_handle = fairy.windows.createDir(handle, .assumeValidPath(component.name)) catch |err| switch (err) {
+        it.setDirection(.forwards);
+        while (it.nextComponent()) |component| {
+            if (component.slice.ptr == last_component.slice.ptr) break;
+            const child_handle = fairy.windows.createDir(dir_handle, component) catch |err| switch (err) {
                 error.ParentDirNotFound => {
-                    // TODO: The directory we just created was deleted.
-                    //       Either try to re-create it, or obtain exclusive delete access to it.
-                    return error.CreateParentDirFail;
+                    std.debug.panic("TODO: Directory not found even though we have an open handle to it (?)", .{});
                 },
                 error.Unexpected => |e| return e,
             };
             errdefer comptime unreachable;
-            fairy.windows.closeHandle(handle);
-            handle = child_handle;
+            fairy.windows.closeHandle(dir_handle);
+            dir_handle = child_handle;
         }
 
-        return .{ .parent = .{ .handle = handle }, .name = .assumeValidPath(last.name) };
-    }
-
-    fn createFile(_: *const Database, parent: w.HANDLE, name: Path, initial_size: w.LARGE_INTEGER) !w.HANDLE {
-        return fairy.windows.createFile(parent, name, .{ .initial_size = initial_size });
-    }
-
-    fn closeHandle(_: *const Database, file: w.HANDLE) void {
-        fairy.windows.closeHandle(file);
+        const handle = fairy.windows.createFile(dir_handle, last_component, .{ .initial_size = file_size }) catch |err| switch (err) {
+            error.ParentDirNotFound => {
+                std.debug.panic("TODO: Directory not found even though we have an open handle to it (?)", .{});
+            },
+            error.Unexpected => |e| return e,
+        };
+        return handle;
     }
 
     fn finishReceiveFileContents(
@@ -593,10 +569,8 @@ pub const Host = struct {
                 .in_new_file => |*in_new_file| {
                     try in_new_file.sendDecision(host, io, writer);
                 },
-                .in_file_contents => |*in_file_contents| switch (in_file_contents.state) {
-                    .send_decision => try in_file_contents.sendDecision(host, io, writer),
-                    .send_result => try in_file_contents.sendResult(host, io, writer),
-                    .receive_file_contents => unreachable,
+                .in_file_contents => |*in_file_contents| {
+                    try in_file_contents.sendResult(host, io, writer);
                 },
                 .in_delete_file => |*in_delete_file| {
                     try in_delete_file.sendConfirmation(host, io, writer);
@@ -611,6 +585,7 @@ pub const Host = struct {
     pub const RecvError = error{
         InvalidAction,
         InvalidHeader,
+        InvalidFileSize,
         UnexpectedIncomingMessage,
     } ||
         network.Reader.ReceiveActionError ||
@@ -621,8 +596,7 @@ pub const Host = struct {
         network.Reader.ReceiveWindowsPathError ||
         Io.Cancelable ||
         Allocator.Error ||
-        fairy.windows.ReceiveFileError ||
-        Database.CreateParentDirectoriesError;
+        fairy.windows.ReceiveFileError;
 
     fn receiveIncomingMessages(host: *Host, reader: network.Reader, io: Io) RecvError!void {
         while (true) {
@@ -638,7 +612,7 @@ pub const Host = struct {
                         .resolve_path => {
                             try MessageThread.InNewFile.initMessageThread(host, io, reader);
                         },
-                        .transfer_file_id => {
+                        .transfer_file_contents => {
                             try MessageThread.InFileContents.initMessageThread(host, io, reader);
                         },
                         .delete_file => {
@@ -655,10 +629,7 @@ pub const Host = struct {
 
                     switch (host.mt) {
                         .in_new_file => unreachable,
-                        .in_file_contents => |*in_file_contents| switch (in_file_contents.state) {
-                            .receive_file_contents => try in_file_contents.receiveFileContents(host, reader, io, action),
-                            .send_decision, .send_result => unreachable,
-                        },
+                        .in_file_contents => unreachable,
                         .in_delete_file => unreachable,
                         .in_delete_dir => unreachable,
                     }
@@ -830,18 +801,9 @@ pub const MessageThread = union(enum) {
     };
 
     pub const InFileContents = struct {
-        state: State,
-        file_id: network.FileId,
-        path: Path,
+        result: SendResult,
 
-        pub const State = union(enum) {
-            send_decision: SendDecision,
-            receive_file_contents,
-            send_result: SendResult,
-
-            pub const SendDecision = enum { accept, decline };
-            pub const SendResult = enum { success, failure };
-        };
+        pub const SendResult = enum { success, failure };
 
         fn initMessageThread(
             host: *Host,
@@ -849,106 +811,35 @@ pub const MessageThread = union(enum) {
             reader: network.Reader,
         ) !void {
             const file_id = try reader.receiveFileId();
-            const path: Path, const decision: State.SendDecision = switch (try host.db.canTransferData(file_id, io)) {
-                .file_exists => |res| .{
-                    res.path,
-                    .accept,
-                },
-                .file_doesnt_exist, .is_a_directory => std.debug.panic("TODO", .{}),
+            const file_size = blk: {
+                const network_size = try reader.receiveFileSize();
+                const windows_size = std.math.cast(w.LARGE_INTEGER, network_size) orelse return error.InvalidFileSize;
+                break :blk windows_size;
             };
+
+            // TODO: Open a temporary file instead
+            const handle = host.db.openRegularFile(io, file_id, file_size) catch |err| switch (err) {
+                error.FileDoesNotExist, error.IsDirectory => std.debug.panic("TODO: Client out of sync", .{}),
+                error.Unexpected, error.Canceled => |e| return e,
+            };
+            defer fairy.windows.closeHandle(handle);
+
+            try fairy.windows.receiveFile(reader.io, handle, file_size);
+            const file_hash = try reader.receiveFileHash();
+            try host.db.finishReceiveFileContents(
+                io,
+                handle,
+                file_id,
+                &file_hash, // TODO: verify the hash
+                file_size,
+            );
+
             const data: MessageThread = .{
                 .in_file_contents = .{
-                    .state = .{ .send_decision = decision },
-                    .file_id = file_id,
-                    .path = path,
+                    .result = .success,
                 },
             };
             host.queueOutgoingMessage(io, data);
-        }
-
-        fn sendDecision(
-            in_file_contents: *InFileContents,
-            host: *Host,
-            io: Io,
-            writer: network.Writer,
-        ) !void {
-            assert(in_file_contents.state == .send_decision);
-
-            const action: network.Action = switch (in_file_contents.state.send_decision) {
-                .accept => .transfer_file_accept,
-                .decline => .transfer_file_decline,
-            };
-            host.logMessage(.outgoing, action);
-
-            switch (in_file_contents.state.send_decision) {
-                .accept => {
-                    in_file_contents.state = .receive_file_contents;
-                    host.flipMessageThreadOwner(.incoming, io);
-                },
-                .decline => host.deleteMessageThread(.outgoing, io),
-            }
-
-            try writer.sendMessageHeader(.thread_reply);
-            try writer.sendAction(action);
-            try writer.flush();
-        }
-
-        fn receiveFileContents(
-            in_file_contents: *InFileContents,
-            host: *Host,
-            reader: network.Reader,
-            io: Io,
-            action: network.Action,
-        ) !void {
-            assert(in_file_contents.state == .receive_file_contents);
-            switch (action) {
-                .transfer_file_contents => {
-                    const file_size = blk: {
-                        const network_size = try reader.receiveFileSize();
-                        const windows_size = std.math.cast(w.LARGE_INTEGER, network_size) orelse
-                            std.debug.panic(
-                                "TODO: File too large to transfer: '{f}' with size {}",
-                                .{ in_file_contents.path.formatUtf8(), network_size },
-                            );
-                        break :blk windows_size;
-                    };
-
-                    const create_result = try host.db.createParentDirectories(in_file_contents.path);
-                    defer switch (create_result.parent) {
-                        .handle => |handle| host.db.closeHandle(handle),
-                        .sync_dir => {},
-                    };
-
-                    const handle = host.db.createFile(switch (create_result.parent) {
-                        .handle => |handle| handle,
-                        .sync_dir => host.db.sync_dir,
-                    }, create_result.name, file_size) catch |err| switch (err) {
-                        error.ParentDirNotFound => {
-                            // TODO: The directory we just created was deleted.
-                            //       Either try to re-create it, or obtain exclusive delete access to it.
-                            // TODO: report failure to the client
-                            return error.CreateParentDirFail;
-                        },
-                        // TODO: report failure to the client
-                        error.Unexpected => |e| return e,
-                    };
-                    defer host.db.closeHandle(handle);
-
-                    try fairy.windows.receiveFile(reader.io, handle, file_size);
-                    const file_hash = try reader.receiveFileHash();
-                    try host.db.finishReceiveFileContents(
-                        io,
-                        handle,
-                        in_file_contents.file_id,
-                        &file_hash, // TODO: verify the hash
-                        file_size,
-                    );
-
-                    in_file_contents.state = .{ .send_result = .success };
-                    host.flipMessageThreadOwner(.outgoing, io);
-                },
-                else => return error.InvalidAction,
-            }
         }
 
         fn sendResult(
@@ -957,9 +848,7 @@ pub const MessageThread = union(enum) {
             io: Io,
             writer: network.Writer,
         ) !void {
-            assert(in_file_contents.state == .send_result);
-
-            const action: network.Action = switch (in_file_contents.state.send_result) {
+            const action: network.Action = switch (in_file_contents.result) {
                 .success => .transfer_file_success,
                 .failure => .transfer_file_failure,
             };

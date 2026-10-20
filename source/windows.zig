@@ -69,7 +69,11 @@ pub const Path = struct {
         end: u16,
         was_null: bool,
 
-        pub fn next(it: *PathIterator) ?Path {
+        pub fn empty(it: *const PathIterator) bool {
+            return it.end == 0;
+        }
+
+        fn goForwards(it: *PathIterator) ?[2]u16 {
             if (it.end == max_len) {
                 it.was_null = true;
                 return null;
@@ -79,34 +83,57 @@ pub const Path = struct {
             const start = if (it.end != 0) it.end + 1 else 0;
             if (std.mem.findScalarPos(u16, it.slice, start, '\\')) |new_end| {
                 it.end = @intCast(new_end);
-                return .{ .slice = it.slice[0..it.end] };
+                return .{ start, it.end };
             } else {
                 it.end = max_len;
-                return .{ .slice = it.slice };
+                return .{ start, @intCast(it.slice.len) };
             }
         }
 
-        pub fn nextWithComponent(it: *PathIterator) ?struct { path: Path, component: []const u16 } {
-            const previous_end = it.end;
-            const path = it.next() orelse return null;
-            const component_end = if (it.end == max_len) it.slice.len else it.end;
-            return .{ .path = path, .component = it.slice[previous_end..component_end] };
+        pub fn next(it: *PathIterator) ?Path {
+            const bounds = it.goForwards() orelse return null;
+            return .{ .slice = it.slice[0..bounds[1]] };
         }
 
-        pub fn previous(it: *PathIterator) ?Path {
+        pub fn nextComponent(it: *PathIterator) ?Path {
+            const bounds = it.goForwards() orelse return null;
+            return .{ .slice = it.slice[bounds[0]..bounds[1]] };
+        }
+
+        pub fn nextPathComponent(it: *PathIterator) ?struct { path: Path, component: Path } {
+            const bounds = it.goForwards() orelse return null;
+            return .{
+                .path = .{ .slice = it.slice[0..bounds[1]] },
+                .component = .{ .slice = it.slice[bounds[0]..bounds[1]] },
+            };
+        }
+
+        fn goBackwards(it: *PathIterator) ?[2]u16 {
             if (it.end == 0) {
                 it.was_null = true;
                 return null;
             }
             it.was_null = false;
 
-            const end = if (it.end == max_len) it.slice.len else it.end;
+            const end = if (it.end == max_len) @as(u16, @intCast(it.slice.len)) else it.end;
             if (std.mem.findScalarLast(u16, it.slice[0..end], '\\')) |new_end| {
                 it.end = @intCast(new_end);
+                return .{ it.end + 1, end };
             } else {
                 it.end = 0;
+                return .{ 0, end };
             }
-            return .{ .slice = it.slice[0..end] };
+            return end;
+        }
+
+        pub fn previous(it: *PathIterator) ?Path {
+            const bounds = it.goBackwards() orelse return null;
+            return .{ .slice = it.slice[0..bounds[1]] };
+        }
+
+        pub fn previousComponent(it: *PathIterator) ?Path {
+            const bounds = it.goBackwards() orelse return null;
+            return .{ .slice = it.slice[bounds[0]..bounds[1]] };
         }
 
         pub const Direction = enum { forwards, backwards };
