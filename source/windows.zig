@@ -121,6 +121,11 @@ pub const Path = struct {
                 },
             }
         }
+
+        pub fn replacePath(it: *PathIterator, new_path: Path) void {
+            assert(std.mem.eql(u16, it.slice, new_path.slice));
+            it.slice = new_path.slice;
+        }
     };
 
     pub fn pathIterator(path: Path) PathIterator {

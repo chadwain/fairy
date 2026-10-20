@@ -80,8 +80,7 @@ pub const ResolvePathResponse = enum(u8) {
     success,
     invalid_path,
     exhausted_file_ids,
-    invalid_folder,
-    wrong_file_kind,
+    client_out_of_sync,
 };
 
 pub const CreateDirResponse = enum(u8) {

@@ -1670,8 +1670,7 @@ pub const MessageThread = union(enum) {
                 },
                 .invalid_path,
                 .exhausted_file_ids,
-                .invalid_folder,
-                .wrong_file_kind,
+                .client_out_of_sync,
                 => {
                     host.log(
                         .err,

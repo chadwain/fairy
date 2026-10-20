@@ -10,8 +10,6 @@ const network = fairy.network;
 const Path = fairy.windows.Path;
 const PathHashMap = fairy.windows.PathHashMap;
 
-const cpu_endian = @import("builtin").cpu.arch.endian();
-
 pub const Database = struct {
     sync_dir: w.HANDLE,
 
@@ -20,7 +18,6 @@ pub const Database = struct {
     path_arena: std.heap.ArenaAllocator.State,
     children_arena: std.heap.ArenaAllocator.State,
 
-    path_map: PathHashMap(network.FileId),
     next_file_id: ?std.meta.Tag(network.FileId),
     files: std.AutoHashMapUnmanaged(network.FileId, FileInfo),
     regular_file_info: std.AutoHashMapUnmanaged(network.FileId, RegularFileEntry),
@@ -50,24 +47,25 @@ pub const Database = struct {
 
     pub const DirectoryFileEntry = struct {
         // Uses children_arena
-        children: std.AutoArrayHashMapUnmanaged(network.FileId, void),
+        children: std.array_hash_map.Auto(network.FileId, void),
         // Uses children_arena
-        children_by_component: std.ArrayHashMapUnmanaged([]const u16, void, ComponentHashMapContext, true),
-    };
+        children_by_component: ComponentArrayHashMap,
 
-    pub const ComponentHashMapContext = struct {
-        pub fn hash(_: ComponentHashMapContext, component: []const u16) u32 {
-            // TODO: more efficient hashing
-            var hasher = std.hash.Wyhash.init(0);
-            for (component) |c| {
-                std.hash.autoHash(&hasher, c);
-            }
-            return @truncate(hasher.final());
-        }
+        pub const ComponentArrayHashMap = blk: {
+            const Context = struct {
+                pub fn hash(_: @This(), component: []const u16) u32 {
+                    // TODO: better hashing
+                    var hasher = std.hash.Wyhash.init(0);
+                    for (component) |c| std.hash.autoHash(&hasher, c);
+                    return @truncate(hasher.final());
+                }
 
-        pub fn eql(_: ComponentHashMapContext, a: []const u16, b: []const u16, _: usize) bool {
-            return std.mem.eql(u16, a, b);
-        }
+                pub fn eql(_: @This(), a: []const u16, b: []const u16, _: usize) bool {
+                    return std.mem.eql(u16, a, b);
+                }
+            };
+            break :blk std.array_hash_map.Custom([]const u16, network.FileId, Context, true);
+        };
     };
 
     pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
@@ -83,7 +81,6 @@ pub const Database = struct {
 
             .path_arena = .{},
             .children_arena = .{},
-            .path_map = .empty,
             .next_file_id = 0,
             .files = .empty,
             .regular_file_info = .empty,
@@ -108,7 +105,6 @@ pub const Database = struct {
         var children_arena = db.children_arena.promote(db.allocator);
         children_arena.deinit();
 
-        db.path_map.deinit(db.allocator);
         db.files.deinit(db.allocator);
         db.regular_file_info.deinit(db.allocator);
         db.directory_file_info.deinit(db.allocator);
@@ -116,79 +112,65 @@ pub const Database = struct {
         db.* = undefined;
     }
 
-    fn newFile(db: *Database, path: Path, kind: network.FileKind, io: Io) !network.FileId {
+    fn newFile(db: *Database, path_unowned: Path, kind: network.FileKind, io: Io) !network.FileId {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        if (db.path_map.get(path)) |file_id| {
+        var it = path_unowned.pathIterator();
+        var item = it.nextWithComponent().?;
+        var parent_dir_entry = &db.sync_dir_entry;
+        var parent_file_id: ?network.FileId = null;
+        while (true) {
+            const file_id = parent_dir_entry.children_by_component.get(item.component) orelse break;
             const file_info = db.files.get(file_id).?;
-            switch (kind) {
-                .regular => if (file_info.directory) return error.WrongFileKind,
-                .directory => if (!file_info.directory) return error.WrongFileKind,
+            if (it.nextWithComponent()) |next| {
+                if (!file_info.directory) return error.ClientOutOfSync;
+                item = next;
+                parent_dir_entry = db.directory_file_info.getPtr(file_id).?;
+                parent_file_id = file_id;
+            } else {
+                return error.ClientOutOfSync;
             }
-            return file_id;
         }
 
         var path_arena = db.path_arena.promote(db.allocator);
         defer db.path_arena = path_arena.state;
         const path_allocator = path_arena.allocator();
+        const path = try path_unowned.dupe(path_allocator);
+        errdefer path_allocator.free(path.slice);
 
         var children_arena = db.children_arena.promote(db.allocator);
         defer db.children_arena = children_arena.state;
         const children_allocator = children_arena.allocator();
 
-        var it = path.backwardsPathIterator();
-        const first_known_directory: ?network.FileId, const num_new_files: fairy.PathComponentCount = blk: {
-            _ = it.previous();
-            var num_new_files: fairy.PathComponentCount = 1;
-            while (it.previous()) |sub_path| : (num_new_files += 1) {
-                const gop = try db.path_map.getOrPut(db.allocator, sub_path);
-                if (gop.found_existing) {
-                    const file_info = db.files.getEntry(gop.value_ptr.*).?;
-                    if (!file_info.value_ptr.directory) return error.InvalidFolder;
-                    break :blk .{ gop.value_ptr.*, num_new_files };
-                } else {
-                    // TODO: Put something here
-                    // TODO: On error, this needs to be deleted
-                }
-            } else break :blk .{ null, num_new_files };
-        };
-
+        // TODO: Calculate the number of components in `path`
+        const num_new_files = fairy.max_path_components;
         const is_directory = switch (kind) {
             .directory => true,
             .regular => false,
         };
         try db.ensureUnusedFileIds(num_new_files);
         try db.files.ensureUnusedCapacity(db.allocator, num_new_files);
-        try db.path_map.ensureUnusedCapacity(db.allocator, num_new_files);
         try db.regular_file_info.ensureUnusedCapacity(db.allocator, @intFromBool(!is_directory));
         try db.directory_file_info.ensureUnusedCapacity(db.allocator, num_new_files - @intFromBool(!is_directory));
         errdefer comptime unreachable;
 
-        it.setDirection(.forwards);
-        var parent_file_id = first_known_directory;
-        var parent_dir_entry = if (parent_file_id) |file_id| db.directory_file_info.getPtr(file_id).? else &db.sync_dir_entry;
-        var item = it.nextWithComponent().?;
+        it.replacePath(path);
+        parent_dir_entry = if (parent_file_id) |file_id| db.directory_file_info.getPtr(file_id).? else &db.sync_dir_entry;
         while (true) {
-            const sub_path = item.path.dupe(path_allocator) catch std.debug.panic("TODO: Out of memory", .{});
-            const component = path_allocator.dupe(u16, item.component) catch std.debug.panic("TODO: Out of memory", .{});
             const file_id = db.nextFileIdAssumeAvailable();
-            db.path_map.putAssumeCapacityNoClobber(sub_path, file_id);
-            parent_dir_entry.children.putNoClobber(children_allocator, file_id, {}) catch |err| switch (err) {
-                error.OutOfMemory => std.debug.panic("TODO: Out of memory", .{}),
-            };
-            parent_dir_entry.children_by_component.putNoClobber(children_allocator, component, {}) catch |err| switch (err) {
-                error.OutOfMemory => std.debug.panic("TODO: Out of memory", .{}),
-            };
-            if (it.nextWithComponent()) |next_component| {
-                const entry = db.initDirectoryFile(file_id, component, sub_path, parent_file_id);
+            parent_dir_entry.children.putNoClobber(children_allocator, file_id, {}) catch |err| std.debug.panic("TODO: {s}", .{@errorName(err)});
+            parent_dir_entry.children_by_component.putNoClobber(children_allocator, item.component, file_id) catch |err| std.debug.panic("TODO: {s}", .{@errorName(err)});
+
+            if (it.nextWithComponent()) |next| {
+                const entry = db.initDirectoryFile(file_id, item.component, item.path, parent_file_id);
                 parent_file_id = file_id;
                 parent_dir_entry = entry;
-                item = next_component;
+                item = next;
             } else {
                 switch (kind) {
-                    .regular => db.initRegularFile(file_id, component, sub_path, parent_file_id),
-                    .directory => _ = db.initDirectoryFile(file_id, component, sub_path, parent_file_id),
+                    .regular => db.initRegularFile(file_id, item.component, item.path, parent_file_id),
+                    .directory => _ = db.initDirectoryFile(file_id, item.component, item.path, parent_file_id),
                 }
                 return file_id;
             }
@@ -407,8 +389,6 @@ pub const Database = struct {
         const file_info = db.files.getEntry(file_id) orelse return .unknown_file;
         if (file_info.value_ptr.directory) std.debug.panic("TODO delete folders", .{});
         const regular_info = db.regular_file_info.getEntry(file_id).?;
-        const path_info_entry = db.path_map.getEntry(file_info.value_ptr.path).?;
-        assert(path_info_entry.value_ptr.* == file_id);
         switch (regular_info.value_ptr.status) {
             .synced, .unsynced => {},
         }
@@ -422,7 +402,6 @@ pub const Database = struct {
             assert(parent_children.swapRemove(file_id));
             db.files.removeByPtr(file_info.key_ptr);
             db.regular_file_info.removeByPtr(regular_info.key_ptr);
-            db.path_map.removeByPtr(path_info_entry.key_ptr);
             return .success;
         } else |_| {
             // TODO: set the file entry to some errored state
@@ -475,7 +454,6 @@ pub const Database = struct {
 
             try fairy.windows.deleteFile(db.sync_dir, child_info.value_ptr.path);
 
-            assert(db.path_map.fetchRemove(child_info.value_ptr.path).?.value == child_file_id);
             if (child_info.value_ptr.directory) {
                 item.state = .iterate;
                 assert(db.directory_file_info.remove(child_file_id));
@@ -489,7 +467,6 @@ pub const Database = struct {
 
         try fairy.windows.deleteFile(db.sync_dir, root_info.value_ptr.path);
 
-        assert(db.path_map.fetchRemove(root_info.value_ptr.path).?.value == file_id);
         const parent_children = if (root_info.value_ptr.parent) |parent_file_id|
             &db.directory_file_info.getPtr(parent_file_id).?.children
         else
@@ -775,8 +752,7 @@ pub const MessageThread = union(enum) {
             success: network.FileId,
             invalid_path,
             exhausted_file_ids,
-            invalid_folder,
-            wrong_file_kind,
+            client_out_of_sync,
         };
 
         fn initMessageThread(
@@ -807,8 +783,7 @@ pub const MessageThread = union(enum) {
                         .{ .success = file_id }
                     else |err| switch (err) {
                         error.ExhaustedFileIds => .exhausted_file_ids,
-                        error.InvalidFolder => .invalid_folder,
-                        error.WrongFileKind => .wrong_file_kind,
+                        error.ClientOutOfSync => .client_out_of_sync,
                         error.Canceled, error.OutOfMemory => |e| return e,
                     },
                 },
@@ -841,8 +816,7 @@ pub const MessageThread = union(enum) {
                 },
                 .invalid_path,
                 .exhausted_file_ids,
-                .invalid_folder,
-                .wrong_file_kind,
+                .client_out_of_sync,
                 => {
                     host.deleteMessageThread(.outgoing, io);
 
