@@ -874,6 +874,8 @@ const scan = struct {
         if (information.FileAttributes.DIRECTORY) {
             try processDirectoryFile(ctx, path, information, set_to_untracked);
 
+            if (set_to_untracked) return;
+
             const component_count: fairy.PathComponentCount = @intCast(ctx.open_dir_handles.items.len - 1); // Don't count the sync dir itself as a component.
             if (component_count == fairy.max_path_components) return; // TODO: track the folder, but don't track its contents.
 
@@ -932,24 +934,26 @@ const scan = struct {
 
         const gop = try ctx.file_info.getOrPut(ctx.scan_arena.allocator(), path);
         if (gop.found_existing) {
-            if (gop.value_ptr.already_seen) std.debug.panic("TODO saw file more than once while scanning: {f}", .{path.formatUtf8()});
+            if (gop.value_ptr.already_seen) return;
             gop.value_ptr.already_seen = true;
 
-            // TODO Reuse the result of this lookup
-            const info = ctx.local_fs.files.get(path).?;
-            if (info.directory) std.debug.panic("TODO a directory was changed to a regular file: {f}", .{path.formatUtf8()});
+            const info = ctx.local_fs.files.getEntry(path).?;
+            if (info.value_ptr.directory) std.debug.panic("TODO a directory was changed to a regular file: {f}", .{path.formatUtf8()});
 
-            switch (info.status) {
+            switch (info.value_ptr.status) {
                 .tracked => {
                     if (set_to_untracked) {
-                        try changeTrackedRegularFileToUntracked(ctx.local_fs, ctx.events, ctx.db_allocator, path);
+                        try changeTrackedRegularFileToUntracked(info, ctx.events, ctx.db_allocator);
                     } else {
-                        try updateTrackedRegularFile(ctx.local_fs, ctx.global_fs, ctx.events, ctx.db_allocator, path, meta);
+                        try updateTrackedRegularFile(ctx.local_fs, info, ctx.global_fs, ctx.events, ctx.db_allocator, meta);
                     }
                 },
                 .untracked => {
-                    if (set_to_untracked) return;
-                    try changeUntrackedRegularFileToNew(ctx.local_fs, ctx.events, ctx.db_allocator, path, meta);
+                    if (set_to_untracked) {
+                        updateUntrackedRegularFile(ctx.local_fs, info, meta);
+                    } else {
+                        try changeUntrackedRegularFileToTracked(ctx.local_fs, info, ctx.events, ctx.db_allocator, meta);
+                    }
                 },
             }
         } else {
@@ -964,7 +968,7 @@ const scan = struct {
 
             const parent = ctx.parent_paths.getLast();
             const status: LocalFilesystem.Status = if (set_to_untracked) .untracked else .tracked;
-            try addFile(ctx.local_fs, ctx.events, ctx.db_allocator, .regular, status, path_copy, parent, meta);
+            try addNewFile(ctx.local_fs, ctx.events, ctx.db_allocator, .regular, status, path_copy, parent, meta);
         }
     }
 
@@ -982,19 +986,27 @@ const scan = struct {
 
         const gop = try ctx.file_info.getOrPut(ctx.scan_arena.allocator(), path);
         if (gop.found_existing) {
-            if (gop.value_ptr.already_seen) std.debug.panic("TODO saw directory more than once while scanning: {f}", .{path.formatUtf8()});
+            if (gop.value_ptr.already_seen) return;
             gop.value_ptr.already_seen = true;
 
-            // TODO Reuse the result of this lookup
-            const info = ctx.local_fs.files.get(path).?;
-            if (!info.directory) std.debug.panic("TODO a regular file was changed into a directory: {f}", .{path.formatUtf8()});
+            const info = ctx.local_fs.files.getEntry(path).?;
+            if (!info.value_ptr.directory) std.debug.panic("TODO a regular file was changed into a directory: {f}", .{path.formatUtf8()});
 
-            switch (info.status) {
+            switch (info.value_ptr.status) {
                 .tracked => {
-                    if (set_to_untracked) std.debug.panic("TODO set a tracked directory to untracked: {f}", .{path.formatUtf8()});
-                    updateTrackedDirectoryFile(ctx.local_fs, path, meta);
+                    if (set_to_untracked) {
+                        try changeTrackedDirectoryFileToUntracked(ctx.local_fs, info, ctx.events, ctx.db_allocator);
+                    } else {
+                        updateDirectoryFile(ctx.local_fs, info, meta);
+                    }
                 },
-                .untracked => std.debug.panic("TODO handle untracked directory: {f}", .{path.formatUtf8()}),
+                .untracked => {
+                    if (set_to_untracked) {
+                        updateDirectoryFile(ctx.local_fs, info, meta);
+                    } else {
+                        try changeUntrackedDirectoryFileToTracked(ctx.local_fs, info, ctx.events, ctx.db_allocator, meta);
+                    }
+                },
             }
         } else {
             errdefer ctx.file_info.removeByPtr(gop.key_ptr);
@@ -1007,11 +1019,8 @@ const scan = struct {
             gop.value_ptr.* = .{ .already_seen = true, .already_scanned_for_deletion = false };
 
             const parent = ctx.parent_paths.getLast();
-            if (set_to_untracked) {
-                std.debug.panic("TODO handle untracked directory: {f}", .{path.formatUtf8()});
-            } else {
-                try addFile(ctx.local_fs, ctx.events, ctx.db_allocator, .directory, .tracked, path_copy, parent, meta);
-            }
+            const status: LocalFilesystem.Status = if (set_to_untracked) .untracked else .tracked;
+            try addNewFile(ctx.local_fs, ctx.events, ctx.db_allocator, .directory, status, path_copy, parent, meta);
         }
     }
 
@@ -1026,20 +1035,23 @@ const scan = struct {
                 const file_info = ctx.file_info.getPtr(child.*).?;
                 if (file_info.already_scanned_for_deletion) continue;
                 file_info.already_scanned_for_deletion = true;
-                const info = ctx.local_fs.files.get(child.*).?;
+                const info = ctx.local_fs.files.getEntry(child.*).?;
 
                 if (file_info.already_seen) {
-                    if (info.directory and stack_len < fairy.max_path_components) {
+                    if (info.value_ptr.directory and stack_len < fairy.max_path_components) {
                         stack[stack_len] = child.*;
                         stack_len += 1;
                     }
                 } else {
-                    switch (info.status) {
-                        .tracked => switch (info.directory) {
-                            false => try deleteTrackedRegularFile(ctx.local_fs, ctx.events, ctx.db_allocator, child.*),
-                            true => try deleteTrackedDirectoryFile(ctx.local_fs, ctx.events, ctx.db_allocator, child.*),
+                    switch (info.value_ptr.status) {
+                        .tracked => switch (info.value_ptr.directory) {
+                            false => try deleteTrackedRegularFile(ctx.local_fs, info, ctx.events, ctx.db_allocator),
+                            true => try deleteTrackedDirectoryFile(ctx.local_fs, info, ctx.events, ctx.db_allocator),
                         },
-                        .untracked => std.debug.panic("TODO delete an untracked file: {f}", .{child.formatUtf8()}),
+                        .untracked => switch (info.value_ptr.directory) {
+                            false => deleteRegularFile(ctx.local_fs, info),
+                            true => deleteDirectoryFile(ctx.local_fs, info, ctx.db_allocator),
+                        },
                     }
                 }
                 break;
@@ -1055,7 +1067,7 @@ const scan = struct {
 
     const FileKind = enum { regular, directory };
 
-    fn addFile(
+    fn addNewFile(
         local_fs: *LocalFilesystem,
         events: *Events,
         allocator: Allocator,
@@ -1085,7 +1097,7 @@ const scan = struct {
         errdefer comptime unreachable;
 
         const gop = local_fs.files.getOrPutAssumeCapacity(path);
-        if (gop.found_existing) std.debug.panic("TODO addFile file already exists", .{});
+        assert(!gop.found_existing);
         gop.value_ptr.* = .{
             .directory = switch (kind) {
                 .regular => false,
@@ -1109,34 +1121,32 @@ const scan = struct {
         }
     }
 
-    fn changeUntrackedRegularFileToNew(
+    fn changeUntrackedRegularFileToTracked(
         local_fs: *LocalFilesystem,
+        info: PathHashMap(LocalFilesystem.Info).Entry,
         events: *Events,
         allocator: Allocator,
-        path: Path,
         meta: LocalFilesystem.Metadata,
     ) !void {
-        const info = local_fs.files.getEntry(path).?;
-
         try events.ensureLocalEventCapacity(allocator);
         errdefer comptime unreachable;
 
+        assert(!info.value_ptr.directory);
         info.value_ptr.status = .tracked;
-        local_fs.meta.getPtr(path).?.* = meta;
+        local_fs.meta.getPtr(info.key_ptr.*).?.* = meta;
         events.queueLocalEventAssumeCapacity(.new_regular, info.key_ptr.*);
     }
 
     fn updateTrackedRegularFile(
         local_fs: *LocalFilesystem,
+        info: PathHashMap(LocalFilesystem.Info).Entry,
         global_fs: *GlobalFilesystem,
         events: *Events,
         allocator: Allocator,
-        path: Path,
         meta: LocalFilesystem.Metadata,
     ) !void {
-        const info = local_fs.files.getEntry(path).?;
         assert(!info.value_ptr.directory);
-        const meta_ptr = local_fs.meta.getPtr(path).?;
+        const meta_ptr = local_fs.meta.getPtr(info.key_ptr.*).?;
 
         if (meta_ptr.local_file_id == meta.local_file_id and
             meta_ptr.size == meta.size) return;
@@ -1145,66 +1155,121 @@ const scan = struct {
         errdefer comptime unreachable;
 
         meta_ptr.* = meta;
-        const file_id = global_fs.path_to_id.get(path).?;
+        const file_id = global_fs.path_to_id.get(info.key_ptr.*).?;
         events.queueSyncEventAssumeCapacity(file_id);
     }
 
-    fn updateTrackedDirectoryFile(
+    fn updateUntrackedRegularFile(
         local_fs: *LocalFilesystem,
-        path: Path,
+        info: PathHashMap(LocalFilesystem.Info).Entry,
         meta: LocalFilesystem.Metadata,
     ) void {
-        const info = local_fs.files.getPtr(path).?;
-        assert(info.directory);
-        local_fs.meta.getPtr(path).?.* = meta;
-        // TODO: Send an event?
+        assert(!info.value_ptr.directory);
+        local_fs.meta.getPtr(info.key_ptr.*).?.* = meta;
+    }
+
+    fn changeUntrackedDirectoryFileToTracked(
+        local_fs: *LocalFilesystem,
+        info: PathHashMap(LocalFilesystem.Info).Entry,
+        events: *Events,
+        allocator: Allocator,
+        meta: LocalFilesystem.Metadata,
+    ) !void {
+        try events.ensureLocalEventCapacity(allocator);
+        errdefer comptime unreachable;
+
+        assert(info.value_ptr.directory);
+        info.value_ptr.status = .tracked;
+        local_fs.meta.getPtr(info.key_ptr.*).?.* = meta;
+        events.queueLocalEventAssumeCapacity(.new_directory, info.key_ptr.*);
+    }
+
+    fn updateDirectoryFile(
+        local_fs: *LocalFilesystem,
+        info: PathHashMap(LocalFilesystem.Info).Entry,
+        meta: LocalFilesystem.Metadata,
+    ) void {
+        assert(info.value_ptr.directory);
+        local_fs.meta.getPtr(info.key_ptr.*).?.* = meta;
     }
 
     fn deleteTrackedRegularFile(
         local_fs: *LocalFilesystem,
+        info: PathHashMap(LocalFilesystem.Info).Entry,
         events: *Events,
         allocator: Allocator,
-        path: Path,
     ) !void {
         // TODO: Delete/cancel any sync events associated with this file
-
         try events.ensureLocalEventCapacity(allocator);
         errdefer comptime unreachable;
 
-        const info = local_fs.files.fetchRemove(path).?;
-        assert(!info.value.directory);
-        assert(local_fs.meta.remove(path));
-        const parent = local_fs.parent.fetchRemove(path).?.value;
+        events.queueLocalEventAssumeCapacity(.delete_regular, info.key_ptr.*);
+        deleteRegularFile(local_fs, info);
+    }
+
+    fn deleteRegularFile(
+        local_fs: *LocalFilesystem,
+        info: PathHashMap(LocalFilesystem.Info).Entry,
+    ) void {
+        assert(!info.value_ptr.directory);
+        assert(local_fs.meta.remove(info.key_ptr.*));
+        const parent = local_fs.parent.fetchRemove(info.key_ptr.*).?.value;
         const parent_children = if (parent) |p| local_fs.children.getPtr(p).? else &local_fs.top_level_children;
-        assert(parent_children.remove(path));
-        events.queueLocalEventAssumeCapacity(.delete_regular, info.key);
+        assert(parent_children.remove(info.key_ptr.*));
+        local_fs.files.removeByPtr(info.key_ptr);
     }
 
     fn deleteTrackedDirectoryFile(
         local_fs: *LocalFilesystem,
+        info: PathHashMap(LocalFilesystem.Info).Entry,
         events: *Events,
         allocator: Allocator,
-        path: Path,
     ) !void {
         // TODO: Delete/cancel any sync events associated with this directory and its children
         try events.ensureLocalEventCapacity(allocator);
         errdefer comptime unreachable;
 
+        events.queueLocalEventAssumeCapacity(.delete_directory, info.key_ptr.*);
+        deleteDirectoryFile(local_fs, info, allocator);
+    }
+
+    fn deleteDirectoryFile(
+        local_fs: *LocalFilesystem,
+        info: PathHashMap(LocalFilesystem.Info).Entry,
+        allocator: Allocator,
+    ) void {
+        assert(info.value_ptr.directory);
+
+        var children = local_fs.children.fetchRemove(info.key_ptr.*).?.value;
+        deleteDirectoryChildren(local_fs, allocator, &children);
+
+        const parent_children = if (local_fs.parent.fetchRemove(info.key_ptr.*).?.value) |parent|
+            local_fs.children.getPtr(parent).?
+        else
+            &local_fs.top_level_children;
+        assert(parent_children.remove(info.key_ptr.*));
+
+        assert(local_fs.meta.remove(info.key_ptr.*));
+        local_fs.files.removeByPtr(info.key_ptr);
+    }
+
+    fn deleteDirectoryChildren(
+        local_fs: *LocalFilesystem,
+        allocator: Allocator,
+        root_children: *PathHashMap(void),
+    ) void {
         const StackItem = struct {
-            path: Path,
             children: PathHashMap(void),
             child_iterator: PathHashMap(void).KeyIterator,
         };
         var stack: [fairy.max_path_components]StackItem = undefined;
         stack[0] = .{
-            .path = path,
-            .children = local_fs.children.fetchRemove(path).?.value,
-            .child_iterator = undefined,
+            .children = undefined,
+            .child_iterator = root_children.keyIterator(),
         };
-        stack[0].child_iterator = stack[0].children.keyIterator();
         var stack_len: fairy.PathComponentCount = 1;
 
-        while (stack_len > 0) {
+        while (true) {
             const stack_item = &stack[stack_len - 1];
             if (stack_item.child_iterator.next()) |child_path_ptr| {
                 const child_path = child_path_ptr.*;
@@ -1213,52 +1278,66 @@ const scan = struct {
                 assert(local_fs.meta.remove(child_path));
 
                 if (info.value.directory) {
-                    if (stack_len == fairy.max_path_components) unreachable; // TODO: unsound assumption; the directory could be empty
-                    stack[stack_len] = .{
-                        .path = child_path,
-                        .children = local_fs.children.fetchRemove(child_path).?.value,
-                        .child_iterator = undefined,
-                    };
-                    stack[stack_len].child_iterator = stack[stack_len].children.keyIterator();
-                    stack_len += 1;
+                    var children = local_fs.children.fetchRemove(child_path).?.value;
+                    if (stack_len != fairy.max_path_components) {
+                        stack[stack_len] = .{
+                            .children = children,
+                            .child_iterator = children.keyIterator(),
+                        };
+                        stack_len += 1;
+                    } else {
+                        if (children.count() > 0) {
+                            std.debug.panic("TODO: Guarantee that paths never have more than {} components", .{fairy.max_path_components});
+                        }
+                        children.deinit(allocator);
+                    }
                 }
             } else {
-                stack_item.children.deinit(allocator);
-                stack_item.* = undefined;
-                stack_len -= 1;
+                if (stack_len == 1) {
+                    root_children.clearAndFree(allocator);
+                    break;
+                } else {
+                    stack_item.children.deinit(allocator);
+                    stack_item.* = undefined;
+                    stack_len -= 1;
+                }
             }
         }
-
-        const info = local_fs.files.fetchRemove(path).?;
-        assert(info.value.directory);
-
-        const parent_children = if (local_fs.parent.fetchRemove(path).?.value) |parent|
-            local_fs.children.getPtr(parent).?
-        else
-            &local_fs.top_level_children;
-        assert(parent_children.remove(path));
-
-        assert(local_fs.meta.remove(path));
-
-        events.queueLocalEventAssumeCapacity(.delete_directory, info.key);
     }
 
     fn changeTrackedRegularFileToUntracked(
-        local_fs: *LocalFilesystem,
+        info: PathHashMap(LocalFilesystem.Info).Entry,
         events: *Events,
         allocator: Allocator,
-        path: Path,
     ) !void {
         // TODO: Delete/cancel any sync events associated with this file
 
         try events.ensureLocalEventCapacity(allocator);
         errdefer comptime unreachable;
 
-        const info = local_fs.files.getEntry(path).?;
         assert(!info.value_ptr.directory);
         info.value_ptr.status = .untracked;
-        local_fs.meta.getPtr(path).?.* = undefined;
         events.queueLocalEventAssumeCapacity(.delete_regular, info.key_ptr.*);
+    }
+
+    fn changeTrackedDirectoryFileToUntracked(
+        local_fs: *LocalFilesystem,
+        info: PathHashMap(LocalFilesystem.Info).Entry,
+        events: *Events,
+        allocator: Allocator,
+    ) !void {
+        // TODO: Delete/cancel any sync events associated with this directory and its children
+
+        try events.ensureLocalEventCapacity(allocator);
+        errdefer comptime unreachable;
+
+        assert(info.value_ptr.directory);
+        info.value_ptr.status = .untracked;
+
+        const children = local_fs.children.getPtr(info.key_ptr.*).?;
+        deleteDirectoryChildren(local_fs, allocator, children);
+
+        events.queueLocalEventAssumeCapacity(.delete_directory, info.key_ptr.*);
     }
 };
 
