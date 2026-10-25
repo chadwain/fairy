@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(test_app);
 
     const run_test_app = b.addRunArtifact(test_app);
-    if (b.args) |args| run_test_app.addArgs(args);
+    run_test_app.addPassthruArgs();
     const test_app_step = b.step("test-app", "Run a test app");
     test_app_step.dependOn(&run_test_app.step);
 }

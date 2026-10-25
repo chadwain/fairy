@@ -107,9 +107,10 @@ pub const Database = struct {
         while (true) {
             // Handle alerts
             const alert = db.alert.swap(0, .monotonic);
-            inline for (std.meta.fields(Alert)) |field| {
-                if ((alert & comptime (1 << field.value)) != 0) {
-                    switch (@field(Alert, field.name)) {
+            const type_info = @typeInfo(Alert).@"enum";
+            inline for (type_info.field_names, type_info.field_values) |name, value| {
+                if ((alert & comptime (1 << value)) != 0) {
+                    switch (@field(Alert, name)) {
                         .new_scan_deadline => {
                             next_scan_time_cached, _ = db.setNextAutoScanDeadline(next_scan_time_cached);
                         },
@@ -243,7 +244,7 @@ pub const Database = struct {
     }
 
     fn setAlert(db: *Database, comptime alert: Alert) void {
-        _ = db.alert.bitSet(comptime (1 << @intFromEnum(alert)), .monotonic);
+        _ = db.alert.bitSet(comptime (1 << @backingInt(alert)), .monotonic);
     }
 
     pub fn disableAutoScanning(db: *Database) void {
@@ -862,8 +863,7 @@ const scan = struct {
             .REPARSE_POINT = true,
             .ENCRYPTED = true,
         };
-        // TODO: Use @backingInt https://codeberg.org/ziglang/zig/issues/35602
-        const set_to_untracked = @as(w.ULONG, @bitCast(rejected)) & @as(w.ULONG, @bitCast(information.FileAttributes)) != 0;
+        const set_to_untracked = @backingInt(rejected) & @backingInt(information.FileAttributes) != 0;
 
         const allocator = ctx.scan_arena.allocator();
         const component_delimeter_index = ctx.current_path.items.len;
