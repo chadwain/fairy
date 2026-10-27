@@ -1,9 +1,18 @@
 pub const client = @import("client.zig");
+pub const linux = @import("linux.zig");
 pub const network = @import("network.zig");
 pub const server = @import("server.zig");
 pub const windows = @import("windows.zig");
 
 pub const log = @import("std").log.scoped(.fairy);
+
+pub const Platform = enum { windows, linux };
+
+pub const platform: Platform = switch (@import("builtin").target.os.tag) {
+    .windows => .windows,
+    .linux => .linux,
+    else => @compileError("Unsupported OS"),
+};
 
 pub const PathComponentCount = u8;
 /// The maximum number of components in a file/folder path that will be recognized.
@@ -24,5 +33,6 @@ comptime {
 
     if (@import("builtin").is_test) {
         _ = windows.Path;
+        _ = linux.Path;
     }
 }

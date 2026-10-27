@@ -7,11 +7,24 @@ const Io = std.Io;
 
 const fairy = @import("fairy.zig");
 const network = fairy.network;
-const Path = fairy.windows.Path;
-const PathHashMap = fairy.windows.PathHashMap;
+
+const Path = switch (fairy.platform) {
+    .windows => fairy.windows.Path,
+    .linux => fairy.linux.Path,
+};
+
+const PathHashMap = switch (fairy.platform) {
+    .windows => fairy.windows.PathHashMap,
+    .linux => fairy.linux.PathHashMap,
+};
+
+const DirHandle = switch (fairy.platform) {
+    .windows => w.HANDLE,
+    .linux => Io.Dir,
+};
 
 pub const Database = struct {
-    sync_dir: w.HANDLE,
+    sync_dir: DirHandle,
 
     mutex: Io.Mutex, // TODO: Compare with RwLock
     allocator: Allocator,
@@ -37,10 +50,7 @@ pub const Database = struct {
 
     pub const RegularFileEntry = struct {
         status: Status,
-        local_file_id: w.LARGE_INTEGER,
-        hash: network.FileHash,
-        modified_time: w.LARGE_INTEGER,
-        size: w.ULARGE_INTEGER,
+        // TODO: Store metadata about regular files
 
         pub const Status = enum { unsynced, synced };
     };
@@ -61,14 +71,15 @@ pub const Database = struct {
                 }
 
                 pub fn eql(_: @This(), a: Path, b: Path, _: usize) bool {
-                    return std.mem.eql(u16, a.slice, b.slice);
+                    return std.mem.eql(std.meta.Child(@FieldType(Path, "slice")), a.slice, b.slice);
                 }
             };
             break :blk std.array_hash_map.Custom(Path, network.FileId, Context, true);
         };
     };
 
-    pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
+    pub fn initWindows(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
+        comptime assert(fairy.platform == .windows);
         // TODO: The length of this path must also be factored into path length calculations.
         const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
         const sync_dir = try fairy.windows.openSyncDir(sync_dir_path_nt.span());
@@ -96,8 +107,54 @@ pub const Database = struct {
         };
     }
 
-    pub fn deinit(db: *Database) void {
+    pub fn deinitWindows(db: *Database) void {
+        comptime assert(fairy.platform == .windows);
         fairy.windows.closeHandle(db.sync_dir);
+
+        var path_arena = db.path_arena.promote(db.allocator);
+        path_arena.deinit();
+
+        var children_arena = db.children_arena.promote(db.allocator);
+        children_arena.deinit();
+
+        db.files.deinit(db.allocator);
+        db.regular_file_info.deinit(db.allocator);
+        db.directory_file_info.deinit(db.allocator);
+
+        db.* = undefined;
+    }
+
+    pub fn initLinux(sync_dir_path: [:0]const u8, io: Io, allocator: Allocator) !Database {
+        comptime assert(fairy.platform == .linux);
+        // TODO: The length of `sync_dir_path` must also be factored into path length calculations.
+        const sync_dir = try Io.Dir.cwd().openDir(io, sync_dir_path, .{ .iterate = true });
+        errdefer comptime unreachable;
+
+        return .{
+            .sync_dir = sync_dir,
+            .allocator = allocator,
+            .mutex = .init,
+
+            .path_arena = .{},
+            .children_arena = .{},
+            .next_file_id = 0,
+            .files = .empty,
+            .regular_file_info = .empty,
+            .directory_file_info = .empty,
+            .sync_dir_entry = .{
+                .children = .empty,
+                .children_by_component = .empty,
+            },
+
+            .host_state = .init(.{}),
+
+            .debug = .{},
+        };
+    }
+
+    pub fn deinitLinux(db: *Database, io: Io) void {
+        comptime assert(fairy.platform == .linux);
+        db.sync_dir.close(io);
 
         var path_arena = db.path_arena.promote(db.allocator);
         path_arena.deinit();
@@ -196,7 +253,7 @@ pub const Database = struct {
     fn nextFileIdAssumeAvailable(db: *Database) network.FileId {
         const next = db.next_file_id.?;
         db.next_file_id = std.math.add(std.meta.Tag(network.FileId), next, 1) catch null;
-        return @enumFromInt(next);
+        return @fromBackingInt(@intCast(next));
     }
 
     // Database must be locked.
@@ -209,10 +266,6 @@ pub const Database = struct {
         });
         db.regular_file_info.putAssumeCapacityNoClobber(file_id, .{
             .status = .unsynced,
-            .local_file_id = undefined,
-            .hash = undefined,
-            .modified_time = undefined,
-            .size = undefined,
         });
     }
 
@@ -251,7 +304,7 @@ pub const Database = struct {
     }
 
     /// Opens a regular file for writing to. Creates parent directories as necessary.
-    fn openRegularFile(db: *Database, io: Io, file_id: network.FileId, file_size: w.LARGE_INTEGER) !w.HANDLE {
+    fn openRegularFileWindows(db: *Database, io: Io, file_id: network.FileId, file_size: w.LARGE_INTEGER) !w.HANDLE {
         const full_path = blk: {
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
@@ -263,8 +316,8 @@ pub const Database = struct {
 
         var it = full_path.backwardsPathIterator();
         const last_component = it.previousComponent().?;
-        const top_level = it.empty();
-        var dir_handle = if (top_level) db.sync_dir else blk: {
+        var is_sync_dir = it.empty();
+        var dir_handle = if (is_sync_dir) db.sync_dir else blk: {
             while (it.previous()) |path| {
                 const handle = fairy.windows.createDir(db.sync_dir, path) catch |err| switch (err) {
                     error.ParentDirNotFound => continue,
@@ -273,6 +326,7 @@ pub const Database = struct {
                 break :blk handle;
             } else std.debug.panic("TODO: Could not create a file in the sync directory", .{});
         };
+        defer if (!is_sync_dir) fairy.windows.closeHandle(dir_handle);
         errdefer std.debug.panic("TODO: Delete intermediate directories and files", .{});
 
         it.setDirection(.forwards);
@@ -287,6 +341,7 @@ pub const Database = struct {
             errdefer comptime unreachable;
             fairy.windows.closeHandle(dir_handle);
             dir_handle = child_handle;
+            is_sync_dir = false;
         }
 
         const handle = fairy.windows.createFile(dir_handle, last_component, .{ .initial_size = file_size }) catch |err| switch (err) {
@@ -298,13 +353,38 @@ pub const Database = struct {
         return handle;
     }
 
+    /// Opens a regular file for writing to. Creates parent directories as necessary.
+    fn openRegularFileLinux(db: *Database, io: Io, file_id: network.FileId) !Io.File {
+        const full_path = blk: {
+            try db.mutex.lock(io);
+            defer db.mutex.unlock(io);
+
+            const info = db.files.getPtr(file_id) orelse return error.FileDoesNotExist;
+            if (info.directory) return error.IsDirectory;
+            break :blk info.path;
+        };
+
+        var it = full_path.backwardsPathIterator();
+        const last_component = it.previousComponent().?;
+        const top_level = it.empty();
+        const dir_handle = if (top_level)
+            db.sync_dir
+        else
+            try db.sync_dir.createDirPathOpen(
+                io,
+                it.previous().?.slice,
+                .{ .open_options = .{ .follow_symlinks = false } },
+            );
+        defer if (!top_level) dir_handle.close(io);
+        errdefer std.debug.panic("TODO: Delete intermediate directories and files", .{});
+
+        return try dir_handle.createFile(io, last_component.slice, .{});
+    }
+
     fn finishReceiveFileContents(
         db: *Database,
         io: Io,
-        handle: w.HANDLE,
         file_id: network.FileId,
-        hash: *const network.FileHash,
-        file_size: w.LARGE_INTEGER,
     ) !void {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
@@ -312,43 +392,8 @@ pub const Database = struct {
         const file_info = db.files.get(file_id) orelse std.debug.panic("TODO file not found", .{});
         if (file_info.directory) std.debug.panic("TODO directory", .{});
 
-        const basic_information = blk: {
-            var iosb: w.IO_STATUS_BLOCK = undefined;
-            var information: w.FILE.BASIC_INFORMATION = undefined;
-            const status = w.ntdll.NtQueryInformationFile(
-                handle,
-                &iosb,
-                &information,
-                @sizeOf(@TypeOf(information)),
-                .Basic,
-            );
-            switch (status) {
-                .SUCCESS => break :blk information,
-                else => return w.unexpectedStatus(status),
-            }
-        };
-        const internal_information = blk: {
-            var iosb: w.IO_STATUS_BLOCK = undefined;
-            var information: w.FILE.INTERNAL_INFORMATION = undefined;
-            const status = w.ntdll.NtQueryInformationFile(
-                handle,
-                &iosb,
-                &information,
-                @sizeOf(@TypeOf(information)),
-                .Internal,
-            );
-            switch (status) {
-                .SUCCESS => break :blk information,
-                else => return w.unexpectedStatus(status),
-            }
-        };
-
         db.regular_file_info.getPtr(file_id).?.* = .{
             .status = .synced,
-            .local_file_id = internal_information.IndexNumber,
-            .hash = hash.*,
-            .modified_time = basic_information.ChangeTime,
-            .size = @intCast(file_size),
         };
     }
 
@@ -359,18 +404,18 @@ pub const Database = struct {
     };
 
     fn deleteGlobalFile(db: *Database, file_id: network.FileId, io: Io) !DeleteGlobalFileResult {
-        try db.mutex.lock(io);
-        defer db.mutex.unlock(io);
+        const path = blk: {
+            try db.mutex.lock(io);
+            defer db.mutex.unlock(io);
 
-        const file_info = db.files.getEntry(file_id) orelse return .unknown_file;
-        if (file_info.value_ptr.directory) std.debug.panic("TODO delete folders", .{});
-        const regular_info = db.regular_file_info.getEntry(file_id).?;
-        switch (regular_info.value_ptr.status) {
-            .synced, .unsynced => {},
-        }
+            const file_info = db.files.getEntry(file_id) orelse return .unknown_file;
+            const path = file_info.value_ptr.path;
+            if (file_info.value_ptr.directory) std.debug.panic("TODO delete folders", .{});
+            const regular_info = db.regular_file_info.getEntry(file_id).?;
+            switch (regular_info.value_ptr.status) {
+                .synced, .unsynced => {},
+            }
 
-        // TODO maybe don't perform the delete right away, but just queue it
-        if (fairy.windows.deleteFile(db.sync_dir, file_info.value_ptr.path)) |_| {
             const parent_children = if (file_info.value_ptr.parent) |parent_file_id|
                 &db.directory_file_info.getPtr(parent_file_id).?.children
             else
@@ -378,15 +423,37 @@ pub const Database = struct {
             assert(parent_children.swapRemove(file_id));
             db.files.removeByPtr(file_info.key_ptr);
             db.regular_file_info.removeByPtr(regular_info.key_ptr);
-            return .success;
-        } else |_| {
-            // TODO: set the file entry to some errored state
-            // TODO: retry the deletion
-            return .delete_file_err;
+
+            break :blk path;
+        };
+
+        switch (fairy.platform) {
+            .windows => {
+
+                // TODO maybe don't perform the delete right away, but just queue it
+                if (fairy.windows.deleteFile(db.sync_dir, path)) |_| {
+                    return .success;
+                } else |_| {
+                    // TODO: set the file entry to some errored state
+                    // TODO: retry the deletion
+                    return .delete_file_err;
+                }
+            },
+            .linux => {
+                db.sync_dir.deleteFile(io, path.slice) catch |err| std.debug.panic("TODO: {s}", .{@errorName(err)});
+                return .success;
+            },
         }
     }
 
-    fn deleteGlobalDir(db: *Database, file_id: network.FileId, io: Io) (error{ UnknownFile, Unexpected } || Io.Cancelable)!void {
+    const DeleteGlobalDirError = error{UnknownFile} ||
+        Io.Cancelable ||
+        switch (fairy.platform) {
+            .windows => error{Unexpected},
+            .linux => Io.Dir.DeleteFileError || Io.Dir.DeleteDirError,
+        };
+
+    fn deleteGlobalDir(db: *Database, file_id: network.FileId, io: Io) DeleteGlobalDirError!void {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
@@ -428,7 +495,10 @@ pub const Database = struct {
                 continue;
             }
 
-            try fairy.windows.deleteFile(db.sync_dir, child_info.value_ptr.path);
+            switch (fairy.platform) {
+                .windows => try fairy.windows.deleteFile(db.sync_dir, child_info.value_ptr.path),
+                .linux => try db.sync_dir.deleteFile(io, child_info.value_ptr.path.slice),
+            }
 
             if (child_info.value_ptr.directory) {
                 item.state = .iterate;
@@ -441,7 +511,10 @@ pub const Database = struct {
             item.index += 1;
         }
 
-        try fairy.windows.deleteFile(db.sync_dir, root_info.value_ptr.path);
+        switch (fairy.platform) {
+            .windows => try fairy.windows.deleteFile(db.sync_dir, root_info.value_ptr.path),
+            .linux => try db.sync_dir.deleteDir(io, root_info.value_ptr.path.slice),
+        }
 
         const parent_children = if (root_info.value_ptr.parent) |parent_file_id|
             &db.directory_file_info.getPtr(parent_file_id).?.children
@@ -468,7 +541,7 @@ pub const Database = struct {
             while (it.next()) |entry| {
                 try writer.print(
                     "{}: {f}\n",
-                    .{ @intFromEnum(entry.key_ptr.*), entry.value_ptr.path.formatUtf8() },
+                    .{ @backingInt(entry.key_ptr.*), entry.value_ptr.path.formatUtf8() },
                 );
             }
         }
@@ -591,12 +664,16 @@ pub const Host = struct {
         network.Reader.ReceiveActionError ||
         network.Reader.ReceiveFileKindError ||
         network.Reader.ReceiveMessageHeaderError ||
-        network.Reader.ReceivePathEncodingError ||
-        network.Reader.ReceiveWindowsPathByteCountError ||
-        network.Reader.ReceiveWindowsPathError ||
         Io.Cancelable ||
         Allocator.Error ||
-        fairy.windows.ReceiveFileError;
+        switch (fairy.platform) {
+            .windows => fairy.windows.ReceiveFileError ||
+                network.Reader.ReceiveWindowsPathByteCountError ||
+                network.Reader.ReceiveWindowsPathError,
+            .linux => Io.Dir.CreateDirPathOpenError ||
+                Io.File.OpenError ||
+                Io.File.Writer.Error,
+        };
 
     fn receiveIncomingMessages(host: *Host, reader: network.Reader, io: Io) RecvError!void {
         while (true) {
@@ -732,11 +809,16 @@ pub const MessageThread = union(enum) {
             reader: network.Reader,
         ) !void {
             const kind = try reader.receiveFileKind();
-            const encoding = try reader.receivePathEncoding();
-            const path_byte_count = try reader.receiveWindowsPathByteCount();
+            const path_byte_count = switch (fairy.platform) {
+                .windows => try reader.receiveWindowsPathByteCount(),
+                .linux => try reader.receiveLinuxPathByteCount(),
+            };
 
             var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
-            const path = reader.receiveWindowsPath(path_byte_count, encoding, &file_path_buffer) catch |err| switch (err) {
+            const path = switch (fairy.platform) {
+                .windows => reader.receiveWindowsPath(path_byte_count, &file_path_buffer),
+                .linux => reader.receiveLinuxPath(path_byte_count, &file_path_buffer),
+            } catch |err| switch (err) {
                 error.InvalidPath => {
                     const data: MessageThread = .{
                         .in_new_file = .{
@@ -811,28 +893,42 @@ pub const MessageThread = union(enum) {
             reader: network.Reader,
         ) !void {
             const file_id = try reader.receiveFileId();
-            const file_size = blk: {
-                const network_size = try reader.receiveFileSize();
-                const windows_size = std.math.cast(w.LARGE_INTEGER, network_size) orelse return error.InvalidFileSize;
-                break :blk windows_size;
-            };
 
             // TODO: Open a temporary file instead
-            const handle = host.db.openRegularFile(io, file_id, file_size) catch |err| switch (err) {
-                error.FileDoesNotExist, error.IsDirectory => std.debug.panic("TODO: Client out of sync", .{}),
-                error.Unexpected, error.Canceled => |e| return e,
-            };
-            defer fairy.windows.closeHandle(handle);
-
-            try fairy.windows.receiveFile(reader.io, handle, file_size);
+            switch (fairy.platform) {
+                .windows => {
+                    const file_size = blk: {
+                        const file_size = try reader.receiveFileSize();
+                        const windows_size = std.math.cast(w.LARGE_INTEGER, file_size) orelse return error.InvalidFileSize;
+                        break :blk windows_size;
+                    };
+                    const handle = host.db.openRegularFileWindows(io, file_id, file_size) catch |err| switch (err) {
+                        error.FileDoesNotExist, error.IsDirectory => std.debug.panic("TODO: Client out of sync", .{}),
+                        error.Unexpected, error.Canceled => |e| return e,
+                    };
+                    defer fairy.windows.closeHandle(handle);
+                    try fairy.windows.receiveFile(reader.io, handle, file_size);
+                },
+                .linux => {
+                    const file_size = try reader.receiveFileSize();
+                    const file = host.db.openRegularFileLinux(io, file_id) catch |err| switch (err) {
+                        error.FileDoesNotExist, error.IsDirectory => std.debug.panic("TODO: Client out of sync", .{}),
+                        error.Canceled => |e| return e,
+                        else => |e| return e,
+                    };
+                    defer file.close(io);
+                    var file_write_buffer: [512]u8 = undefined;
+                    var file_writer = file.writer(io, &file_write_buffer);
+                    reader.io.streamExact(&file_writer.interface, file_size) catch |err| switch (err) {
+                        error.WriteFailed => return file_writer.err.?,
+                        error.ReadFailed, error.EndOfStream => |e| return e,
+                    };
+                    file_writer.interface.flush() catch return file_writer.err.?;
+                },
+            }
             const file_hash = try reader.receiveFileHash();
-            try host.db.finishReceiveFileContents(
-                io,
-                handle,
-                file_id,
-                &file_hash, // TODO: verify the hash
-                file_size,
-            );
+            _ = file_hash; // TODO
+            try host.db.finishReceiveFileContents(io, file_id);
 
             const data: MessageThread = .{
                 .in_file_contents = .{
@@ -903,8 +999,9 @@ pub const MessageThread = union(enum) {
         ) !void {
             const file_id = try reader.receiveFileId();
             host.db.deleteGlobalDir(file_id, io) catch |err| switch (err) {
-                error.UnknownFile, error.Unexpected => std.debug.panic("TODO", .{}),
+                error.UnknownFile => std.debug.panic("TODO: Client out of sync", .{}),
                 error.Canceled => |e| return e,
+                else => |e| std.debug.panic("TODO: {s}", .{@errorName(e)}),
             };
 
             const data: MessageThread = .{

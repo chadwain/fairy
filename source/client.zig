@@ -694,10 +694,10 @@ const scan = struct {
         /// A stack of Database-owned directory paths.
         /// The first element is always `null`.
         parent_paths: std.ArrayList(?Path),
-        /// Info about each file that is relevant for scanning.
-        file_info: FileInfo,
+        /// The status of each file during scanning.
+        file_scan_status: FileScanStatus,
 
-        const FileInfo = PathHashMap(struct {
+        const FileScanStatus = PathHashMap(struct {
             /// Becomes true when the file is seen while scanning.
             already_seen: bool,
             /// Only used in the second phase of scanning, where unseen files are marked as deleted.
@@ -709,11 +709,11 @@ const scan = struct {
             scan_arena: *std.heap.ArenaAllocator,
             path_arena: *std.heap.ArenaAllocator,
         ) !Context {
-            var file_info: Context.FileInfo = .empty;
-            try file_info.ensureTotalCapacity(scan_arena.allocator(), locked.db.local_fs.files.count());
+            var file_scan_status: Context.FileScanStatus = .empty;
+            try file_scan_status.ensureTotalCapacity(scan_arena.allocator(), locked.db.local_fs.files.count());
             var it = locked.db.local_fs.files.iterator();
             while (it.next()) |entry| {
-                file_info.putAssumeCapacityNoClobber(entry.key_ptr.*, .{
+                file_scan_status.putAssumeCapacityNoClobber(entry.key_ptr.*, .{
                     .already_seen = false,
                     .already_scanned_for_deletion = false,
                 });
@@ -738,7 +738,7 @@ const scan = struct {
                 .component_delimeters = .empty,
                 .open_dir_handles = open_dir_handles,
                 .parent_paths = parent_paths,
-                .file_info = file_info,
+                .file_scan_status = file_scan_status,
             };
         }
 
@@ -932,9 +932,12 @@ const scan = struct {
             .size = size,
         };
 
-        const gop = try ctx.file_info.getOrPut(ctx.scan_arena.allocator(), path);
+        const gop = try ctx.file_scan_status.getOrPut(ctx.scan_arena.allocator(), path);
         if (gop.found_existing) {
-            if (gop.value_ptr.already_seen) return;
+            if (gop.value_ptr.already_seen) {
+                // NOTE: Somehow saw the same file twice, let's just ignore it
+                return;
+            }
             gop.value_ptr.already_seen = true;
 
             const info = ctx.local_fs.files.getEntry(path).?;
@@ -957,7 +960,7 @@ const scan = struct {
                 },
             }
         } else {
-            errdefer ctx.file_info.removeByPtr(gop.key_ptr);
+            errdefer ctx.file_scan_status.removeByPtr(gop.key_ptr);
 
             const path_allocator = ctx.path_arena.allocator();
             const path_copy = try path.dupe(path_allocator);
@@ -984,9 +987,12 @@ const scan = struct {
             .size = 0,
         };
 
-        const gop = try ctx.file_info.getOrPut(ctx.scan_arena.allocator(), path);
+        const gop = try ctx.file_scan_status.getOrPut(ctx.scan_arena.allocator(), path);
         if (gop.found_existing) {
-            if (gop.value_ptr.already_seen) return;
+            if (gop.value_ptr.already_seen) {
+                // NOTE: Somehow saw the same file twice, let's just ignore it
+                return;
+            }
             gop.value_ptr.already_seen = true;
 
             const info = ctx.local_fs.files.getEntry(path).?;
@@ -1009,7 +1015,7 @@ const scan = struct {
                 },
             }
         } else {
-            errdefer ctx.file_info.removeByPtr(gop.key_ptr);
+            errdefer ctx.file_scan_status.removeByPtr(gop.key_ptr);
 
             const path_allocator = ctx.path_arena.allocator();
             const path_copy = try path.dupe(path_allocator);
@@ -1032,7 +1038,7 @@ const scan = struct {
             var it = children.keyIterator();
             // TODO: O(N^2) loop
             while (it.next()) |child| {
-                const file_info = ctx.file_info.getPtr(child.*).?;
+                const file_info = ctx.file_scan_status.getPtr(child.*).?;
                 if (file_info.already_scanned_for_deletion) continue;
                 file_info.already_scanned_for_deletion = true;
                 const info = ctx.local_fs.files.getEntry(child.*).?;
@@ -1700,9 +1706,23 @@ pub const MessageThread = union(enum) {
             try writer.sendMessageHeader(.new_thread);
             try writer.sendAction(action);
             try writer.sendFileKind(out_new_file.kind);
-            try writer.sendPathEncoding(.wtf16le);
-            try writer.sendWindowsPathByteCount(out_new_file.path.byteCount());
-            try writer.sendWindowsPath(out_new_file.path);
+            const server_platform: fairy.Platform = .linux; // TODO: hardcoded value
+            switch (server_platform) {
+                .windows => {
+                    try writer.sendWindowsPathByteCount(out_new_file.path.byteCount());
+                    try writer.sendWindowsPath(out_new_file.path);
+                },
+                .linux => {
+                    // TODO: Make a proper path conversion function
+                    var buffer: [fairy.linux.Path.max_len]u8 = undefined;
+                    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+                    const wtf8 = std.unicode.wtf16LeToWtf8Alloc(fba.allocator(), out_new_file.path.slice) catch std.debug.panic("TODO: OOM", .{});
+                    std.mem.replaceScalar(u8, wtf8, '\\', '/');
+                    const path = fairy.linux.Path.assumeValidPath(wtf8);
+                    try writer.sendLinuxPathByteCount(path.byteCount());
+                    try writer.sendLinuxPath(path);
+                },
+            }
             try writer.flush();
 
             host.flipMessageThreadOwner(.transmitting, io);

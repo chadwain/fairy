@@ -22,6 +22,8 @@ const cpu_endian = @import("builtin").cpu.arch.endian();
 /// - No component may be longer than `Path.component_max_len` code units long.
 /// - No component may end with a '.', or ' ' codepoint. (Thus '.' and '..' are not valid components.)
 /// - No component may be the same as a legacy DOS device name. (NUL, COM1, AUX, etc.)
+
+// TODO: Reject invalid characters `/\:*"?<>|` and non-printable characters (0-31)
 pub const Path = struct {
     slice: []const u16,
 

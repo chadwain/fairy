@@ -57,17 +57,13 @@ pub const FileId = enum(u32) {
     _,
 
     pub fn format(file_id: FileId, writer: *Io.Writer) Io.Writer.Error!void {
-        try writer.print("FileId({d})", .{@intFromEnum(file_id)});
+        try writer.print("FileId({d})", .{@backingInt(file_id)});
     }
 };
 
 pub const FileSize = u64;
 
 pub const FileKind = enum(u8) { regular, directory };
-
-pub const PathEncoding = enum(u8) {
-    wtf16le,
-};
 
 pub const PathByteCount = u16;
 
@@ -103,7 +99,7 @@ pub const Writer = struct {
     }
 
     fn writeEnum(writer: Writer, comptime Enum: type, value: Enum) !void {
-        try writer.io.writeInt(@typeInfo(Enum).@"enum".tag_type, @intFromEnum(value), endian);
+        try writer.io.writeInt(@typeInfo(Enum).@"enum".tag_type, @backingInt(value), endian);
     }
 
     pub fn sendMessageHeader(writer: Writer, header: MessageHeader) !void {
@@ -122,12 +118,12 @@ pub const Writer = struct {
         try writer.writeEnum(FileKind, kind);
     }
 
-    pub fn sendPathEncoding(writer: Writer, encoding: PathEncoding) Io.Writer.Error!void {
-        try writer.writeEnum(PathEncoding, encoding);
-    }
-
     pub fn sendWindowsPathByteCount(writer: Writer, byte_count: PathByteCount) Io.Writer.Error!void {
         assert(byte_count % 2 == 0);
+        try writer.io.writeInt(PathByteCount, byte_count, endian);
+    }
+
+    pub fn sendLinuxPathByteCount(writer: Writer, byte_count: PathByteCount) Io.Writer.Error!void {
         try writer.io.writeInt(PathByteCount, byte_count, endian);
     }
 
@@ -141,6 +137,10 @@ pub const Writer = struct {
 
     pub fn sendWindowsPath(writer: Writer, path: fairy.windows.Path) Io.Writer.Error!void {
         try writer.io.writeAll(@ptrCast(path.slice));
+    }
+
+    pub fn sendLinuxPath(writer: Writer, path: fairy.linux.Path) Io.Writer.Error!void {
+        try writer.io.writeAll(path.slice);
     }
 
     pub fn sendResolvePathResponse(writer: Writer, response: ResolvePathResponse) Io.Writer.Error!void {
@@ -189,18 +189,18 @@ pub const Reader = struct {
         return try reader.readEnum(FileKind) orelse error.UnknownFileKind;
     }
 
-    pub const ReceivePathEncodingError = error{UnknownPathEncoding} || Io.Reader.Error;
-
-    pub fn receivePathEncoding(reader: Reader) ReceivePathEncodingError!PathEncoding {
-        return try reader.readEnum(PathEncoding) orelse error.UnknownPathEncoding;
-    }
-
     pub const ReceiveWindowsPathByteCountError = error{InvalidWindowsPathByteCount} || Io.Reader.Error;
 
     pub fn receiveWindowsPathByteCount(reader: Reader) ReceiveWindowsPathByteCountError!PathByteCount {
         const int = try reader.io.takeInt(PathByteCount, endian);
         if (int % 2 == 1) return error.InvalidWindowsPathByteCount;
         return int;
+    }
+
+    pub const ReceiveLinuxPathByteCountError = Io.Reader.Error;
+
+    pub fn receiveLinuxPathByteCount(reader: Reader) ReceiveLinuxPathByteCountError!PathByteCount {
+        return try reader.io.takeInt(PathByteCount, endian);
     }
 
     pub fn receiveFileSize(reader: Reader) Io.Reader.Error!FileSize {
@@ -217,14 +217,9 @@ pub const Reader = struct {
     pub fn receiveWindowsPath(
         reader: Reader,
         byte_count: PathByteCount,
-        encoding: PathEncoding,
         buffer: *align(2) FilePathBuffer,
     ) ReceiveWindowsPathError!fairy.windows.Path {
         assert(byte_count % 2 == 0);
-        switch (encoding) {
-            .wtf16le => {},
-        }
-
         var file_path_writer: Io.Writer = .fixed(buffer);
         reader.io.streamExact(&file_path_writer, byte_count) catch |err| switch (err) {
             error.WriteFailed => unreachable,
@@ -232,6 +227,22 @@ pub const Reader = struct {
         };
         const path = buffer[0..byte_count];
         return try .fromSlice(@ptrCast(path));
+    }
+
+    pub const ReceiveLinuxPathError = error{InvalidPath} || Io.Reader.Error;
+
+    pub fn receiveLinuxPath(
+        reader: Reader,
+        byte_count: PathByteCount,
+        buffer: *FilePathBuffer,
+    ) ReceiveLinuxPathError!fairy.linux.Path {
+        var file_path_writer: Io.Writer = .fixed(buffer);
+        reader.io.streamExact(&file_path_writer, byte_count) catch |err| switch (err) {
+            error.WriteFailed => unreachable,
+            error.ReadFailed, error.EndOfStream => |e| return e,
+        };
+        const path = buffer[0..byte_count];
+        return try .fromSlice(path);
     }
 
     pub const ReceiveResolvePathResponseError = error{UnknownResolvePathResponse} || Io.Reader.Error;
