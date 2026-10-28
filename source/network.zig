@@ -39,6 +39,13 @@ pub const Action = enum(u8) {
     delete_dir_confirm,
 };
 
+pub const Platform = enum(u8) {
+    windows,
+    linux,
+};
+
+pub const ack: u32 = 0xF0F0F0F0;
+
 pub const FileHash = struct {
     blake3: [byte_size]u8,
 
@@ -106,6 +113,14 @@ pub const Writer = struct {
         try writer.writeEnum(MessageHeader, header);
     }
 
+    pub fn sendAck(writer: Writer) !void {
+        try writer.io.writeInt(@TypeOf(ack), ack, endian);
+    }
+
+    pub fn sendPlatform(writer: Writer, platform: Platform) Io.Writer.Error!void {
+        try writer.writeEnum(Platform, platform);
+    }
+
     pub fn sendAction(writer: Writer, action: Action) !void {
         try writer.writeEnum(Action, action);
     }
@@ -170,6 +185,19 @@ pub const Reader = struct {
 
     pub fn receiveMessageHeader(reader: Reader) ReceiveMessageHeaderError!MessageHeader {
         return try reader.readEnum(MessageHeader) orelse error.UnknownMessageHeader;
+    }
+
+    pub const ReceiveAckError = error{InvalidAck} || Io.Reader.Error;
+
+    pub fn receiveAck(reader: Reader) ReceiveAckError!void {
+        const int = try reader.io.takeInt(@TypeOf(ack), endian);
+        if (int != ack) return error.InvalidAck;
+    }
+
+    pub const ReceivePlatformError = error{UnknownPlatform} || Io.Reader.Error;
+
+    pub fn receivePlatform(reader: Reader) ReceivePlatformError!Platform {
+        return try reader.readEnum(Platform) orelse error.UnknownPlatform;
     }
 
     pub const ReceiveActionError = error{UnknownAction} || Io.Reader.Error;

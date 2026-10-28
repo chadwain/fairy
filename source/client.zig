@@ -1384,6 +1384,8 @@ fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash
 }
 
 pub const Host = struct {
+    setup: std.atomic.Value(Setup),
+    server_platform: fairy.Platform,
     mt: MessageThread,
     mt_status: std.atomic.Value(MtStatus),
     // TODO: Don't store this here, instead make it an argument to `run`
@@ -1415,6 +1417,8 @@ pub const Host = struct {
 
     pub fn init(db: *Database, debug: Debug) Host {
         return .{
+            .setup = .init(.recv_server_platform),
+            .server_platform = undefined,
             .mt = undefined,
             .mt_status = .init(.unlocked),
             .db = db,
@@ -1425,6 +1429,12 @@ pub const Host = struct {
     pub fn deinit(host: *Host) void {
         host.* = undefined;
     }
+
+    pub const Setup = enum(u32) {
+        recv_server_platform,
+        send_ack,
+        end,
+    };
 
     pub const RunError = Io.ConcurrentError || Io.Cancelable;
 
@@ -1472,8 +1482,22 @@ pub const Host = struct {
 
     fn sendMessages(host: *Host, writer: network.Writer, io: Io) SendMessagesError!void {
         host.log(.debug, "sending on thread {}", .{std.os.windows.GetCurrentThreadId()});
-        // TODO: Send an initial message containing protocol version, etc.
-        // TODO: Send a nonce value with each message thread
+
+        {
+            while (true) : (try io.futexWait(Setup, &host.setup.raw, .recv_server_platform)) {
+                switch (host.setup.load(.acquire)) {
+                    .recv_server_platform => continue,
+                    .send_ack => break,
+                    .end => unreachable,
+                }
+            }
+
+            try writer.sendAck();
+            try writer.flush();
+            host.setup.store(.end, .release);
+            io.futexWake(Setup, &host.setup.raw, 1);
+        }
+
         while (true) {
             while (true) : (try io.futexWait(SendEvent, &host.db.host_send_event.raw, .none)) {
                 // First, check if we own the current message thread.
@@ -1568,6 +1592,7 @@ pub const Host = struct {
         InvalidHeader,
         UnexpectedIncomingMessage,
     } ||
+        network.Reader.ReceivePlatformError ||
         network.Reader.ReceiveActionError ||
         network.Reader.ReceiveCreateDirResponseError ||
         network.Reader.ReceiveMessageHeaderError ||
@@ -1578,6 +1603,27 @@ pub const Host = struct {
 
     fn receiveMessages(host: *Host, reader: network.Reader, io: Io) ReceiveMessagesError!void {
         host.log(.debug, "receiving on thread {}", .{std.os.windows.GetCurrentThreadId()});
+
+        {
+            const platform = try reader.receivePlatform();
+            host.server_platform = switch (platform) {
+                .windows => .windows,
+                .linux => .linux,
+            };
+            host.setup.store(.send_ack, .release);
+            io.futexWake(Setup, &host.setup.raw, 1);
+
+            host.log(.debug, "server platform: {s}", .{@tagName(host.server_platform)});
+
+            while (true) : (try io.futexWait(Setup, &host.setup.raw, .send_ack)) {
+                switch (host.setup.load(.acquire)) {
+                    .recv_server_platform => unreachable,
+                    .send_ack => continue,
+                    .end => break,
+                }
+            }
+        }
+
         while (true) {
             const header = try reader.receiveMessageHeader();
             if (header == .disconnect) break;
@@ -1706,8 +1752,7 @@ pub const MessageThread = union(enum) {
             try writer.sendMessageHeader(.new_thread);
             try writer.sendAction(action);
             try writer.sendFileKind(out_new_file.kind);
-            const server_platform: fairy.Platform = .linux; // TODO: hardcoded value
-            switch (server_platform) {
+            switch (host.server_platform) {
                 .windows => {
                     try writer.sendWindowsPathByteCount(out_new_file.path.byteCount());
                     try writer.sendWindowsPath(out_new_file.path);

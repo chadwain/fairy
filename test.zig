@@ -81,10 +81,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var cdb_run_task = try io.concurrent(fairy.client.Database.run, .{ &cdb, io });
             defer cdb_run_task.cancel(io) catch {};
 
-            const stream = try addr.connect(io, .{ .mode = .stream });
-            defer stream.close(io);
-
-            var host_task = try io.concurrent(startHost, .{ io, &cdb, stream });
+            var host_task = try io.concurrent(startClientHost, .{ io, &cdb, addr });
             defer host_task.cancel(io) catch {};
 
             try runClientCli(io, &cdb);
@@ -102,17 +99,17 @@ fn runClientCli(io: Io, cdb: *Database) !void {
 
     const Command = enum {
         quit,
-        client_print_files,
-        client_print_local_events,
-        client_scan,
+        print_files,
+        print_local_events,
+        scan,
         toggle_auto_scanning,
         help,
     };
     const commands = std.StaticStringMap(Command).initComptime(.{
         .{ "q", Command.quit },
-        .{ "a", Command.client_print_files },
-        .{ "e", Command.client_print_local_events },
-        .{ "s", Command.client_scan },
+        .{ "a", Command.print_files },
+        .{ "e", Command.print_local_events },
+        .{ "s", Command.scan },
         .{ "t", Command.toggle_auto_scanning },
         .{ "?", Command.help },
     });
@@ -139,19 +136,19 @@ fn runClientCli(io: Io, cdb: *Database) !void {
 
         switch (commands.get(line) orelse continue) {
             .quit => break,
-            .client_print_files => {
+            .print_files => {
                 const locked = try cdb.lock(io);
                 defer locked.unlock(io);
                 try locked.debug.printFileEntries(stdout);
                 try stdout.flush();
             },
-            .client_print_local_events => {
+            .print_local_events => {
                 const locked = try cdb.lock(io);
                 defer locked.unlock(io);
                 try locked.debug.printLocalEvents(stdout);
                 try stdout.flush();
             },
-            .client_scan => {
+            .scan => {
                 const locked = try cdb.lock(io);
                 defer locked.unlock(io);
                 try locked.manualScan(io);
@@ -182,12 +179,12 @@ fn runServerCli(io: Io, sdb: *Database) !void {
 
     const Command = enum {
         quit,
-        server_print_files_folders,
+        print_files_folders,
         help,
     };
     const commands = std.StaticStringMap(Command).initComptime(.{
         .{ "q", Command.quit },
-        .{ "sa", Command.server_print_files_folders },
+        .{ "a", Command.print_files_folders },
         .{ "?", Command.help },
     });
 
@@ -212,7 +209,7 @@ fn runServerCli(io: Io, sdb: *Database) !void {
 
         switch (commands.get(line) orelse continue) {
             .quit => break,
-            .server_print_files_folders => {
+            .print_files_folders => {
                 try sdb.debug.printFileEntries(stdout, io);
                 try stdout.flush();
             },
@@ -243,6 +240,13 @@ const Args = struct {
 };
 
 const buffer_size = @max(fairy.network.min_reader_writer_buffer_size, 128);
+
+fn startClientHost(io: Io, db: *Database, addr: Io.net.IpAddress) !void {
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    try startHost(io, db, stream);
+}
 
 fn startHost(io: Io, db: *Database, stream: Io.net.Stream) !void {
     var read_buffer: [buffer_size]u8 = undefined;
