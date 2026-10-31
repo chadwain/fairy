@@ -7,10 +7,6 @@ const Io = std.Io;
 const fairy = @import("fairy");
 const build_options = @import("build-options");
 const host_type = build_options.host_type;
-const Database = switch (host_type) {
-    .server => fairy.server.Database,
-    .client => fairy.client.Database,
-};
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var debug_allocator = std.heap.DebugAllocator(.{}).init;
@@ -49,13 +45,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             while (net_server.accept(io)) |stream| {
                 defer stream.close(io);
 
-                var sdb = switch (fairy.platform) {
-                    .windows => try fairy.server.Database.initWindows(sync_dir, allocator),
-                    .linux => try fairy.server.Database.initLinux(sync_dir, io, allocator),
+                var fairy_server = switch (fairy.platform) {
+                    .windows => try fairy.Server.initWindows(sync_dir, allocator),
+                    .linux => try fairy.Server.initLinux(sync_dir, io, allocator),
                 };
                 defer switch (fairy.platform) {
-                    .windows => sdb.deinitWindows(),
-                    .linux => sdb.deinitLinux(io),
+                    .windows => fairy_server.deinitWindows(),
+                    .linux => fairy_server.deinitLinux(io),
                 };
 
                 const U = union(enum) {
@@ -66,8 +62,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 var select = Io.Select(U).init(io, &buffer);
                 defer select.cancelDiscard();
 
-                try select.concurrent(.host, startHost, .{ io, &sdb, stream });
-                try select.concurrent(.cli, runServerCli, .{ io, &sdb });
+                try select.concurrent(.host, startHost, .{ io, &fairy_server, stream });
+                try select.concurrent(.cli, runServerCli, .{ io, &fairy_server });
                 switch (try select.await()) {
                     .cli => |val| return try val,
                     .host => continue,
@@ -89,7 +85,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
-fn runClientCli(io: Io, cdb: *Database) !void {
+fn runClientCli(io: Io, cdb: *fairy.client.Database) !void {
     var stdin_buffer: [64]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
     const reader = &stdin.interface;
@@ -169,7 +165,7 @@ fn runClientCli(io: Io, cdb: *Database) !void {
     }
 }
 
-fn runServerCli(io: Io, sdb: *Database) !void {
+fn runServerCli(io: Io, server: *fairy.Server) !void {
     var stdin_buffer: [64]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
     const reader = &stdin.interface;
@@ -210,7 +206,7 @@ fn runServerCli(io: Io, sdb: *Database) !void {
         switch (commands.get(line) orelse continue) {
             .quit => break,
             .print_files_folders => {
-                try sdb.debug.printFileEntries(stdout, io);
+                try server.debug.printFileEntries(stdout, io);
                 try stdout.flush();
             },
             .help => print("{s}", .{help}),
@@ -241,14 +237,21 @@ const Args = struct {
 
 const buffer_size = @max(fairy.network.min_reader_writer_buffer_size, 128);
 
-fn startClientHost(io: Io, db: *Database, addr: Io.net.IpAddress) !void {
+fn startClientHost(io: Io, db: *fairy.client.Database, addr: Io.net.IpAddress) !void {
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
     try startHost(io, db, stream);
 }
 
-fn startHost(io: Io, db: *Database, stream: Io.net.Stream) !void {
+fn startHost(
+    io: Io,
+    db: switch (host_type) {
+        .server => *fairy.Server,
+        .client => *fairy.client.Database,
+    },
+    stream: Io.net.Stream,
+) !void {
     var read_buffer: [buffer_size]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
     var write_buffer: [buffer_size]u8 = undefined;
@@ -256,7 +259,7 @@ fn startHost(io: Io, db: *Database, stream: Io.net.Stream) !void {
 
     const name = @tagName(host_type);
     const Host = switch (host_type) {
-        .server => fairy.server.Host,
+        .server => fairy.Server.Host,
         .client => fairy.client.Host,
     };
     var host = Host.init(db, .{ .name = name });
