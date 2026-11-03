@@ -182,6 +182,46 @@ pub const Database = struct {
     }
 };
 
+const Diagnostics = union {
+    client: Client,
+    global: Global,
+    internal: Internal,
+
+    const Client = error{
+        UnknownFileId,
+        NotRegularFile,
+        NotDirectoryFile,
+        FileAlreadyExists,
+    };
+
+    const Global = error{
+        ExhaustedRevisionIds,
+        ExhaustedFileIds,
+    };
+
+    const Internal = Allocator.Error ||
+        switch (fairy.platform) {
+            .windows => error{Unexpected},
+            .linux => Io.Dir.DeleteFileError ||
+                Io.Dir.DeleteDirError,
+        };
+
+    fn errClient(diag: *Diagnostics, value: Client) error{Client} {
+        diag.* = .{ .client = value };
+        return error.Client;
+    }
+
+    fn errGlobal(diag: *Diagnostics, value: Global) error{Global} {
+        diag.* = .{ .global = value };
+        return error.Global;
+    }
+
+    fn errInternal(diag: *Diagnostics, value: Internal) error{Internal} {
+        diag.* = .{ .internal = value };
+        return error.Internal;
+    }
+};
+
 /// Opens a regular file for writing to. Creates parent directories as necessary.
 fn openRegularFileWindows(server: *Server, full_path: Path, file_size: w.LARGE_INTEGER) !w.HANDLE {
     var it = full_path.backwardsPathIterator();
@@ -270,9 +310,11 @@ const Locked = struct {
         locked.server.mutex.unlock(io);
     }
 
-    fn ensureUnusedRevision(locked: Locked) (error{ExhaustedRevisionIds} || Allocator.Error)!void {
-        if (locked.server.db.revisions.items.len == std.math.maxInt(std.meta.Tag(network.RevisionId))) return error.ExhaustedRevisionIds;
-        try locked.server.db.revisions.ensureUnusedCapacity(locked.server.allocator, 1);
+    fn ensureUnusedRevision(locked: Locked, diag: *Diagnostics) error{ Global, Internal }!void {
+        if (locked.server.db.revisions.items.len == std.math.maxInt(std.meta.Tag(network.RevisionId))) {
+            return diag.errGlobal(error.ExhaustedRevisionIds);
+        }
+        locked.server.db.revisions.ensureUnusedCapacity(locked.server.allocator, 1) catch |err| return diag.errInternal(err);
     }
 
     fn createRevisionAssumeAvailable(locked: Locked) network.RevisionId {
@@ -282,7 +324,12 @@ const Locked = struct {
         return @fromBackingInt(int);
     }
 
-    fn newFile(locked: Locked, path_unowned: Path, kind: network.FileKind) !network.FileId {
+    fn newFile(
+        locked: Locked,
+        path_unowned: Path,
+        kind: network.FileKind,
+        diag: *Diagnostics,
+    ) error{ Client, Global, Internal }!network.FileId {
         const s = locked.server;
 
         var it = path_unowned.pathIterator();
@@ -299,12 +346,12 @@ const Locked = struct {
                 };
                 const file_info = s.db.files.get(file_id).?;
                 if (it.nextComponent()) |next| {
-                    if (!file_info.directory) return error.ClientOutOfSync;
+                    if (!file_info.directory) return diag.errClient(error.NotDirectoryFile);
                     component = next;
                     parent_dir_entry = s.db.directory_file_info.getPtr(file_id).?;
                     parent_file_id = file_id;
                 } else {
-                    return error.ClientOutOfSync;
+                    return diag.errClient(error.FileAlreadyExists);
                 }
             }
         }
@@ -312,7 +359,7 @@ const Locked = struct {
         var path_arena = s.path_arena.promote(s.allocator);
         defer s.path_arena = path_arena.state;
         const path_allocator = path_arena.allocator();
-        const path = try path_unowned.dupe(path_allocator);
+        const path = path_unowned.dupe(path_allocator) catch |err| return diag.errInternal(err);
         errdefer path_allocator.free(path.slice);
 
         var children_arena = s.children_arena.promote(s.allocator);
@@ -325,12 +372,12 @@ const Locked = struct {
             .directory => true,
             .regular => false,
         };
-        try locked.ensureUnusedRevision();
-        try locked.ensureUnusedFileIds(num_new_files);
-        try s.db.files.ensureUnusedCapacity(s.allocator, num_new_files);
-        try s.db.regular_file_info.ensureUnusedCapacity(s.allocator, @intFromBool(!is_directory));
-        try s.db.directory_file_info.ensureUnusedCapacity(s.allocator, num_new_files - @intFromBool(!is_directory));
-        try s.db.history.ensureUnusedCapacity(s.allocator, num_new_files);
+        try locked.ensureUnusedRevision(diag);
+        try locked.ensureUnusedFileIds(num_new_files, diag);
+        s.db.files.ensureUnusedCapacity(s.allocator, num_new_files) catch |err| return diag.errInternal(err);
+        s.db.regular_file_info.ensureUnusedCapacity(s.allocator, @intFromBool(!is_directory)) catch |err| return diag.errInternal(err);
+        s.db.directory_file_info.ensureUnusedCapacity(s.allocator, num_new_files - @intFromBool(!is_directory)) catch |err| return diag.errInternal(err);
+        s.db.history.ensureUnusedCapacity(s.allocator, num_new_files) catch |err| return diag.errInternal(err);
         errdefer comptime unreachable;
 
         it.replacePath(path);
@@ -358,10 +405,10 @@ const Locked = struct {
         }
     }
 
-    fn ensureUnusedFileIds(locked: Locked, num: std.meta.Tag(network.FileId)) error{ExhaustedFileIds}!void {
+    fn ensureUnusedFileIds(locked: Locked, num: std.meta.Tag(network.FileId), diag: *Diagnostics) error{Global}!void {
         assert(num > 0);
-        const next = locked.server.next_file_id orelse return error.ExhaustedFileIds;
-        _ = std.math.add(std.meta.Tag(network.FileId), next, num - 1) catch return error.ExhaustedFileIds;
+        const next = locked.server.next_file_id orelse return diag.errGlobal(error.ExhaustedFileIds);
+        _ = std.math.add(std.meta.Tag(network.FileId), next, num - 1) catch return diag.errGlobal(error.ExhaustedFileIds);
     }
 
     fn nextFileIdAssumeAvailable(locked: Locked) network.FileId {
@@ -431,7 +478,7 @@ const Locked = struct {
         locked: Locked,
         file_id: network.FileId,
         buffer: *[fairy.max_path_components]network.FileId,
-    ) ![]network.FileId {
+    ) []network.FileId {
         const s = locked.server;
 
         var file_info = s.db.files.get(file_id) orelse std.debug.panic("TODO file not found", .{});
@@ -446,24 +493,25 @@ const Locked = struct {
         return list.items;
     }
 
-    fn getPath(locked: Locked, file_id: network.FileId) error{ FileDoesNotExist, IsDirectory }!Path {
-        const info = locked.server.db.files.getPtr(file_id) orelse return error.FileDoesNotExist;
-        if (info.directory) return error.IsDirectory;
+    fn getRegularFilePath(locked: Locked, file_id: network.FileId, diag: *Diagnostics) error{Client}!Path {
+        const info = locked.server.db.files.getPtr(file_id) orelse return diag.errClient(error.UnknownFileId);
+        if (info.directory) return diag.errClient(error.NotRegularFile);
         return info.path;
     }
 
     fn deleteGlobalFile(
         locked: Locked,
         file_id: network.FileId,
-    ) (error{ UnknownFile, NotARegularFile, ExhaustedRevisionIds } || Allocator.Error)!Path {
+        diag: *Diagnostics,
+    ) error{ Client, Global, Internal }!Path {
         const s = locked.server;
 
         const file_info = blk: {
-            const file_info = s.db.files.getEntry(file_id) orelse return error.UnknownFile;
-            if (file_info.value_ptr.directory) return error.NotARegularFile;
+            const file_info = s.db.files.getEntry(file_id) orelse return diag.errClient(error.UnknownFileId);
+            if (file_info.value_ptr.directory) return diag.errClient(error.NotRegularFile);
 
-            try locked.ensureUnusedRevision();
-            try s.db.history.ensureUnusedCapacity(s.allocator, 1);
+            try locked.ensureUnusedRevision(diag);
+            s.db.history.ensureUnusedCapacity(s.allocator, 1) catch |err| return diag.errInternal(err);
 
             defer s.db.files.removeByPtr(file_info.key_ptr);
             break :blk file_info.value_ptr.*;
@@ -484,19 +532,22 @@ const Locked = struct {
         return file_info.path;
     }
 
-    const DeleteGlobalDirError = error{
-        UnknownFile,
-        NotADirectory,
-        ExhaustedRevisionIds,
-    } ||
-        Allocator.Error ||
-        Io.Cancelable ||
+    const DeleteGlobalDirError = error{ Client, Global, Internal } ||
         switch (fairy.platform) {
-            .windows => error{Unexpected},
-            .linux => Io.Dir.DeleteFileError || Io.Dir.DeleteDirError,
+            .windows => error{},
+            .linux => Io.Cancelable,
         };
 
-    fn deleteGlobalDir(locked: Locked, file_id: network.FileId, io: Io) DeleteGlobalDirError!void {
+    fn deleteGlobalDir(
+        locked: Locked,
+        file_id: network.FileId,
+        io: switch (fairy.platform) {
+            .windows => void,
+            .linux => Io,
+        },
+        diag: *Diagnostics,
+    ) DeleteGlobalDirError!void {
+        // TODO: Perform the filesystem deletion separately from the in-memory deletion
         const s = locked.server;
 
         const Item = struct {
@@ -509,11 +560,12 @@ const Locked = struct {
         };
         var stack: [fairy.max_path_components]Item = undefined;
 
-        const root_info = s.db.files.getEntry(file_id) orelse return error.UnknownFile;
-        if (!root_info.value_ptr.directory) return error.NotADirectory;
+        const root_info = s.db.files.getEntry(file_id) orelse return diag.errClient(error.UnknownFileId);
+        if (!root_info.value_ptr.directory) return diag.errClient(error.NotDirectoryFile);
 
-        try locked.ensureUnusedRevision();
-        try s.db.history.ensureUnusedCapacity(s.allocator, 1);
+        try locked.ensureUnusedRevision(diag);
+        s.db.history.ensureUnusedCapacity(s.allocator, 1) catch |err| return diag.errInternal(err);
+        errdefer std.debug.panic("TODO: Forbid errors after this point", .{});
 
         const root_dir_entry = s.db.directory_file_info.getEntry(file_id).?;
         stack[0] = .{ .children = root_dir_entry.value_ptr.children.keys(), .index = 0, .state = .iterate };
@@ -542,8 +594,8 @@ const Locked = struct {
             }
 
             switch (fairy.platform) {
-                .windows => try fairy.windows.deleteFile(s.sync_dir, child_info.value_ptr.path),
-                .linux => try s.sync_dir.deleteFile(io, child_info.value_ptr.path.slice),
+                .windows => fairy.windows.deleteFile(s.sync_dir, child_info.value_ptr.path) catch |err| return diag.errInternal(err),
+                .linux => s.sync_dir.deleteFile(io, child_info.value_ptr.path.slice) catch |err| return diag.errInternal(err),
             }
 
             if (child_info.value_ptr.directory) {
@@ -558,8 +610,8 @@ const Locked = struct {
         }
 
         switch (fairy.platform) {
-            .windows => try fairy.windows.deleteFile(s.sync_dir, root_info.value_ptr.path),
-            .linux => try s.sync_dir.deleteDir(io, root_info.value_ptr.path.slice),
+            .windows => fairy.windows.deleteFile(s.sync_dir, root_info.value_ptr.path) catch |err| return diag.errInternal(err),
+            .linux => s.sync_dir.deleteDir(io, root_info.value_ptr.path.slice) catch |err| return diag.errInternal(err),
         }
 
         const parent_children = if (root_info.value_ptr.parent) |parent_file_id|
@@ -637,7 +689,7 @@ pub const Host = struct {
     /// Blocks until the `Host` is finished running.
     pub fn run(
         host: *Host,
-        diag: ?*Diagnostics,
+        diag: ?*Host.Diagnostics,
         io: Io,
         reader: *Io.Reader,
         writer: *Io.Writer,
@@ -648,7 +700,7 @@ pub const Host = struct {
                 recv_error: RecvError!void,
             };
 
-            fn addToDiagnostics(d: ?*Diagnostics, u: SelectUnion) void {
+            fn addToDiagnostics(d: ?*Host.Diagnostics, u: SelectUnion) void {
                 const ptr = d orelse return;
                 switch (u) {
                     inline else => |payload, tag| {
@@ -911,13 +963,13 @@ pub const MessageThread = union(enum) {
                         const locked = try host.server.lock(io);
                         defer locked.unlock(io);
 
-                        break :blk if (locked.newFile(path, kind)) |file_id|
+                        var diag: Server.Diagnostics = undefined;
+                        break :blk if (locked.newFile(path, kind, &diag)) |file_id|
                             .{ .success = file_id }
                         else |err| switch (err) {
-                            error.ExhaustedRevisionIds => std.debug.panic("TODO", .{}),
-                            error.ExhaustedFileIds => .exhausted_file_ids,
-                            error.ClientOutOfSync => .client_out_of_sync,
-                            error.OutOfMemory => |e| return e,
+                            error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
+                            error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
+                            error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
                         };
                     },
                 },
@@ -940,7 +992,7 @@ pub const MessageThread = union(enum) {
                     const reversed_file_id_path = blk: {
                         const locked = try host.server.lock(io);
                         defer locked.unlock(io);
-                        break :blk try locked.getReverseFileIdPath(file_id, &reverse_file_ids_buffer);
+                        break :blk locked.getReverseFileIdPath(file_id, &reverse_file_ids_buffer);
                     };
 
                     host.deleteMessageThread(.outgoing, io);
@@ -990,8 +1042,9 @@ pub const MessageThread = union(enum) {
                     const path = blk: {
                         const locked = try host.server.lock(io);
                         defer locked.unlock(io);
-                        break :blk locked.getPath(file_id) catch |err| switch (err) {
-                            error.FileDoesNotExist, error.IsDirectory => std.debug.panic("TODO: Client out of sync", .{}),
+                        var diag: Server.Diagnostics = undefined;
+                        break :blk locked.getRegularFilePath(file_id, &diag) catch |err| switch (err) {
+                            error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
                         };
                     };
                     const handle = host.server.openRegularFileWindows(path, file_size) catch |err| switch (err) {
@@ -1005,8 +1058,9 @@ pub const MessageThread = union(enum) {
                     const path = blk: {
                         const locked = try host.server.lock(io);
                         defer locked.unlock(io);
-                        break :blk locked.getPath(file_id) catch |err| switch (err) {
-                            error.FileDoesNotExist, error.IsDirectory => std.debug.panic("TODO: Client out of sync", .{}),
+                        var diag: Server.Diagnostics = undefined;
+                        break :blk locked.getRegularFilePath(file_id, &diag) catch |err| switch (err) {
+                            error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
                         };
                     };
                     const file = host.server.openRegularFileLinux(path, io) catch |err| switch (err) {
@@ -1062,9 +1116,11 @@ pub const MessageThread = union(enum) {
             const path = blk: {
                 const locked = try host.server.lock(io);
                 defer locked.unlock(io);
-                break :blk locked.deleteGlobalFile(file_id) catch |err| switch (err) {
-                    error.UnknownFile, error.NotARegularFile => std.debug.panic("TODO: Client out of sync", .{}),
-                    error.OutOfMemory, error.ExhaustedRevisionIds => std.debug.panic("TODO: {s}", .{@errorName(err)}),
+                var diag: Server.Diagnostics = undefined;
+                break :blk locked.deleteGlobalFile(file_id, &diag) catch |err| switch (err) {
+                    error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
+                    error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
+                    error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
                 };
             };
             switch (fairy.platform) {
@@ -1104,11 +1160,20 @@ pub const MessageThread = union(enum) {
             {
                 const locked = try host.server.lock(io);
                 defer locked.unlock(io);
-                locked.deleteGlobalDir(file_id, io) catch |err| switch (err) {
-                    error.UnknownFile => std.debug.panic("TODO: Client out of sync", .{}),
-                    error.Canceled => |e| return e,
-                    else => |e| std.debug.panic("TODO: {s}", .{@errorName(e)}),
-                };
+                var diag: Server.Diagnostics = undefined;
+                switch (fairy.platform) {
+                    .windows => locked.deleteGlobalDir(file_id, {}, &diag) catch |err| switch (err) {
+                        error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
+                        error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
+                        error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
+                    },
+                    .linux => locked.deleteGlobalDir(file_id, io, &diag) catch |err| switch (err) {
+                        error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
+                        error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
+                        error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
+                        error.Canceled => |e| return e,
+                    },
+                }
             }
 
             const data: MessageThread = .{
