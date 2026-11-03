@@ -12,10 +12,13 @@ const network = fairy.network;
 
 sync_dir: DirHandle,
 mutex: Io.Mutex, // TODO: Compare with RwLock
+
 allocator: Allocator,
 path_arena: std.heap.ArenaAllocator.State,
 children_arena: std.heap.ArenaAllocator.State,
+
 next_file_id: ?std.meta.Tag(network.FileId),
+
 db: Database,
 host_state: std.atomic.Value(Host.State),
 debug: Debug,
@@ -46,36 +49,38 @@ fn initCommon(sync_dir: DirHandle, allocator: Allocator) Server {
         .mutex = .init,
         .path_arena = .{},
         .children_arena = .{},
+
         .next_file_id = 0,
+
         .db = .init,
         .host_state = .init(.{}),
         .debug = .{},
     };
 }
 
-pub fn deinitWindows(s: *Server) void {
+pub fn deinitWindows(server: *Server) void {
     comptime assert(fairy.platform == .windows);
-    fairy.windows.closeHandle(s.sync_dir);
+    fairy.windows.closeHandle(server.sync_dir);
 
-    s.deinitCommon();
+    server.deinitCommon();
 }
 
-pub fn deinitLinux(s: *Server, io: Io) void {
+pub fn deinitLinux(server: *Server, io: Io) void {
     comptime assert(fairy.platform == .linux);
-    s.sync_dir.close(io);
+    server.sync_dir.close(io);
 
-    s.deinitCommon();
+    server.deinitCommon();
 }
 
-fn deinitCommon(s: *Server) void {
-    var path_arena = s.path_arena.promote(s.allocator);
+fn deinitCommon(server: *Server) void {
+    var path_arena = server.path_arena.promote(server.allocator);
     path_arena.deinit();
 
-    var children_arena = s.children_arena.promote(s.allocator);
+    var children_arena = server.children_arena.promote(server.allocator);
     children_arena.deinit();
 
-    s.db.deinit(s.allocator);
-    s.* = undefined;
+    server.db.deinit(server.allocator);
+    server.* = undefined;
 }
 
 fn lock(server: *Server, io: Io) !Locked {
@@ -103,6 +108,8 @@ pub const Database = struct {
     regular_file_info: std.AutoHashMapUnmanaged(network.FileId, RegularFileEntry),
     directory_file_info: std.AutoHashMapUnmanaged(network.FileId, DirectoryFileEntry),
     sync_dir_entry: DirectoryFileEntry,
+    history: std.ArrayList(HistoryItem),
+    revisions: std.ArrayList(usize),
 
     pub const FileInfo = struct {
         directory: bool,
@@ -138,6 +145,20 @@ pub const Database = struct {
         };
     };
 
+    pub const HistoryItem = union(network.HistoryItemKind) {
+        create_file: Create,
+        create_dir: Create,
+        delete_file: network.FileId,
+        delete_dir: network.FileId,
+        modify_file: network.FileId,
+
+        pub const Create = struct {
+            path: Path,
+            file_id: network.FileId,
+            parent: ?network.FileId,
+        };
+    };
+
     const init: Database = .{
         .files = .empty,
         .regular_file_info = .empty,
@@ -146,12 +167,16 @@ pub const Database = struct {
             .children = .empty,
             .children_by_component = .empty,
         },
+        .history = .empty,
+        .revisions = .empty,
     };
 
     fn deinit(db: *Database, allocator: Allocator) void {
         db.files.deinit(allocator);
         db.regular_file_info.deinit(allocator);
         db.directory_file_info.deinit(allocator);
+        db.history.deinit(allocator);
+        db.revisions.deinit(allocator);
 
         db.* = undefined;
     }
@@ -218,6 +243,10 @@ fn openRegularFileLinux(server: *Server, full_path: Path, io: Io) !Io.File {
 }
 
 pub const Debug = struct {
+    fn log(_: *const Debug, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype) void {
+        @field(fairy.log, @tagName(level))("(server) " ++ fmt, args);
+    }
+
     pub fn printFileEntries(debug: *Debug, writer: *Io.Writer, io: Io) !void {
         const server: *Server = @alignCast(@fieldParentPtr("debug", debug));
         try server.mutex.lock(io);
@@ -239,6 +268,18 @@ const Locked = struct {
 
     fn unlock(locked: Locked, io: Io) void {
         locked.server.mutex.unlock(io);
+    }
+
+    fn ensureUnusedRevision(locked: Locked) (error{ExhaustedRevisionIds} || Allocator.Error)!void {
+        if (locked.server.db.revisions.items.len == std.math.maxInt(std.meta.Tag(network.RevisionId))) return error.ExhaustedRevisionIds;
+        try locked.server.db.revisions.ensureUnusedCapacity(locked.server.allocator, 1);
+    }
+
+    fn createRevisionAssumeAvailable(locked: Locked) network.RevisionId {
+        const int: std.meta.Tag(network.RevisionId) = @intCast(locked.server.db.revisions.items.len);
+        locked.server.debug.log(.info, "created revision {}", .{int});
+        locked.server.db.revisions.appendAssumeCapacity(locked.server.db.history.items.len);
+        return @fromBackingInt(int);
     }
 
     fn newFile(locked: Locked, path_unowned: Path, kind: network.FileKind) !network.FileId {
@@ -284,10 +325,12 @@ const Locked = struct {
             .directory => true,
             .regular => false,
         };
+        try locked.ensureUnusedRevision();
         try locked.ensureUnusedFileIds(num_new_files);
         try s.db.files.ensureUnusedCapacity(s.allocator, num_new_files);
         try s.db.regular_file_info.ensureUnusedCapacity(s.allocator, @intFromBool(!is_directory));
         try s.db.directory_file_info.ensureUnusedCapacity(s.allocator, num_new_files - @intFromBool(!is_directory));
+        try s.db.history.ensureUnusedCapacity(s.allocator, num_new_files);
         errdefer comptime unreachable;
 
         it.replacePath(path);
@@ -308,6 +351,8 @@ const Locked = struct {
                     .regular => locked.initRegularFile(file_id, item.component, item.path, parent_file_id),
                     .directory => _ = locked.initDirectoryFile(file_id, item.component, item.path, parent_file_id),
                 }
+                const revision = locked.createRevisionAssumeAvailable();
+                _ = revision; // TODO
                 return file_id;
             }
         }
@@ -322,7 +367,7 @@ const Locked = struct {
     fn nextFileIdAssumeAvailable(locked: Locked) network.FileId {
         const next = locked.server.next_file_id.?;
         locked.server.next_file_id = std.math.add(std.meta.Tag(network.FileId), next, 1) catch null;
-        return @fromBackingInt(@intCast(next));
+        return @fromBackingInt(next);
     }
 
     fn initRegularFile(
@@ -333,6 +378,13 @@ const Locked = struct {
         parent_file_id: ?network.FileId,
     ) void {
         const db = &locked.server.db;
+        db.history.appendAssumeCapacity(.{
+            .create_file = .{
+                .path = path,
+                .file_id = file_id,
+                .parent = parent_file_id,
+            },
+        });
         db.files.putAssumeCapacityNoClobber(file_id, .{
             .directory = false,
             .component = component,
@@ -350,6 +402,15 @@ const Locked = struct {
         parent_file_id: ?network.FileId,
     ) *Database.DirectoryFileEntry {
         const db = &locked.server.db;
+
+        db.history.appendAssumeCapacity(.{
+            .create_dir = .{
+                .path = path,
+                .file_id = file_id,
+                .parent = parent_file_id,
+            },
+        });
+
         db.files.putAssumeCapacityNoClobber(file_id, .{
             .directory = true,
             .component = component,
@@ -391,15 +452,23 @@ const Locked = struct {
         return info.path;
     }
 
-    fn deleteGlobalFile(locked: Locked, file_id: network.FileId) error{ UnknownFile, NotARegularFile }!Path {
+    fn deleteGlobalFile(
+        locked: Locked,
+        file_id: network.FileId,
+    ) (error{ UnknownFile, NotARegularFile, ExhaustedRevisionIds } || Allocator.Error)!Path {
         const s = locked.server;
 
         const file_info = blk: {
             const file_info = s.db.files.getEntry(file_id) orelse return error.UnknownFile;
             if (file_info.value_ptr.directory) return error.NotARegularFile;
+
+            try locked.ensureUnusedRevision();
+            try s.db.history.ensureUnusedCapacity(s.allocator, 1);
+
             defer s.db.files.removeByPtr(file_info.key_ptr);
             break :blk file_info.value_ptr.*;
         };
+        errdefer comptime unreachable;
 
         assert(s.db.regular_file_info.remove(file_id));
         const parent_children = if (file_info.parent) |parent_file_id|
@@ -408,13 +477,19 @@ const Locked = struct {
             &s.db.sync_dir_entry.children;
         assert(parent_children.swapRemove(file_id));
 
+        s.db.history.appendAssumeCapacity(.{ .delete_file = file_id });
+        const revision = locked.createRevisionAssumeAvailable();
+        _ = revision; // TODO
+
         return file_info.path;
     }
 
     const DeleteGlobalDirError = error{
         UnknownFile,
         NotADirectory,
+        ExhaustedRevisionIds,
     } ||
+        Allocator.Error ||
         Io.Cancelable ||
         switch (fairy.platform) {
             .windows => error{Unexpected},
@@ -436,6 +511,10 @@ const Locked = struct {
 
         const root_info = s.db.files.getEntry(file_id) orelse return error.UnknownFile;
         if (!root_info.value_ptr.directory) return error.NotADirectory;
+
+        try locked.ensureUnusedRevision();
+        try s.db.history.ensureUnusedCapacity(s.allocator, 1);
+
         const root_dir_entry = s.db.directory_file_info.getEntry(file_id).?;
         stack[0] = .{ .children = root_dir_entry.value_ptr.children.keys(), .index = 0, .state = .iterate };
 
@@ -495,6 +574,10 @@ const Locked = struct {
         assert(parent_children_by_component.swapRemove(root_info.value_ptr.component));
         s.db.files.removeByPtr(root_info.key_ptr);
         s.db.directory_file_info.removeByPtr(root_dir_entry.key_ptr);
+
+        s.db.history.appendAssumeCapacity(.{ .delete_dir = file_id });
+        const revision = locked.createRevisionAssumeAvailable();
+        _ = revision; // TODO
     }
 };
 
@@ -831,6 +914,7 @@ pub const MessageThread = union(enum) {
                         break :blk if (locked.newFile(path, kind)) |file_id|
                             .{ .success = file_id }
                         else |err| switch (err) {
+                            error.ExhaustedRevisionIds => std.debug.panic("TODO", .{}),
                             error.ExhaustedFileIds => .exhausted_file_ids,
                             error.ClientOutOfSync => .client_out_of_sync,
                             error.OutOfMemory => |e| return e,
@@ -980,6 +1064,7 @@ pub const MessageThread = union(enum) {
                 defer locked.unlock(io);
                 break :blk locked.deleteGlobalFile(file_id) catch |err| switch (err) {
                     error.UnknownFile, error.NotARegularFile => std.debug.panic("TODO: Client out of sync", .{}),
+                    error.OutOfMemory, error.ExhaustedRevisionIds => std.debug.panic("TODO: {s}", .{@errorName(err)}),
                 };
             };
             switch (fairy.platform) {

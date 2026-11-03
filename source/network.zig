@@ -46,6 +46,16 @@ pub const Platform = enum(u8) {
 
 pub const ack: u32 = 0xF0F0F0F0;
 
+pub const RevisionId = enum(u64) { _ };
+
+pub const HistoryItemKind = enum(u8) {
+    create_file,
+    create_dir,
+    delete_file,
+    delete_dir,
+    modify_file,
+};
+
 pub const FileHash = struct {
     blake3: [byte_size]u8,
 
