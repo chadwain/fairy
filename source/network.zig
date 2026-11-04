@@ -48,12 +48,25 @@ pub const ack: u32 = 0xF0F0F0F0;
 
 pub const RevisionId = enum(u64) { _ };
 
-pub const HistoryItemKind = enum(u8) {
-    create_file,
-    create_dir,
-    delete_file,
-    delete_dir,
-    modify_file,
+pub const history = struct {
+    pub const Entry = enum(u8) {
+        create,
+        delete,
+        modify,
+    };
+
+    /// Trailing: [ FileId + component name (WTF-8, null-terminated)] (`num_new_files` times)
+    pub const Create = extern struct {
+        kind: FileKind,
+        num_new_files: fairy.FileCount,
+        top_level: bool,
+        parent: FileId,
+    };
+
+    pub const Delete = extern struct {
+        kind: FileKind,
+        file_id: FileId,
+    };
 };
 
 pub const FileHash = struct {

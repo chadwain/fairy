@@ -41,6 +41,10 @@ pub const Path = struct {
         return @intCast(path.slice.len);
     }
 
+    pub fn componentCount(path: Path) fairy.PathComponentCount {
+        return @intCast(std.mem.countScalar(u8, path.slice, '/') + 1);
+    }
+
     pub fn dupe(path: Path, allocator: Allocator) !Path {
         return .{ .slice = try allocator.dupe(u8, path.slice) };
     }

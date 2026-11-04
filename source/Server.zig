@@ -108,7 +108,7 @@ pub const Database = struct {
     regular_file_info: std.AutoHashMapUnmanaged(network.FileId, RegularFileEntry),
     directory_file_info: std.AutoHashMapUnmanaged(network.FileId, DirectoryFileEntry),
     sync_dir_entry: DirectoryFileEntry,
-    history: std.ArrayList(HistoryItem),
+    history: std.ArrayList(u8),
     revisions: std.ArrayList(usize),
 
     pub const FileInfo = struct {
@@ -142,20 +142,6 @@ pub const Database = struct {
                 }
             };
             break :blk std.array_hash_map.Custom(Path, network.FileId, Context, true);
-        };
-    };
-
-    pub const HistoryItem = union(network.HistoryItemKind) {
-        create_file: Create,
-        create_dir: Create,
-        delete_file: network.FileId,
-        delete_dir: network.FileId,
-        modify_file: network.FileId,
-
-        pub const Create = struct {
-            path: Path,
-            file_id: network.FileId,
-            parent: ?network.FileId,
         };
     };
 
@@ -301,6 +287,53 @@ pub const Debug = struct {
             );
         }
     }
+
+    pub fn printRevision(debug: *Debug, writer: *Io.Writer, io: Io, revision: network.RevisionId) !void {
+        const server: *Server = @alignCast(@fieldParentPtr("debug", debug));
+        try server.mutex.lock(io);
+        defer server.mutex.unlock(io);
+
+        const revision_number = @backingInt(revision);
+        if (revision_number == 0) {
+            try writer.writeAll("initial revision\n");
+            return;
+        }
+        if (revision_number - 1 >= server.db.revisions.items.len) return error.InvalidRevision;
+        const history = blk: {
+            const begin = if (revision_number != 1) server.db.revisions.items[revision_number - 2] else 0;
+            const end = server.db.revisions.items[revision_number - 1];
+            break :blk server.db.history.items[begin..end];
+        };
+        var reader = Io.Reader.fixed(history);
+        while (true) {
+            const entry = reader.takeEnum(network.history.Entry, network.endian) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.InvalidEnumTag, error.ReadFailed => unreachable,
+            };
+            switch (entry) {
+                .create => {
+                    const create = reader.takeStruct(network.history.Create, network.endian) catch unreachable;
+                    try writer.print(
+                        "create: kind={s}, parent={?f}, length={}\n",
+                        .{ @tagName(create.kind), if (!create.top_level) create.parent else null, create.num_new_files },
+                    );
+                    for (0..create.num_new_files) |_| {
+                        const file_id = reader.takeEnumNonexhaustive(network.FileId, network.endian) catch unreachable;
+                        const component = (reader.takeDelimiter(0) catch unreachable).?;
+                        try writer.print("\tid={f}, name={f}\n", .{ file_id, std.unicode.fmtUtf8(component) });
+                    }
+                },
+                .delete => {
+                    const delete = reader.takeStruct(network.history.Delete, network.endian) catch unreachable;
+                    try writer.print(
+                        "delete: kind={s}, id={f}\n",
+                        .{ @tagName(delete.kind), delete.file_id },
+                    );
+                },
+                else => std.debug.panic("TODO", .{}),
+            }
+        }
+    }
 };
 
 const Locked = struct {
@@ -311,16 +344,16 @@ const Locked = struct {
     }
 
     fn ensureUnusedRevision(locked: Locked, diag: *Diagnostics) error{ Global, Internal }!void {
-        if (locked.server.db.revisions.items.len == std.math.maxInt(std.meta.Tag(network.RevisionId))) {
+        if (locked.server.db.revisions.items.len == std.math.maxInt(std.meta.Tag(network.RevisionId)) - 1) {
             return diag.errGlobal(error.ExhaustedRevisionIds);
         }
         locked.server.db.revisions.ensureUnusedCapacity(locked.server.allocator, 1) catch |err| return diag.errInternal(err);
     }
 
     fn createRevisionAssumeAvailable(locked: Locked) network.RevisionId {
+        locked.server.db.revisions.appendAssumeCapacity(locked.server.db.history.items.len);
         const int: std.meta.Tag(network.RevisionId) = @intCast(locked.server.db.revisions.items.len);
         locked.server.debug.log(.info, "created revision {}", .{int});
-        locked.server.db.revisions.appendAssumeCapacity(locked.server.db.history.items.len);
         return @fromBackingInt(int);
     }
 
@@ -334,6 +367,8 @@ const Locked = struct {
 
         var it = path_unowned.pathIterator();
         var parent_file_id: ?network.FileId = null;
+        // TODO: Calculate the number of components earlier
+        var num_new_files = path_unowned.componentCount();
         {
             var component = it.nextComponent().?;
             var parent_dir_entry = &s.db.sync_dir_entry;
@@ -350,6 +385,7 @@ const Locked = struct {
                     component = next;
                     parent_dir_entry = s.db.directory_file_info.getPtr(file_id).?;
                     parent_file_id = file_id;
+                    num_new_files -= 1;
                 } else {
                     return diag.errClient(error.FileAlreadyExists);
                 }
@@ -366,8 +402,6 @@ const Locked = struct {
         defer s.children_arena = children_arena.state;
         const children_allocator = children_arena.allocator();
 
-        // TODO: Calculate the number of components in `path`
-        const num_new_files = fairy.max_path_components;
         const is_directory = switch (kind) {
             .directory => true,
             .regular => false,
@@ -377,8 +411,27 @@ const Locked = struct {
         s.db.files.ensureUnusedCapacity(s.allocator, num_new_files) catch |err| return diag.errInternal(err);
         s.db.regular_file_info.ensureUnusedCapacity(s.allocator, @intFromBool(!is_directory)) catch |err| return diag.errInternal(err);
         s.db.directory_file_info.ensureUnusedCapacity(s.allocator, num_new_files - @intFromBool(!is_directory)) catch |err| return diag.errInternal(err);
-        s.db.history.ensureUnusedCapacity(s.allocator, num_new_files) catch |err| return diag.errInternal(err);
+        const history_needed_capacity = @sizeOf(network.history.Entry) +
+            @sizeOf(network.history.Create) +
+            @as(usize, num_new_files) * (@sizeOf(network.FileId) + Path.component_max_len + 1);
+        s.db.history.ensureUnusedCapacity(s.allocator, history_needed_capacity) catch |err| return diag.errInternal(err);
         errdefer comptime unreachable;
+
+        var history_writer = Io.Writer.Allocating.fromArrayList(s.allocator, &s.db.history);
+        defer {
+            s.db.history = history_writer.toArrayList();
+            const revision = locked.createRevisionAssumeAvailable();
+            _ = revision; // TODO
+        }
+        const history = &history_writer.writer;
+
+        history.writeInt(std.meta.Tag(network.history.Entry), @backingInt(network.history.Entry.create), network.endian) catch unreachable;
+        history.writeStruct(network.history.Create{
+            .kind = kind,
+            .num_new_files = num_new_files,
+            .top_level = (parent_file_id == null),
+            .parent = parent_file_id orelse @fromBackingInt(0),
+        }, network.endian) catch unreachable;
 
         it.replacePath(path);
         var item = it.nextPathComponent().?;
@@ -387,6 +440,16 @@ const Locked = struct {
             const file_id = locked.nextFileIdAssumeAvailable();
             parent_dir_entry.children.putNoClobber(children_allocator, file_id, {}) catch |err| std.debug.panic("TODO: {s}", .{@errorName(err)});
             parent_dir_entry.children_by_component.putNoClobber(children_allocator, item.component, file_id) catch |err| std.debug.panic("TODO: {s}", .{@errorName(err)});
+
+            history.writeInt(std.meta.Tag(network.FileId), @backingInt(file_id), network.endian) catch unreachable;
+            switch (fairy.platform) {
+                .windows => {
+                    var wtf8_buffer: [255]u8 = undefined;
+                    history.writeAll(item.component.componentToWtf8(&wtf8_buffer)) catch unreachable;
+                },
+                .linux => history.writeAll(item.component.slice),
+            }
+            history.writeByte(0) catch unreachable;
 
             if (it.nextPathComponent()) |next| {
                 const entry = locked.initDirectoryFile(file_id, item.component, item.path, parent_file_id);
@@ -398,8 +461,6 @@ const Locked = struct {
                     .regular => locked.initRegularFile(file_id, item.component, item.path, parent_file_id),
                     .directory => _ = locked.initDirectoryFile(file_id, item.component, item.path, parent_file_id),
                 }
-                const revision = locked.createRevisionAssumeAvailable();
-                _ = revision; // TODO
                 return file_id;
             }
         }
@@ -425,13 +486,6 @@ const Locked = struct {
         parent_file_id: ?network.FileId,
     ) void {
         const db = &locked.server.db;
-        db.history.appendAssumeCapacity(.{
-            .create_file = .{
-                .path = path,
-                .file_id = file_id,
-                .parent = parent_file_id,
-            },
-        });
         db.files.putAssumeCapacityNoClobber(file_id, .{
             .directory = false,
             .component = component,
@@ -449,14 +503,6 @@ const Locked = struct {
         parent_file_id: ?network.FileId,
     ) *Database.DirectoryFileEntry {
         const db = &locked.server.db;
-
-        db.history.appendAssumeCapacity(.{
-            .create_dir = .{
-                .path = path,
-                .file_id = file_id,
-                .parent = parent_file_id,
-            },
-        });
 
         db.files.putAssumeCapacityNoClobber(file_id, .{
             .directory = true,
@@ -506,30 +552,41 @@ const Locked = struct {
     ) error{ Client, Global, Internal }!Path {
         const s = locked.server;
 
-        const file_info = blk: {
-            const file_info = s.db.files.getEntry(file_id) orelse return diag.errClient(error.UnknownFileId);
-            if (file_info.value_ptr.directory) return diag.errClient(error.NotRegularFile);
+        const file_info = s.db.files.getEntry(file_id) orelse return diag.errClient(error.UnknownFileId);
+        if (file_info.value_ptr.directory) return diag.errClient(error.NotRegularFile);
 
-            try locked.ensureUnusedRevision(diag);
-            s.db.history.ensureUnusedCapacity(s.allocator, 1) catch |err| return diag.errInternal(err);
-
-            defer s.db.files.removeByPtr(file_info.key_ptr);
-            break :blk file_info.value_ptr.*;
-        };
+        try locked.ensureUnusedRevision(diag);
+        const history_needed_capacity = @sizeOf(network.history.Entry) +
+            @sizeOf(network.history.Delete);
+        s.db.history.ensureUnusedCapacity(s.allocator, history_needed_capacity) catch |err| return diag.errInternal(err);
         errdefer comptime unreachable;
 
-        assert(s.db.regular_file_info.remove(file_id));
-        const parent_children = if (file_info.parent) |parent_file_id|
-            &s.db.directory_file_info.getPtr(parent_file_id).?.children
-        else
-            &s.db.sync_dir_entry.children;
-        assert(parent_children.swapRemove(file_id));
+        var history_writer = Io.Writer.Allocating.fromArrayList(s.allocator, &s.db.history);
+        defer {
+            s.db.history = history_writer.toArrayList();
+            const revision = locked.createRevisionAssumeAvailable();
+            _ = revision; // TODO
+        }
+        const history = &history_writer.writer;
 
-        s.db.history.appendAssumeCapacity(.{ .delete_file = file_id });
-        const revision = locked.createRevisionAssumeAvailable();
-        _ = revision; // TODO
+        const path = blk: {
+            defer s.db.files.removeByPtr(file_info.key_ptr);
+            assert(s.db.regular_file_info.remove(file_id));
+            const parent_children = if (file_info.value_ptr.parent) |parent_file_id|
+                &s.db.directory_file_info.getPtr(parent_file_id).?.children
+            else
+                &s.db.sync_dir_entry.children;
+            assert(parent_children.swapRemove(file_id));
+            break :blk file_info.value_ptr.path;
+        };
 
-        return file_info.path;
+        history.writeInt(std.meta.Tag(network.history.Entry), @backingInt(network.history.Entry.delete), network.endian) catch unreachable;
+        history.writeStruct(network.history.Delete{
+            .kind = .regular,
+            .file_id = file_id,
+        }, network.endian) catch unreachable;
+
+        return path;
     }
 
     const DeleteGlobalDirError = error{ Client, Global, Internal } ||
@@ -552,10 +609,9 @@ const Locked = struct {
 
         const Item = struct {
             children: []const network.FileId,
-            index: Index,
+            index: fairy.FileCount,
             state: State,
 
-            const Index = u32; // TODO: Temporary, decide on an index type to use for iterating over children
             const State = enum { iterate, delete };
         };
         var stack: [fairy.max_path_components]Item = undefined;
@@ -563,8 +619,18 @@ const Locked = struct {
         const root_info = s.db.files.getEntry(file_id) orelse return diag.errClient(error.UnknownFileId);
         if (!root_info.value_ptr.directory) return diag.errClient(error.NotDirectoryFile);
 
+        var history_writer = Io.Writer.Allocating.fromArrayList(s.allocator, &s.db.history);
+        defer {
+            s.db.history = history_writer.toArrayList();
+            const revision = locked.createRevisionAssumeAvailable();
+            _ = revision; // TODO
+        }
+        const history = &history_writer.writer;
+
         try locked.ensureUnusedRevision(diag);
-        s.db.history.ensureUnusedCapacity(s.allocator, 1) catch |err| return diag.errInternal(err);
+        const history_needed_capacity = @sizeOf(network.history.Entry) +
+            @sizeOf(network.history.Delete);
+        history_writer.ensureUnusedCapacity(history_needed_capacity) catch |err| return diag.errInternal(err);
         errdefer std.debug.panic("TODO: Forbid errors after this point", .{});
 
         const root_dir_entry = s.db.directory_file_info.getEntry(file_id).?;
@@ -627,9 +693,11 @@ const Locked = struct {
         s.db.files.removeByPtr(root_info.key_ptr);
         s.db.directory_file_info.removeByPtr(root_dir_entry.key_ptr);
 
-        s.db.history.appendAssumeCapacity(.{ .delete_dir = file_id });
-        const revision = locked.createRevisionAssumeAvailable();
-        _ = revision; // TODO
+        history.writeInt(std.meta.Tag(network.history.Entry), @backingInt(network.history.Entry.delete), network.endian) catch unreachable;
+        history.writeStruct(network.history.Delete{
+            .kind = .directory,
+            .file_id = file_id,
+        }, network.endian) catch unreachable;
     }
 };
 

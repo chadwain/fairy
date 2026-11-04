@@ -1,6 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const print = std.debug.print;
+const printf = std.debug.print;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -85,6 +85,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
+fn print(message: []const u8) void {
+    printf("{s}\n", .{message});
+}
+
 fn runClientCli(io: Io, cdb: *fairy.client.Database) !void {
     var stdin_buffer: [64]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
@@ -117,7 +121,7 @@ fn runClientCli(io: Io, cdb: *fairy.client.Database) !void {
         }
         break :blk msg;
     };
-    print("{s}", .{help});
+    printf("{s}", .{help});
     var disabled_auto_scanning = false;
     while (true) {
         var line: []const u8 = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
@@ -160,7 +164,7 @@ fn runClientCli(io: Io, cdb: *fairy.client.Database) !void {
                     cdb.disableAutoScanning();
                 }
             },
-            .help => print("{s}", .{help}),
+            .help => printf("{s}", .{help}),
         }
     }
 }
@@ -176,11 +180,13 @@ fn runServerCli(io: Io, server: *fairy.Server) !void {
     const Command = enum {
         quit,
         print_files_folders,
+        print_revision,
         help,
     };
     const commands = std.StaticStringMap(Command).initComptime(.{
         .{ "q", Command.quit },
         .{ "a", Command.print_files_folders },
+        .{ "r", Command.print_revision },
         .{ "?", Command.help },
     });
 
@@ -191,7 +197,7 @@ fn runServerCli(io: Io, server: *fairy.Server) !void {
         }
         break :blk msg;
     };
-    print("{s}", .{help});
+    printf("{s}", .{help});
     while (true) {
         var line: []const u8 = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.ReadFailed, error.EndOfStream => |e| return e,
@@ -202,14 +208,32 @@ fn runServerCli(io: Io, server: *fairy.Server) !void {
         };
         reader.toss(1);
         line = std.mem.trimEnd(u8, line, "\r");
-
-        switch (commands.get(line) orelse continue) {
+        var splitter = std.mem.splitScalar(u8, line, ' ');
+        switch (commands.get(splitter.first()) orelse {
+            print("invalid command");
+            continue;
+        }) {
             .quit => break,
             .print_files_folders => {
                 try server.debug.printFileEntries(stdout, io);
                 try stdout.flush();
             },
-            .help => print("{s}", .{help}),
+            .print_revision => {
+                const number = splitter.next() orelse {
+                    print("invalid args");
+                    continue;
+                };
+                const revision_number = std.fmt.parseInt(std.meta.Tag(fairy.network.RevisionId), number, 10) catch {
+                    print("not a valid revision number");
+                    continue;
+                };
+                server.debug.printRevision(stdout, io, @fromBackingInt(revision_number)) catch |err| {
+                    printf("error: {s}\n", .{@errorName(err)});
+                    continue;
+                };
+                try stdout.flush();
+            },
+            .help => printf("{s}", .{help}),
         }
     }
 }
@@ -266,7 +290,7 @@ fn startHost(
     defer host.deinit();
     var diag: Host.Diagnostics = .{};
     defer {
-        print("{s} send result: {s}, recv result: {s}\n", .{
+        printf("{s} send result: {s}, recv result: {s}\n", .{
             name,
             blk: {
                 const err = diag.send_error orelse break :blk "OK";

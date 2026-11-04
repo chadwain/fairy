@@ -19,6 +19,8 @@ pub const PathComponentCount = u8;
 /// If a path has more components than this, the file/folder will not be tracked.
 pub const max_path_components: PathComponentCount = 255;
 
+pub const FileCount = u32;
+
 pub fn print(message: []const u8) void {
     @import("std").debug.print("{s}\n", .{message});
 }

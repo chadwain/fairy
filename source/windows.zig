@@ -24,6 +24,7 @@ const cpu_endian = @import("builtin").cpu.arch.endian();
 /// - No component may be the same as a legacy DOS device name. (NUL, COM1, AUX, etc.)
 
 // TODO: Reject invalid characters `/\:*"?<>|` and non-printable characters (0-31)
+// TODO: Ensure that each component is 255 code units or less when converted to WTF-8
 pub const Path = struct {
     slice: []const u16,
 
@@ -46,6 +47,10 @@ pub const Path = struct {
         return @intCast(path.slice.len * 2);
     }
 
+    pub fn componentCount(path: Path) fairy.PathComponentCount {
+        return @intCast(std.mem.countScalar(u16, path.slice, '\\') + 1);
+    }
+
     pub fn dupe(path: Path, allocator: Allocator) !Path {
         return .{ .slice = try allocator.dupe(u16, path.slice) };
     }
@@ -63,6 +68,12 @@ pub const Path = struct {
     fn formatWtf16AsUtf8(slice: []const u16, writer: *Io.Writer) Io.Writer.Error!void {
         comptime assert(cpu_endian == .little);
         try writer.print("{f}", .{std.unicode.fmtUtf16Le(slice)});
+    }
+
+    /// Only valid if the path represents a single component.
+    pub fn componentToWtf8(path: Path, buffer: *[255]u8) []u8 {
+        const len = std.unicode.wtf16LeToWtf8(buffer, path.slice);
+        return buffer[0..len];
     }
 
     pub const PathIterator = struct {

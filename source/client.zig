@@ -1626,12 +1626,8 @@ pub const Host = struct {
 
         while (true) {
             const header = try reader.receiveMessageHeader();
-            if (header == .disconnect) break;
-            const action = try reader.receiveAction();
-            host.logNetworkAction(.incoming, action);
-
             switch (header) {
-                .disconnect => unreachable,
+                .disconnect => break,
                 .new_thread => {
                     return error.InvalidAction;
                 },
@@ -1643,6 +1639,9 @@ pub const Host = struct {
                             .incoming => break,
                         }
                     }
+
+                    const action = try reader.receiveAction();
+                    host.logNetworkAction(.incoming, action);
 
                     switch (host.mt) {
                         .out_new_file => |*out_new_file| switch (out_new_file.state) {
