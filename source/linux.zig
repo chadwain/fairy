@@ -34,6 +34,7 @@ pub const Path = struct {
     }
 
     pub fn assumeValidPath(slice: []const u8) Path {
+        assert(isValidPath(slice));
         return .{ .slice = slice };
     }
 

@@ -20,6 +20,7 @@ children_arena: std.heap.ArenaAllocator.State,
 next_file_id: ?std.meta.Tag(network.FileId),
 
 db: Database,
+events: Events,
 host_state: std.atomic.Value(Host.State),
 debug: Debug,
 
@@ -53,6 +54,7 @@ fn initCommon(sync_dir: DirHandle, allocator: Allocator) Server {
         .next_file_id = 0,
 
         .db = .init,
+        .events = .init,
         .host_state = .init(.{}),
         .debug = .{},
     };
@@ -80,6 +82,7 @@ fn deinitCommon(server: *Server) void {
     children_arena.deinit();
 
     server.db.deinit(server.allocator);
+    server.events.deinit(server.allocator);
     server.* = undefined;
 }
 
@@ -112,10 +115,17 @@ pub const Database = struct {
     revisions: std.ArrayList(usize),
 
     pub const FileInfo = struct {
+        status: Status,
         directory: bool,
         path: Path,
         component: Path,
         parent: ?network.FileId,
+
+        pub const Status = enum {
+            new,
+            synced,
+            deleted,
+        };
     };
 
     pub const RegularFileEntry = struct {
@@ -168,11 +178,149 @@ pub const Database = struct {
     }
 };
 
+pub const Events = struct {
+    /// Controls when the event loop wakes up.
+    /// Does not protect a critical section.
+    alert: std.atomic.Value(Alert),
+    delete: std.AutoArrayHashMapUnmanaged(network.FileId, void),
+    sync: std.AutoHashMapUnmanaged(network.FileId, struct { canceled: bool = false }),
+
+    pub const Alert = enum(u32) { sleep, wake };
+
+    const init: Events = .{
+        .alert = .init(.sleep),
+        .delete = .empty,
+        .sync = .empty,
+    };
+
+    fn deinit(events: *Events, allocator: Allocator) void {
+        events.delete.deinit(allocator);
+        events.sync.deinit(allocator);
+    }
+
+    fn queueDeleteEventAssumeCapacity(events: *Events, file_id: network.FileId, io: Io) void {
+        if (events.sync.getPtr(file_id)) |sync| {
+            sync.canceled = true;
+        }
+        events.delete.putAssumeCapacityNoClobber(file_id, {});
+        events.alert.store(.wake, .monotonic);
+        io.futexWake(Events.Alert, &events.alert.raw, 1);
+    }
+};
+
+pub fn eventLoop(server: *Server, io: Io) !void {
+    while (true) {
+        if (server.events.alert.cmpxchgStrong(.wake, .sleep, .monotonic, .monotonic)) |_| {
+            try io.futexWait(Events.Alert, &server.events.alert.raw, .sleep);
+            continue;
+        }
+
+        try server.mutex.lock(io);
+
+        if (server.events.delete.count() > 0) {
+            const file_id = server.events.delete.keys()[0];
+
+            // Delete events should cancel sync events.
+            if (server.events.sync.get(file_id)) |value| {
+                assert(value.canceled);
+            }
+
+            const info = server.db.files.getPtr(file_id).?;
+            assert(info.status == .deleted);
+            const path, const directory = .{ info.path, info.directory };
+            server.mutex.unlock(io);
+
+            switch (directory) {
+                true => {
+                    // TODO: Treat file not found as success
+                    switch (fairy.platform) {
+                        .windows => try fairy.windows.deleteTree(server.sync_dir, path, server.allocator),
+                        .linux => try server.sync_dir.deleteTree(io, path.slice),
+                    }
+
+                    server.mutex.lockUncancelable(io);
+                    defer server.mutex.unlock(io);
+
+                    server.events.delete.orderedRemoveAt(0);
+
+                    const Item = struct {
+                        children: []const network.FileId,
+                        index: fairy.FileCount = 0,
+                        state: State = .iterate,
+
+                        const State = enum { iterate, delete };
+                    };
+                    var stack: [fairy.max_path_components]Item = undefined;
+
+                    const root_dir_entry = server.db.directory_file_info.getEntry(file_id).?;
+                    stack[0] = .{ .children = root_dir_entry.value_ptr.children.keys() };
+
+                    var stack_len: fairy.PathComponentCount = 1;
+                    while (stack_len > 0) {
+                        const item = &stack[stack_len - 1];
+                        if (item.index == item.children.len) {
+                            item.* = undefined;
+                            stack_len -= 1;
+                            continue;
+                        }
+
+                        const child_file_id = item.children[item.index];
+                        const child_info = server.db.files.getEntry(child_file_id).?;
+
+                        if (child_info.value_ptr.directory and item.state == .iterate) enter_dir: {
+                            const dir_entry = server.db.directory_file_info.getPtr(child_file_id).?;
+                            const children = dir_entry.children.keys();
+                            if (children.len == 0) break :enter_dir;
+
+                            item.state = .delete;
+                            stack[stack_len] = .{ .children = children };
+                            stack_len += 1;
+                            continue;
+                        }
+
+                        if (child_info.value_ptr.directory) {
+                            item.state = .iterate;
+                            assert(server.db.directory_file_info.remove(child_file_id));
+                        } else {
+                            assert(server.db.regular_file_info.remove(child_file_id));
+                        }
+                        server.db.files.removeByPtr(child_info.key_ptr);
+
+                        item.index += 1;
+                    }
+
+                    assert(server.db.files.remove(file_id));
+                    server.db.directory_file_info.removeByPtr(root_dir_entry.key_ptr);
+                },
+                false => {
+                    // TODO: Treat file not found as success
+                    switch (fairy.platform) {
+                        .windows => try fairy.windows.deleteFile(server.sync_dir, path),
+                        .linux => try server.sync_dir.deleteFile(io, path.slice),
+                    }
+
+                    server.mutex.lockUncancelable(io);
+                    defer server.mutex.unlock(io);
+
+                    server.events.delete.orderedRemoveAt(0);
+                    assert(server.db.files.remove(file_id));
+                    assert(server.db.regular_file_info.remove(file_id));
+                },
+            }
+
+            continue;
+        }
+
+        server.mutex.unlock(io);
+    }
+}
+
 const Diagnostics = union {
     client: Client,
     global: Global,
     internal: Internal,
 
+    /// Client-side errors; usually because the client is out of sync.
     const Client = error{
         UnknownFileId,
         NotRegularFile,
@@ -180,11 +328,13 @@ const Diagnostics = union {
         FileAlreadyExists,
     };
 
+    /// Errors that arise because of operations that cannot be completed.
     const Global = error{
         ExhaustedRevisionIds,
         ExhaustedFileIds,
     };
 
+    /// Internal server errors.
     const Internal = Allocator.Error ||
         switch (fairy.platform) {
             .windows => error{Unexpected},
@@ -430,7 +580,7 @@ const Locked = struct {
             .kind = kind,
             .num_new_files = num_new_files,
             .top_level = (parent_file_id == null),
-            .parent = parent_file_id orelse @fromBackingInt(0),
+            .parent = parent_file_id orelse @fromBackingInt(0x12345678),
         }, network.endian) catch unreachable;
 
         it.replacePath(path);
@@ -447,7 +597,7 @@ const Locked = struct {
                     var wtf8_buffer: [255]u8 = undefined;
                     history.writeAll(item.component.componentToWtf8(&wtf8_buffer)) catch unreachable;
                 },
-                .linux => history.writeAll(item.component.slice),
+                .linux => history.writeAll(item.component.slice) catch unreachable,
             }
             history.writeByte(0) catch unreachable;
 
@@ -487,6 +637,7 @@ const Locked = struct {
     ) void {
         const db = &locked.server.db;
         db.files.putAssumeCapacityNoClobber(file_id, .{
+            .status = .new,
             .directory = false,
             .component = component,
             .path = path,
@@ -505,6 +656,7 @@ const Locked = struct {
         const db = &locked.server.db;
 
         db.files.putAssumeCapacityNoClobber(file_id, .{
+            .status = .synced,
             .directory = true,
             .component = component,
             .path = path,
@@ -548,18 +700,34 @@ const Locked = struct {
     fn deleteGlobalFile(
         locked: Locked,
         file_id: network.FileId,
+        io: Io,
         diag: *Diagnostics,
-    ) error{ Client, Global, Internal }!Path {
+    ) error{ Client, Global, Internal }!void {
         const s = locked.server;
 
-        const file_info = s.db.files.getEntry(file_id) orelse return diag.errClient(error.UnknownFileId);
-        if (file_info.value_ptr.directory) return diag.errClient(error.NotRegularFile);
+        const file_info = s.db.files.getPtr(file_id) orelse return diag.errClient(error.UnknownFileId);
+        switch (file_info.status) {
+            .new => std.debug.panic("TODO", .{}),
+            .synced => {},
+            .deleted => return diag.errClient(error.UnknownFileId),
+        }
+        if (file_info.directory) return diag.errClient(error.NotRegularFile);
 
         try locked.ensureUnusedRevision(diag);
         const history_needed_capacity = @sizeOf(network.history.Entry) +
             @sizeOf(network.history.Delete);
         s.db.history.ensureUnusedCapacity(s.allocator, history_needed_capacity) catch |err| return diag.errInternal(err);
+        s.events.delete.ensureUnusedCapacity(s.allocator, 1) catch |err| return diag.errInternal(err);
         errdefer comptime unreachable;
+
+        file_info.status = .deleted;
+
+        const parent_children = if (file_info.parent) |parent_file_id|
+            s.db.directory_file_info.getPtr(parent_file_id).?
+        else
+            &s.db.sync_dir_entry;
+        assert(parent_children.children.swapRemove(file_id));
+        assert(parent_children.children_by_component.swapRemove(file_info.component));
 
         var history_writer = Io.Writer.Allocating.fromArrayList(s.allocator, &s.db.history);
         defer {
@@ -568,17 +736,6 @@ const Locked = struct {
             _ = revision; // TODO
         }
         const history = &history_writer.writer;
-
-        const path = blk: {
-            defer s.db.files.removeByPtr(file_info.key_ptr);
-            assert(s.db.regular_file_info.remove(file_id));
-            const parent_children = if (file_info.value_ptr.parent) |parent_file_id|
-                &s.db.directory_file_info.getPtr(parent_file_id).?.children
-            else
-                &s.db.sync_dir_entry.children;
-            assert(parent_children.swapRemove(file_id));
-            break :blk file_info.value_ptr.path;
-        };
 
         history.writeInt(std.meta.Tag(network.history.Entry), @backingInt(network.history.Entry.delete), network.endian) catch unreachable;
         history.writeStruct(network.history.Delete{
@@ -586,38 +743,73 @@ const Locked = struct {
             .file_id = file_id,
         }, network.endian) catch unreachable;
 
-        return path;
+        s.events.queueDeleteEventAssumeCapacity(file_id, io);
     }
 
-    const DeleteGlobalDirError = error{ Client, Global, Internal } ||
-        switch (fairy.platform) {
-            .windows => error{},
-            .linux => Io.Cancelable,
-        };
-
+    /// Sets all files within a tree to the deleted status.
     fn deleteGlobalDir(
         locked: Locked,
-        file_id: network.FileId,
-        io: switch (fairy.platform) {
-            .windows => void,
-            .linux => Io,
-        },
+        root_file_id: network.FileId,
+        io: Io,
         diag: *Diagnostics,
-    ) DeleteGlobalDirError!void {
-        // TODO: Perform the filesystem deletion separately from the in-memory deletion
+    ) error{ Client, Global, Internal }!void {
         const s = locked.server;
+
+        const root_info = s.db.files.getPtr(root_file_id) orelse return diag.errClient(error.UnknownFileId);
+        switch (root_info.status) {
+            .new => std.debug.panic("TODO", .{}),
+            .synced => {},
+            .deleted => return diag.errClient(error.UnknownFileId),
+        }
+        if (!root_info.directory) return diag.errClient(error.NotDirectoryFile);
+
+        try locked.ensureUnusedRevision(diag);
+        const history_needed_capacity = @sizeOf(network.history.Entry) +
+            @sizeOf(network.history.Delete);
+        s.db.history.ensureUnusedCapacity(s.allocator, history_needed_capacity) catch |err| return diag.errInternal(err);
+        s.events.delete.ensureUnusedCapacity(s.allocator, 1) catch |err| return diag.errInternal(err);
+        errdefer comptime unreachable;
+
+        root_info.status = .deleted;
 
         const Item = struct {
             children: []const network.FileId,
-            index: fairy.FileCount,
-            state: State,
-
-            const State = enum { iterate, delete };
+            index: fairy.FileCount = 0,
         };
-        var stack: [fairy.max_path_components]Item = undefined;
+        var buffer: [fairy.max_path_components]Item = undefined;
+        var stack = std.ArrayList(Item).initBuffer(&buffer);
+        stack.appendAssumeCapacity(.{ .children = s.db.directory_file_info.getPtr(root_file_id).?.children.keys() });
+        while (stack.lastPtr()) |item| {
+            if (item.index == item.children.len) {
+                _ = stack.pop();
+                continue;
+            }
 
-        const root_info = s.db.files.getEntry(file_id) orelse return diag.errClient(error.UnknownFileId);
-        if (!root_info.value_ptr.directory) return diag.errClient(error.NotDirectoryFile);
+            const file_id = item.children[item.index];
+            item.index += 1;
+            const info = s.db.files.getPtr(file_id).?;
+            switch (info.status) {
+                .new => std.debug.panic("TODO", .{}),
+                .synced => info.status = .deleted,
+                .deleted => continue,
+            }
+            // TODO: cancel sync events
+
+            if (info.directory) {
+                const dir_info = s.db.directory_file_info.getPtr(file_id).?;
+                const children = dir_info.children.keys();
+                if (children.len != 0) {
+                    stack.appendAssumeCapacity(.{ .children = children });
+                }
+            }
+        }
+
+        const parent_dir_info = if (root_info.parent) |parent_file_id|
+            s.db.directory_file_info.getPtr(parent_file_id).?
+        else
+            &s.db.sync_dir_entry;
+        assert(parent_dir_info.children.swapRemove(root_file_id));
+        assert(parent_dir_info.children_by_component.swapRemove(root_info.component));
 
         var history_writer = Io.Writer.Allocating.fromArrayList(s.allocator, &s.db.history);
         defer {
@@ -627,77 +819,12 @@ const Locked = struct {
         }
         const history = &history_writer.writer;
 
-        try locked.ensureUnusedRevision(diag);
-        const history_needed_capacity = @sizeOf(network.history.Entry) +
-            @sizeOf(network.history.Delete);
-        history_writer.ensureUnusedCapacity(history_needed_capacity) catch |err| return diag.errInternal(err);
-        errdefer std.debug.panic("TODO: Forbid errors after this point", .{});
-
-        const root_dir_entry = s.db.directory_file_info.getEntry(file_id).?;
-        stack[0] = .{ .children = root_dir_entry.value_ptr.children.keys(), .index = 0, .state = .iterate };
-
-        var stack_len: fairy.PathComponentCount = 1;
-        while (stack_len > 0) {
-            const item = &stack[stack_len - 1];
-            if (item.index == item.children.len) {
-                item.* = undefined;
-                stack_len -= 1;
-                continue;
-            }
-
-            const child_file_id = item.children[item.index];
-            const child_info = s.db.files.getEntry(child_file_id).?;
-
-            if (child_info.value_ptr.directory and item.state == .iterate) enter_dir: {
-                const dir_entry = s.db.directory_file_info.getPtr(child_file_id).?;
-                const children = dir_entry.children.keys();
-                if (children.len == 0) break :enter_dir;
-
-                item.state = .delete;
-                stack[stack_len] = .{ .children = children, .index = 0, .state = .iterate };
-                stack_len += 1;
-                continue;
-            }
-
-            switch (fairy.platform) {
-                .windows => fairy.windows.deleteFile(s.sync_dir, child_info.value_ptr.path) catch |err| return diag.errInternal(err),
-                .linux => s.sync_dir.deleteFile(io, child_info.value_ptr.path.slice) catch |err| return diag.errInternal(err),
-            }
-
-            if (child_info.value_ptr.directory) {
-                item.state = .iterate;
-                assert(s.db.directory_file_info.remove(child_file_id));
-            } else {
-                assert(s.db.regular_file_info.remove(child_file_id));
-            }
-            s.db.files.removeByPtr(child_info.key_ptr);
-
-            item.index += 1;
-        }
-
-        switch (fairy.platform) {
-            .windows => fairy.windows.deleteFile(s.sync_dir, root_info.value_ptr.path) catch |err| return diag.errInternal(err),
-            .linux => s.sync_dir.deleteDir(io, root_info.value_ptr.path.slice) catch |err| return diag.errInternal(err),
-        }
-
-        const parent_children = if (root_info.value_ptr.parent) |parent_file_id|
-            &s.db.directory_file_info.getPtr(parent_file_id).?.children
-        else
-            &s.db.sync_dir_entry.children;
-        const parent_children_by_component = if (root_info.value_ptr.parent) |parent_file_id|
-            &s.db.directory_file_info.getPtr(parent_file_id).?.children_by_component
-        else
-            &s.db.sync_dir_entry.children_by_component;
-        assert(parent_children.swapRemove(file_id));
-        assert(parent_children_by_component.swapRemove(root_info.value_ptr.component));
-        s.db.files.removeByPtr(root_info.key_ptr);
-        s.db.directory_file_info.removeByPtr(root_dir_entry.key_ptr);
-
         history.writeInt(std.meta.Tag(network.history.Entry), @backingInt(network.history.Entry.delete), network.endian) catch unreachable;
         history.writeStruct(network.history.Delete{
             .kind = .directory,
-            .file_id = file_id,
+            .file_id = root_file_id,
         }, network.endian) catch unreachable;
+        s.events.queueDeleteEventAssumeCapacity(root_file_id, io);
     }
 };
 
@@ -1120,6 +1247,16 @@ pub const MessageThread = union(enum) {
                     };
                     defer fairy.windows.closeHandle(handle);
                     try fairy.windows.receiveFile(reader.io, handle, file_size);
+                    {
+                        const locked = try host.server.lock(io);
+                        defer locked.unlock(io);
+                        const info = locked.server.db.files.getPtr(file_id) orelse std.debug.panic("TODO", .{});
+                        switch (info.status) {
+                            .new => info.status = .synced,
+                            .synced => {},
+                            .deleted => {},
+                        }
+                    }
                 },
                 .linux => {
                     const file_size = try reader.receiveFileSize();
@@ -1181,19 +1318,15 @@ pub const MessageThread = union(enum) {
             reader: network.Reader,
         ) !void {
             const file_id = try reader.receiveFileId();
-            const path = blk: {
+            {
                 const locked = try host.server.lock(io);
                 defer locked.unlock(io);
                 var diag: Server.Diagnostics = undefined;
-                break :blk locked.deleteGlobalFile(file_id, &diag) catch |err| switch (err) {
-                    error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
+                locked.deleteGlobalFile(file_id, io, &diag) catch |err| switch (err) {
                     error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
+                    error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
                     error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
                 };
-            };
-            switch (fairy.platform) {
-                .windows => try fairy.windows.deleteFile(host.server.sync_dir, path),
-                .linux => try host.server.sync_dir.deleteFile(io, path.slice),
             }
 
             const data: MessageThread = .{
@@ -1229,19 +1362,11 @@ pub const MessageThread = union(enum) {
                 const locked = try host.server.lock(io);
                 defer locked.unlock(io);
                 var diag: Server.Diagnostics = undefined;
-                switch (fairy.platform) {
-                    .windows => locked.deleteGlobalDir(file_id, {}, &diag) catch |err| switch (err) {
-                        error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
-                        error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
-                        error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
-                    },
-                    .linux => locked.deleteGlobalDir(file_id, io, &diag) catch |err| switch (err) {
-                        error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
-                        error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
-                        error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
-                        error.Canceled => |e| return e,
-                    },
-                }
+                locked.deleteGlobalDir(file_id, io, &diag) catch |err| switch (err) {
+                    error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
+                    error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
+                    error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
+                };
             }
 
             const data: MessageThread = .{

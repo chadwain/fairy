@@ -723,6 +723,8 @@ const scan = struct {
             try parent_paths.append(scan_arena.allocator(), null);
 
             var open_dir_handles: std.ArrayList(w.HANDLE) = .empty;
+            // TODO: We should clone the sync dir handle to avoid issues with
+            //       doing multiple queries on the handle
             try open_dir_handles.append(scan_arena.allocator(), locked.db.sync_dir);
 
             return .{

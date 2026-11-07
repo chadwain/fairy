@@ -55,16 +55,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 };
 
                 const U = union(enum) {
+                    loop: @typeInfo(@TypeOf(fairy.Server.eventLoop)).@"fn".return_type.?,
                     cli: @typeInfo(@TypeOf(runServerCli)).@"fn".return_type.?,
                     host: @typeInfo(@TypeOf(startHost)).@"fn".return_type.?,
                 };
-                var buffer: [2]U = undefined;
+                var buffer: [3]U = undefined;
                 var select = Io.Select(U).init(io, &buffer);
                 defer select.cancelDiscard();
 
+                try select.concurrent(.loop, fairy.Server.eventLoop, .{ &fairy_server, io });
                 try select.concurrent(.host, startHost, .{ io, &fairy_server, stream });
                 try select.concurrent(.cli, runServerCli, .{ io, &fairy_server });
                 switch (try select.await()) {
+                    .loop => continue,
                     .cli => |val| return try val,
                     .host => continue,
                 }

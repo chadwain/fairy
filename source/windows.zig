@@ -40,6 +40,7 @@ pub const Path = struct {
     }
 
     pub fn assumeValidPath(slice: []const u16) Path {
+        assert(isValidPath(slice));
         return .{ .slice = slice };
     }
 
@@ -445,8 +446,12 @@ pub fn createDir(parent: w.HANDLE, path: Path) !w.HANDLE {
 }
 
 pub fn openDir(parent: w.HANDLE, path: Path) !w.HANDLE {
+    return openDirRaw(parent, path.slice);
+}
+
+fn openDirRaw(parent: w.HANDLE, path: []const u16) !w.HANDLE {
     var handle: w.HANDLE = undefined;
-    var unicode_string = w.UNICODE_STRING.init(path.slice);
+    var unicode_string = w.UNICODE_STRING.init(path);
     const object_attributes: w.OBJECT.ATTRIBUTES = .{
         .Length = @sizeOf(w.OBJECT.ATTRIBUTES),
         .RootDirectory = parent,
@@ -599,7 +604,11 @@ extern "ntdll" fn NtDeleteFile(
 ) callconv(.winapi) w.NTSTATUS;
 
 pub fn deleteFile(parent: w.HANDLE, path: Path) !void {
-    var unicode_string: w.UNICODE_STRING = .init(path.slice);
+    try deleteFileRaw(parent, path.slice);
+}
+
+fn deleteFileRaw(parent: w.HANDLE, path: []const u16) !void {
+    var unicode_string: w.UNICODE_STRING = .init(path);
     const object_attributes: w.OBJECT.ATTRIBUTES = .{
         .Length = @sizeOf(w.OBJECT.ATTRIBUTES),
         .RootDirectory = parent,
@@ -615,6 +624,123 @@ pub fn deleteFile(parent: w.HANDLE, path: Path) !void {
         .SUCCESS => {},
         else => return w.unexpectedStatus(status),
     }
+}
+
+pub fn deleteTree(parent: w.HANDLE, path: Path, allocator: Allocator) !void {
+    // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_id_extd_both_dir_information
+    // TODO: see if there's a smaller query type
+    const nt_query_information_class: w.FILE.INFORMATION_CLASS = .IdBothDirectory;
+
+    // Corresponds to FILE_ID_BOTH_DIR_INFORMATION.
+    // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_id_both_dir_information
+    const NtQueryInformation = extern struct {
+        NextEntryOffset: w.ULONG,
+        FileIndex: w.ULONG,
+        CreationTime: w.LARGE_INTEGER,
+        LastAccessTime: w.LARGE_INTEGER,
+        LastWriteTime: w.LARGE_INTEGER,
+        ChangeTime: w.LARGE_INTEGER,
+        EndOfFile: w.LARGE_INTEGER,
+        AllocationSize: w.LARGE_INTEGER,
+        FileAttributes: w.FILE.ATTRIBUTE,
+        FileNameLength: w.ULONG,
+        EaSize: w.ULONG,
+        ShortNameLength: CCHAR,
+        ShortName: [12]w.WCHAR,
+        FileId: w.LARGE_INTEGER,
+        FileName: [1]w.WCHAR,
+
+        // https://learn.microsoft.com/en-us/windows/win32/winprog/windows-data-types
+        const CCHAR = w.CHAR;
+    };
+
+    const Item = struct {
+        handle: w.HANDLE,
+        buffer: [512]u8 align(@alignOf(NtQueryInformation)) = undefined,
+        index: ?w.ULONG = null,
+        restart_scan: w.BOOLEAN = .TRUE,
+        state: enum { enter, exit } = .enter,
+    };
+
+    var stack: std.ArrayList(Item) = .empty; // TODO initCapacity
+    defer {
+        for (stack.items) |item| closeHandle(item.handle);
+        stack.deinit(allocator);
+    }
+
+    {
+        try stack.ensureUnusedCapacity(allocator, 1);
+        const handle = try openDir(parent, path);
+        stack.appendAssumeCapacity(.{ .handle = handle });
+    }
+    var io_status_block: w.IO_STATUS_BLOCK = undefined;
+    while (stack.lastPtr()) |item| {
+        if (item.index == null) {
+            const status = w.ntdll.NtQueryDirectoryFile(
+                item.handle,
+                null,
+                null,
+                null,
+                &io_status_block,
+                &item.buffer,
+                item.buffer.len,
+                nt_query_information_class,
+                .FALSE,
+                null,
+                item.restart_scan,
+            );
+            switch (status) {
+                .NO_MORE_FILES => {
+                    closeHandle(item.handle);
+                    _ = stack.pop();
+                    continue;
+                },
+                .BUFFER_OVERFLOW => return error.NtBufferOverflow,
+                .SUCCESS => {
+                    if (io_status_block.Information == 0) return error.NtBufferOverflow;
+                    item.restart_scan = .FALSE;
+                    item.index = 0;
+                },
+                else => return w.unexpectedStatus(status),
+            }
+        }
+
+        const info: *const NtQueryInformation = @ptrCast(@alignCast(&item.buffer[item.index.?]));
+        const offset_of_file_name = @offsetOf(NtQueryInformation, "FileName");
+        const file_name_bytes = item.buffer[item.index.? + offset_of_file_name ..][0..info.FileNameLength];
+        const file_name: []const u16 = @ptrCast(@alignCast(file_name_bytes));
+
+        const wtf16 = std.unicode.wtf8ToWtf16LeStringLiteral;
+        if (std.mem.eql(u16, file_name, comptime wtf16(".")) or
+            std.mem.eql(u16, file_name, comptime wtf16("..")))
+        {
+            item.index = if (info.NextEntryOffset != 0) item.index.? + info.NextEntryOffset else null;
+            continue;
+        }
+
+        if (info.FileAttributes.DIRECTORY) {
+            switch (item.state) {
+                .enter => {
+                    const handle = item.handle;
+                    item.state = .exit;
+                    try stack.ensureUnusedCapacity(allocator, 1);
+                    const child_handle = try openDirRaw(handle, file_name);
+                    stack.appendAssumeCapacity(.{ .handle = child_handle });
+                    continue;
+                },
+                .exit => {
+                    item.state = .enter;
+                    try deleteFileRaw(item.handle, file_name);
+                },
+            }
+        } else {
+            try deleteFileRaw(item.handle, file_name);
+        }
+
+        item.index = if (info.NextEntryOffset != 0) item.index.? + info.NextEntryOffset else null;
+    }
+
+    try deleteFile(parent, path);
 }
 
 pub const SendFileError = Io.Writer.Error || Io.UnexpectedError;
