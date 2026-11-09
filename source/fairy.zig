@@ -6,7 +6,7 @@ pub const windows = @import("windows.zig");
 
 pub const log = @import("std").log.scoped(.fairy);
 
-pub const Platform = enum { windows, linux };
+pub const Platform = enum(u8) { windows, linux };
 
 pub const platform: Platform = switch (@import("builtin").target.os.tag) {
     .windows => .windows,

@@ -236,11 +236,16 @@ pub const Database = struct {
 
         db.host_pending_event.store(true, .release);
         db.setHostAlert(.client_event);
-        io.futexWake(u32, &db.host_alert.raw, 1);
+        db.wakeHost(io);
     }
 
     fn setHostAlert(db: *Database, comptime alert: Host.Alert) void {
-        _ = db.host_alert.bitSet(@backingInt(alert), .release);
+        _ = db.host_alert.bitSet(@backingInt(alert), .monotonic);
+    }
+
+    fn wakeHost(db: *Database, io: Io) void {
+        assert(db.host_alert.load(.monotonic) != 0);
+        io.futexWake(u32, &db.host_alert.raw, 1);
     }
 
     fn wake(db: *Database, io: Io) void {
@@ -530,6 +535,12 @@ pub const LockedDatabase = struct {
 
         _, const should_alert = locked.db.setNextAutoScanDeadline(Io.Clock.Timestamp.now(io, Database.clock).addDuration(Database.max_wait_time));
         if (should_alert) locked.db.setAlert(.new_scan_deadline);
+    }
+
+    pub fn getRegularFilePath(locked: LockedDatabase, file_id: network.FileId) !Path {
+        const file_info = locked.db.global_fs.files.getPtr(file_id) orelse return error.FileDoesNotExist;
+        if (file_info.directory) return error.NotRegularFile;
+        return file_info.path;
     }
 
     // called from Host
@@ -1392,6 +1403,8 @@ pub const Host = struct {
     server_platform: fairy.Platform,
     mt: MessageThread,
     mt_status: std.atomic.Value(MtStatus),
+    sync_request_file_id: network.FileId,
+    sync_file_response_status: std.atomic.Value(FileSyncStatus),
     // TODO: Don't store this here, instead make it an argument to `run`
     db: *Database,
     debug: Debug,
@@ -1399,6 +1412,7 @@ pub const Host = struct {
     pub const Alert = enum(u32) {
         thread_reply,
         client_event,
+        sync_file,
     };
 
     pub const MtStatus = enum(u32) {
@@ -1410,6 +1424,12 @@ pub const Host = struct {
         transmitting,
         /// The message thread is locked and owned by the incoming task.
         incoming,
+    };
+
+    pub const FileSyncStatus = enum(u32) {
+        done,
+        starting,
+        transmitting,
     };
 
     pub const ClientEvent = enum {
@@ -1429,6 +1449,8 @@ pub const Host = struct {
             .server_platform = undefined,
             .mt = undefined,
             .mt_status = .init(.unlocked),
+            .sync_request_file_id = undefined,
+            .sync_file_response_status = .init(.done),
             .db = db,
             .debug = debug,
         };
@@ -1451,7 +1473,7 @@ pub const Host = struct {
         recv_error: ?ReceiveMessagesError = null,
     };
 
-    /// Blocks until canceled.
+    /// Blocks until cancelation or client/server disconnection.
     pub fn run(
         host: *Host,
         diag: ?*Diagnostics,
@@ -1508,7 +1530,7 @@ pub const Host = struct {
 
         while (true) {
             try io.futexWait(u32, &host.db.host_alert.raw, 0);
-            const alert = host.db.host_alert.swap(0, .acquire);
+            const alert = host.db.host_alert.swap(0, .monotonic);
             inline for (comptime std.enums.values(Alert)) |value| {
                 const mask: u32 = 1 << @backingInt(value);
                 if (alert & mask != 0) switch (value) {
@@ -1519,6 +1541,9 @@ pub const Host = struct {
                     .client_event => {
                         assert(host.db.host_pending_event.load(.acquire));
                         try host.processClientEvent(io, writer);
+                    },
+                    .sync_file => {
+                        try host.syncFile(io, writer);
                     },
                 };
             }
@@ -1607,12 +1632,11 @@ pub const Host = struct {
         InvalidAction,
         InvalidHeader,
         UnexpectedIncomingMessage,
+        MultipleSyncFileRequests,
     } ||
         network.Reader.ReceivePlatformError ||
         network.Reader.ReceiveActionError ||
-        network.Reader.ReceiveCreateDirResponseError ||
         network.Reader.ReceiveMessageHeaderError ||
-        network.Reader.ReceiveResolvePathResponseError ||
         Io.Cancelable ||
         Allocator.Error ||
         fairy.windows.ReceiveFileError;
@@ -1621,11 +1645,7 @@ pub const Host = struct {
         host.log(.debug, "receiving on thread {}", .{std.os.windows.GetCurrentThreadId()});
 
         {
-            const platform = try reader.receivePlatform();
-            host.server_platform = switch (platform) {
-                .windows => .windows,
-                .linux => .linux,
-            };
+            host.server_platform = try reader.receivePlatform();
             host.setup.store(.send_ack, .release);
             io.futexWake(Setup, &host.setup.raw, 1);
 
@@ -1645,18 +1665,14 @@ pub const Host = struct {
             switch (header) {
                 .disconnect => break,
                 .new_thread => {
-                    const action = try reader.receiveAction();
-                    host.logNetworkAction(.incoming, action);
-
-                    switch (action) {
-                        else => return error.InvalidAction,
-                    }
+                    return error.InvalidAction;
                 },
                 .thread_reply => {
-                    while (true) : (try io.futexWait(MtStatus, &host.mt_status.raw, .incoming)) {
-                        switch (host.mt_status.load(.monotonic)) {
+                    while (true) {
+                        const mt_status = host.mt_status.load(.acquire);
+                        switch (mt_status) {
                             .unlocked, .outgoing => return error.UnexpectedIncomingMessage,
-                            .transmitting => continue,
+                            .transmitting => try io.futexWait(MtStatus, &host.mt_status.raw, mt_status),
                             .incoming => break,
                         }
                     }
@@ -1683,6 +1699,22 @@ pub const Host = struct {
                         },
                     }
                 },
+                .sync_file_request => {
+                    while (true) {
+                        switch (host.sync_file_response_status.load(.monotonic)) {
+                            .done => break,
+                            .starting => return error.MultipleSyncFileRequests,
+                            .transmitting => |value| try io.futexWait(FileSyncStatus, &host.sync_file_response_status.raw, value),
+                        }
+                    }
+                    host.sync_request_file_id = try reader.receiveFileId();
+                    assert(host.sync_file_response_status.cmpxchgStrong(.done, .starting, .release, .monotonic) == null);
+                    host.db.setHostAlert(.sync_file);
+                    host.db.wakeHost(io);
+                },
+                .sync_file_response => {
+                    return error.InvalidHeader;
+                },
             }
         }
     }
@@ -1701,7 +1733,7 @@ pub const Host = struct {
             .incoming => {
                 host.setMessageThreadStatus(.incoming, .outgoing);
                 host.db.setHostAlert(.thread_reply);
-                host.wakeSendTask(io);
+                host.db.wakeHost(io);
             },
             .outgoing => comptime unreachable,
             .transmitting => {
@@ -1716,17 +1748,52 @@ pub const Host = struct {
         host.setMessageThreadStatus(.incoming, .unlocked);
         if (host.db.host_pending_event.load(.monotonic)) {
             host.db.setHostAlert(.client_event);
-            host.wakeSendTask(io);
+            host.db.wakeHost(io);
         }
-    }
-
-    fn wakeSendTask(host: *Host, io: Io) void {
-        assert(host.db.host_alert.load(.monotonic) != 0);
-        io.futexWake(u32, &host.db.host_alert.raw, 1);
     }
 
     fn wakeReceiveTask(host: *Host, io: Io) void {
         io.futexWake(MtStatus, &host.mt_status.raw, 1);
+    }
+
+    fn syncFile(host: *Host, io: Io, writer: network.Writer) !void {
+        assert(host.sync_file_response_status.load(.acquire) == .starting);
+
+        const file_id = host.sync_request_file_id;
+        host.log(.info, "syncing file: {f}", .{file_id});
+
+        const path = blk: {
+            const locked = try host.db.lock(io);
+            defer locked.unlock(io);
+            break :blk locked.getRegularFilePath(file_id) catch |err| switch (err) {
+                error.FileDoesNotExist, error.NotRegularFile => std.debug.panic("TODO", .{}),
+            };
+        };
+        const file = try fairy.windows.openFile(host.db.sync_dir, path, .read);
+        defer fairy.windows.closeHandle(file);
+
+        // TODO update the database with this new size information
+        const file_size = blk: {
+            const windows_size = try getFileSize(file);
+            const casted_size = std.math.cast(network.FileSize, windows_size) orelse
+                std.debug.panic(
+                    "TODO: File too large to transfer: '{f}' with size {}",
+                    .{ file_id, windows_size },
+                );
+            break :blk casted_size;
+        };
+        const file_hash = network.FileHash{ .blake3 = @splat(0) }; // TODO: compute the hash while sending data
+
+        assert(host.sync_file_response_status.cmpxchgStrong(.starting, .transmitting, .acq_rel, .monotonic) == null);
+
+        try writer.sendFileSize(file_size);
+        try fairy.windows.sendFile(writer.io, file, file_size);
+        try writer.sendFileHash(&file_hash);
+        try writer.flush();
+        host.sync_request_file_id = undefined;
+
+        assert(host.sync_file_response_status.cmpxchgStrong(.transmitting, .done, .release, .monotonic) == null);
+        io.futexWake(FileSyncStatus, &host.sync_file_response_status.raw, 1);
     }
 
     fn log(host: *const Host, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype) void {
@@ -1807,44 +1874,28 @@ pub const MessageThread = union(enum) {
             assert(out_new_file.state == .receive_decision);
             if (action != .resolve_path_response) return error.InvalidAction;
 
-            const response = try reader.receiveResolvePathResponse();
-            switch (response) {
-                .success => {
-                    // TODO Store this in Database somewhere instead
-                    var file_id_buffer: [fairy.max_path_components]network.FileId = undefined;
-                    var file_id_list: std.ArrayList(network.FileId) = .initBuffer(&file_id_buffer);
-                    var it = out_new_file.path.pathIterator();
-                    while (it.next()) |_| {
-                        const ptr = file_id_list.addOneBounded() catch unreachable;
-                        ptr.* = try reader.receiveFileId();
-                    }
-
-                    {
-                        const locked = try host.db.lock(io);
-                        defer locked.unlock(io);
-                        try locked.setNewFileId(out_new_file.path, out_new_file.kind, file_id_list.items);
-                    }
-
-                    host.log(
-                        .info,
-                        "received {f} for file {f}",
-                        .{ file_id_list.items[file_id_list.items.len - 1], out_new_file.path.formatUtf8() },
-                    );
-                    host.finishClientEvent(io);
-                    host.deleteMessageThread(io);
-                },
-                .invalid_path,
-                .exhausted_file_ids,
-                .client_out_of_sync,
-                => {
-                    host.log(
-                        .err,
-                        "error '{s}' while resolving path {f}",
-                        .{ @tagName(response), out_new_file.path.formatUtf8() },
-                    );
-                    host.deleteMessageThread(io);
-                },
+            // TODO Store this in Database somewhere instead
+            var file_id_buffer: [fairy.max_path_components]network.FileId = undefined;
+            var file_id_list: std.ArrayList(network.FileId) = .initBuffer(&file_id_buffer);
+            var it = out_new_file.path.pathIterator();
+            while (it.next()) |_| {
+                const ptr = file_id_list.addOneBounded() catch unreachable;
+                ptr.* = try reader.receiveFileId();
             }
+
+            {
+                const locked = try host.db.lock(io);
+                defer locked.unlock(io);
+                try locked.setNewFileId(out_new_file.path, out_new_file.kind, file_id_list.items);
+            }
+
+            host.log(
+                .info,
+                "received {f} for file {f}",
+                .{ file_id_list.items[file_id_list.items.len - 1], out_new_file.path.formatUtf8() },
+            );
+            host.finishClientEvent(io);
+            host.deleteMessageThread(io);
         }
     };
 

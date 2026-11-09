@@ -21,7 +21,6 @@ next_file_id: ?std.meta.Tag(network.FileId),
 
 db: Database,
 events: Events,
-host_state: std.atomic.Value(Host.State),
 debug: Debug,
 
 pub fn initWindows(sync_dir_path: [:0]const u16, allocator: Allocator) !Server {
@@ -55,7 +54,6 @@ fn initCommon(sync_dir: DirHandle, allocator: Allocator) Server {
 
         .db = .init,
         .events = .init,
-        .host_state = .init(.{}),
         .debug = .{},
     };
 }
@@ -358,8 +356,10 @@ const Diagnostics = union {
     }
 };
 
-/// Opens a regular file for writing to. Creates parent directories as necessary.
-fn openRegularFileWindows(server: *Server, full_path: Path, file_size: w.LARGE_INTEGER) !w.HANDLE {
+/// Creates a regular file for writing to. Creates parent directories as necessary.
+fn createRegularFileWindows(server: *Server, full_path: Path, file_size: w.LARGE_INTEGER) !w.HANDLE {
+    // TODO: Take the parent dir as a parameter instead of the server
+    // TODO: We must check that the opened dirs have the same case as in `full_path`
     var it = full_path.backwardsPathIterator();
     const last_component = it.previousComponent().?;
     var is_sync_dir = it.empty();
@@ -399,8 +399,9 @@ fn openRegularFileWindows(server: *Server, full_path: Path, file_size: w.LARGE_I
     return handle;
 }
 
-/// Opens a regular file for writing to. Creates parent directories as necessary.
-fn openRegularFileLinux(server: *Server, full_path: Path, io: Io) !Io.File {
+/// Creates a regular file for writing to. Creates parent directories as necessary.
+fn createRegularFileLinux(server: *Server, full_path: Path, io: Io) !Io.File {
+    // TODO: Take the parent dir as a parameter instead of the server
     var it = full_path.backwardsPathIterator();
     const last_component = it.previousComponent().?;
     const top_level = it.empty();
@@ -415,7 +416,7 @@ fn openRegularFileLinux(server: *Server, full_path: Path, io: Io) !Io.File {
     defer if (!top_level) dir_handle.close(io);
     errdefer std.debug.panic("TODO: Delete intermediate directories and files", .{});
 
-    return try dir_handle.createFile(io, last_component.slice, .{});
+    return try dir_handle.createFile(io, last_component.slice, .{ .truncate = true });
 }
 
 pub const Debug = struct {
@@ -831,6 +832,7 @@ const Locked = struct {
 pub const Host = struct {
     setup: std.atomic.Value(Setup),
     mt: MessageThread,
+    mt_status: std.atomic.Value(MtStatus),
     // TODO: Don't store this here, instead make it an argument to `run`
     server: *Server,
     debug: Host.Debug,
@@ -845,26 +847,22 @@ pub const Host = struct {
         end,
     };
 
-    pub const State = packed struct(u32) {
-        mt: MtStatus = .init,
-        padding: u30 = 0,
-
-        pub const MtStatus = enum(u2) {
-            /// The message thread is free to use.
-            init,
-            /// The message thread is locked and being initialized.
-            acquired,
-            /// The message thread is locked and owned by the outgoing task.
-            outgoing,
-            /// The message thread is locked and owned by the incoming task.
-            incoming,
-        };
+    pub const MtStatus = enum(u32) {
+        /// The message thread is free to use.
+        init,
+        /// The message thread is locked and owned by the outgoing task.
+        outgoing,
+        /// The message thread is locked and owned by the outgoing task, which is currently transmitting data.
+        transmitting,
+        /// The message thread is locked and owned by the incoming task.
+        incoming,
     };
 
     pub fn init(server: *Server, debug: Host.Debug) Host {
         return .{
             .setup = .init(.send_platform),
             .mt = undefined,
+            .mt_status = .init(.init),
             .server = server,
             .debug = debug,
         };
@@ -920,10 +918,7 @@ pub const Host = struct {
 
     fn sendOutgoingMessages(host: *Host, writer: network.Writer, io: Io) SendError!void {
         {
-            try writer.sendPlatform(switch (fairy.platform) {
-                .windows => .windows,
-                .linux => .linux,
-            });
+            try writer.sendPlatform(fairy.platform);
             try writer.flush();
             host.setup.store(.recv_ack, .release);
             io.futexWake(Setup, &host.setup.raw, 1);
@@ -939,9 +934,9 @@ pub const Host = struct {
 
         while (true) {
             while (true) {
-                const state = host.server.host_state.load(.monotonic);
-                if (state.mt == .outgoing) break;
-                try io.futexWait(State, &host.server.host_state.raw, state);
+                const mt_status = host.mt_status.load(.acquire);
+                if (mt_status == .outgoing) break;
+                try io.futexWait(MtStatus, &host.mt_status.raw, mt_status);
             }
 
             switch (host.mt) {
@@ -1000,13 +995,19 @@ pub const Host = struct {
 
         while (true) {
             const header = try reader.receiveMessageHeader();
-            if (header == .disconnect) break;
-            const action = try reader.receiveAction();
-            host.logMessage(.incoming, action);
-
             switch (header) {
-                .disconnect => unreachable,
+                .disconnect => break,
                 .new_thread => {
+                    while (host.mt_status.cmpxchgStrong(.init, .incoming, .acquire, .monotonic)) |current_value| {
+                        switch (current_value) {
+                            .init, .incoming => unreachable,
+                            .outgoing => return error.UnexpectedIncomingMessage,
+                            .transmitting => try io.futexWait(MtStatus, &host.mt_status.raw, .transmitting),
+                        }
+                    }
+
+                    const action = try reader.receiveAction();
+                    host.logMessage(.incoming, action);
                     switch (action) {
                         .resolve_path => {
                             try MessageThread.InNewFile.initMessageThread(host, io, reader);
@@ -1024,72 +1025,93 @@ pub const Host = struct {
                     }
                 },
                 .thread_reply => {
-                    if (host.server.host_state.load(.monotonic).mt != .incoming) return error.UnexpectedIncomingMessage;
-
-                    switch (host.mt) {
-                        .in_new_file => unreachable,
-                        .in_file_contents => unreachable,
-                        .in_delete_file => unreachable,
-                        .in_delete_dir => unreachable,
-                    }
+                    return error.UnexpectedIncomingMessage;
                 },
+                .sync_file_request => {
+                    return error.UnexpectedIncomingMessage;
+                },
+                .sync_file_response => std.debug.panic("TODO", .{}),
             }
         }
     }
 
-    fn queueOutgoingMessage(host: *Host, io: Io, data: MessageThread) void {
-        host.acquireMessageThread() orelse std.debug.panic("TODO: Message thread could not be acquired", .{});
-
+    fn setOutgoingMessage(host: *Host, io: Io, data: MessageThread) void {
         host.mt = data;
-
-        host.releaseNewMessageThreadStatus(.acquired, .outgoing);
-        io.futexWake(State, &host.server.host_state.raw, 1);
+        assert(host.mt_status.cmpxchgStrong(.incoming, .outgoing, .release, .monotonic) == null);
+        io.futexWake(MtStatus, &host.mt_status.raw, 1);
     }
 
-    fn flipMessageThreadOwner(host: *Host, comptime to: State.MtStatus, io: Io) void {
-        switch (to) {
-            .init, .acquired => comptime unreachable,
-            .outgoing => {
-                host.releaseNewMessageThreadStatus(.incoming, to);
-                io.futexWake(State, &host.server.host_state.raw, 1);
-            },
-            .incoming => {
-                host.releaseNewMessageThreadStatus(.outgoing, to);
-            },
-        }
+    fn beginTransmitting(host: *Host) void {
+        assert(host.mt_status.cmpxchgStrong(.outgoing, .transmitting, .acq_rel, .monotonic) == null);
     }
 
-    fn deleteMessageThread(host: *Host, expected_status: State.MtStatus, io: Io) void {
+    fn deleteMessageThread(host: *Host, io: Io) void {
         host.mt = undefined;
-        host.releaseNewMessageThreadStatus(expected_status, .init);
-
-        switch (expected_status) {
-            .init, .acquired => unreachable,
-            .outgoing => {},
-            .incoming => io.futexWake(State, &host.server.host_state.raw, 1),
-        }
+        assert(host.mt_status.cmpxchgStrong(.transmitting, .init, .release, .monotonic) == null);
+        io.futexWake(MtStatus, &host.mt_status.raw, 1);
     }
 
-    /// Returns null if it could not be acquired.
-    fn acquireMessageThread(host: *Host) ?void {
-        // TODO switch to using simple atomic stores/loads
-        var old_state = host.server.host_state.load(.monotonic);
-        while (old_state.mt == .init) {
-            var new_state = old_state;
-            new_state.mt = .acquired;
-            old_state = host.server.host_state.cmpxchgWeak(old_state, new_state, .acquire, .monotonic) orelse break;
-        } else return null;
-    }
+    fn receiveSyncFileResponse(host: *Host, io: Io, reader: network.Reader) !void {
+        const file_id = try reader.receiveFileId();
 
-    fn releaseNewMessageThreadStatus(host: *Host, expected: State.MtStatus, new: State.MtStatus) void {
-        // TODO switch to using simple atomic stores/loads
-        var old_state = host.server.host_state.load(.monotonic);
-        while (true) {
-            assert(old_state.mt == expected);
-            var new_state = old_state;
-            new_state.mt = new;
-            old_state = host.server.host_state.cmpxchgWeak(old_state, new_state, .release, .monotonic) orelse break;
+        // TODO: Open a temporary file instead
+        switch (fairy.platform) {
+            .windows => {
+                const file_size = blk: {
+                    const file_size = try reader.receiveFileSize();
+                    const windows_size = std.math.cast(w.LARGE_INTEGER, file_size) orelse return error.InvalidFileSize;
+                    break :blk windows_size;
+                };
+                const path = blk: {
+                    const locked = try host.server.lock(io);
+                    defer locked.unlock(io);
+                    var diag: Server.Diagnostics = undefined;
+                    break :blk locked.getRegularFilePath(file_id, &diag) catch |err| switch (err) {
+                        error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
+                    };
+                };
+                const handle = host.server.createRegularFileWindows(path, file_size) catch |err| switch (err) {
+                    error.Unexpected => |e| return e,
+                };
+                defer fairy.windows.closeHandle(handle);
+                try fairy.windows.receiveFile(reader.io, handle, file_size);
+                {
+                    const locked = try host.server.lock(io);
+                    defer locked.unlock(io);
+                    const info = locked.server.db.files.getPtr(file_id) orelse std.debug.panic("TODO", .{});
+                    switch (info.status) {
+                        .new => info.status = .synced,
+                        .synced => {},
+                        .deleted => {},
+                    }
+                }
+            },
+            .linux => {
+                const file_size = try reader.receiveFileSize();
+                const path = blk: {
+                    const locked = try host.server.lock(io);
+                    defer locked.unlock(io);
+                    var diag: Server.Diagnostics = undefined;
+                    break :blk locked.getRegularFilePath(file_id, &diag) catch |err| switch (err) {
+                        error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
+                    };
+                };
+                const file = host.server.createRegularFileLinux(path, io) catch |err| switch (err) {
+                    else => |e| return e,
+                };
+                defer file.close(io);
+                var file_write_buffer: [512]u8 = undefined;
+                var file_writer = file.writer(io, &file_write_buffer);
+                reader.io.streamExact(&file_writer.interface, file_size) catch |err| switch (err) {
+                    error.WriteFailed => return file_writer.err.?,
+                    error.ReadFailed, error.EndOfStream => |e| return e,
+                };
+                file_writer.interface.flush() catch return file_writer.err.?;
+            },
         }
+        const file_hash = try reader.receiveFileHash();
+        _ = file_hash; // TODO
+
     }
 
     fn debugLog(host: *const Host, comptime fmt: []const u8, args: anytype) void {
@@ -1098,11 +1120,11 @@ pub const Host = struct {
 
     fn logMessage(
         host: *const Host,
-        comptime mt_status: Host.State.MtStatus,
+        comptime mt_status: MtStatus,
         action: network.Action,
     ) void {
         switch (mt_status) {
-            .init, .acquired => unreachable,
+            .init, .transmitting => comptime unreachable,
             .outgoing => host.debugLog("outgoing: {s}", .{@tagName(action)}),
             .incoming => host.debugLog("incoming: {s}", .{@tagName(action)}),
         }
@@ -1116,7 +1138,7 @@ pub const MessageThread = union(enum) {
     in_delete_dir: InDeleteDir,
 
     pub const InNewFile = struct {
-        data: NewFileResult,
+        result: network.FileId,
 
         pub const NewFileResult = union(network.ResolvePathResponse) {
             success: network.FileId,
@@ -1138,38 +1160,27 @@ pub const MessageThread = union(enum) {
 
             var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
             const path = switch (fairy.platform) {
-                .windows => reader.receiveWindowsPath(path_byte_count, &file_path_buffer),
-                .linux => reader.receiveLinuxPath(path_byte_count, &file_path_buffer),
-            } catch |err| switch (err) {
-                error.InvalidPath => {
-                    const data: MessageThread = .{
-                        .in_new_file = .{
-                            .data = .invalid_path,
-                        },
-                    };
-                    return host.queueOutgoingMessage(io, data);
-                },
-                error.ReadFailed, error.EndOfStream => |e| return e,
+                .windows => try reader.receiveWindowsPath(path_byte_count, &file_path_buffer),
+                .linux => try reader.receiveLinuxPath(path_byte_count, &file_path_buffer),
+            };
+            const file_id = blk: {
+                const locked = try host.server.lock(io);
+                defer locked.unlock(io);
+
+                var diag: Server.Diagnostics = undefined;
+                break :blk locked.newFile(path, kind, &diag) catch |err| switch (err) {
+                    error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
+                    error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
+                    error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
+                };
             };
 
             const data: MessageThread = .{
                 .in_new_file = .{
-                    .data = blk: {
-                        const locked = try host.server.lock(io);
-                        defer locked.unlock(io);
-
-                        var diag: Server.Diagnostics = undefined;
-                        break :blk if (locked.newFile(path, kind, &diag)) |file_id|
-                            .{ .success = file_id }
-                        else |err| switch (err) {
-                            error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
-                            error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
-                            error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
-                        };
-                    },
+                    .result = file_id,
                 },
             };
-            host.queueOutgoingMessage(io, data);
+            host.setOutgoingMessage(io, data);
         }
 
         fn sendDecision(
@@ -1181,36 +1192,23 @@ pub const MessageThread = union(enum) {
             const action: network.Action = .resolve_path_response;
             host.logMessage(.outgoing, action);
 
-            switch (in_new_file.data) {
-                .success => |file_id| {
-                    var reverse_file_ids_buffer: [fairy.max_path_components]network.FileId = undefined;
-                    const reversed_file_id_path = blk: {
-                        const locked = try host.server.lock(io);
-                        defer locked.unlock(io);
-                        break :blk locked.getReverseFileIdPath(file_id, &reverse_file_ids_buffer);
-                    };
+            var reverse_file_ids_buffer: [fairy.max_path_components]network.FileId = undefined;
+            const reversed_file_id_path = blk: {
+                const locked = try host.server.lock(io);
+                defer locked.unlock(io);
+                break :blk locked.getReverseFileIdPath(in_new_file.result, &reverse_file_ids_buffer);
+            };
 
-                    host.deleteMessageThread(.outgoing, io);
+            host.beginTransmitting();
 
-                    try writer.sendMessageHeader(.thread_reply);
-                    try writer.sendAction(action);
-                    try writer.sendResolvePathResponse(.success);
-                    for (0..reversed_file_id_path.len) |index| {
-                        try writer.sendFileId(reversed_file_id_path[reversed_file_id_path.len - 1 - index]);
-                    }
-                },
-                .invalid_path,
-                .exhausted_file_ids,
-                .client_out_of_sync,
-                => {
-                    host.deleteMessageThread(.outgoing, io);
-
-                    try writer.sendMessageHeader(.thread_reply);
-                    try writer.sendAction(action);
-                    try writer.sendResolvePathResponse(in_new_file.data);
-                },
+            try writer.sendMessageHeader(.thread_reply);
+            try writer.sendAction(action);
+            for (0..reversed_file_id_path.len) |index| {
+                try writer.sendFileId(reversed_file_id_path[reversed_file_id_path.len - 1 - index]);
             }
             try writer.flush();
+
+            host.deleteMessageThread(io);
         }
     };
 
@@ -1242,7 +1240,7 @@ pub const MessageThread = union(enum) {
                             error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
                         };
                     };
-                    const handle = host.server.openRegularFileWindows(path, file_size) catch |err| switch (err) {
+                    const handle = host.server.createRegularFileWindows(path, file_size) catch |err| switch (err) {
                         error.Unexpected => |e| return e,
                     };
                     defer fairy.windows.closeHandle(handle);
@@ -1268,7 +1266,7 @@ pub const MessageThread = union(enum) {
                             error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
                         };
                     };
-                    const file = host.server.openRegularFileLinux(path, io) catch |err| switch (err) {
+                    const file = host.server.createRegularFileLinux(path, io) catch |err| switch (err) {
                         else => |e| return e,
                     };
                     defer file.close(io);
@@ -1289,7 +1287,7 @@ pub const MessageThread = union(enum) {
                     .result = .success,
                 },
             };
-            host.queueOutgoingMessage(io, data);
+            host.setOutgoingMessage(io, data);
         }
 
         fn sendResult(
@@ -1303,11 +1301,14 @@ pub const MessageThread = union(enum) {
                 .failure => .transfer_file_failure,
             };
             host.logMessage(.outgoing, action);
-            host.deleteMessageThread(.outgoing, io);
+
+            host.beginTransmitting();
 
             try writer.sendMessageHeader(.thread_reply);
             try writer.sendAction(action);
             try writer.flush();
+
+            host.deleteMessageThread(io);
         }
     };
 
@@ -1332,7 +1333,7 @@ pub const MessageThread = union(enum) {
             const data: MessageThread = .{
                 .in_delete_file = .{},
             };
-            host.queueOutgoingMessage(io, data);
+            host.setOutgoingMessage(io, data);
         }
 
         fn sendConfirmation(
@@ -1343,11 +1344,14 @@ pub const MessageThread = union(enum) {
         ) !void {
             const action: network.Action = .delete_file_confirm;
             host.logMessage(.outgoing, action);
-            host.deleteMessageThread(.outgoing, io);
+
+            host.beginTransmitting();
 
             try writer.sendMessageHeader(.thread_reply);
             try writer.sendAction(action);
             try writer.flush();
+
+            host.deleteMessageThread(io);
         }
     };
 
@@ -1372,7 +1376,7 @@ pub const MessageThread = union(enum) {
             const data: MessageThread = .{
                 .in_delete_dir = .{},
             };
-            host.queueOutgoingMessage(io, data);
+            host.setOutgoingMessage(io, data);
         }
 
         fn sendConfirmation(
@@ -1383,11 +1387,14 @@ pub const MessageThread = union(enum) {
         ) !void {
             const action: network.Action = .delete_dir_confirm;
             host.logMessage(.outgoing, action);
-            host.deleteMessageThread(.outgoing, io);
+
+            host.beginTransmitting();
 
             try writer.sendMessageHeader(.thread_reply);
             try writer.sendAction(action);
             try writer.flush();
+
+            host.deleteMessageThread(io);
         }
     };
 };

@@ -13,6 +13,11 @@ pub const MessageHeader = enum(u8) {
     new_thread,
     /// Sent on any subsequent messages from the host in the same message thread.
     thread_reply,
+    /// Sent by the server to a client.
+    /// This is followed by a `FileId`.
+    sync_file_request,
+    /// Sent by a client in response to a `sync_file_request`.
+    sync_file_response,
 };
 
 pub const Action = enum(u8) {
@@ -37,11 +42,6 @@ pub const Action = enum(u8) {
 
     delete_dir,
     delete_dir_confirm,
-};
-
-pub const Platform = enum(u8) {
-    windows,
-    linux,
 };
 
 pub const ack: u32 = 0xF0F0F0F0;
@@ -99,20 +99,6 @@ pub const PathByteCount = u16;
 
 pub const FilePathBuffer = [1 << @bitSizeOf(PathByteCount)]u8;
 
-pub const ResolvePathResponse = enum(u8) {
-    success,
-    invalid_path,
-    exhausted_file_ids,
-    client_out_of_sync,
-};
-
-pub const CreateDirResponse = enum(u8) {
-    success,
-    not_a_directory,
-    unknown_file,
-    unexpected,
-};
-
 pub const min_reader_writer_buffer_size = FileHash.byte_size;
 
 pub const Writer = struct {
@@ -140,8 +126,8 @@ pub const Writer = struct {
         try writer.io.writeInt(@TypeOf(ack), ack, endian);
     }
 
-    pub fn sendPlatform(writer: Writer, platform: Platform) Io.Writer.Error!void {
-        try writer.writeEnum(Platform, platform);
+    pub fn sendPlatform(writer: Writer, platform: fairy.Platform) Io.Writer.Error!void {
+        try writer.writeEnum(fairy.Platform, platform);
     }
 
     pub fn sendAction(writer: Writer, action: Action) !void {
@@ -180,14 +166,6 @@ pub const Writer = struct {
     pub fn sendLinuxPath(writer: Writer, path: fairy.linux.Path) Io.Writer.Error!void {
         try writer.io.writeAll(path.slice);
     }
-
-    pub fn sendResolvePathResponse(writer: Writer, response: ResolvePathResponse) Io.Writer.Error!void {
-        try writer.writeEnum(ResolvePathResponse, response);
-    }
-
-    pub fn sendCreateDirResponse(writer: Writer, response: CreateDirResponse) Io.Writer.Error!void {
-        try writer.writeEnum(CreateDirResponse, response);
-    }
 };
 
 pub const Reader = struct {
@@ -219,8 +197,8 @@ pub const Reader = struct {
 
     pub const ReceivePlatformError = error{UnknownPlatform} || Io.Reader.Error;
 
-    pub fn receivePlatform(reader: Reader) ReceivePlatformError!Platform {
-        return try reader.readEnum(Platform) orelse error.UnknownPlatform;
+    pub fn receivePlatform(reader: Reader) ReceivePlatformError!fairy.Platform {
+        return try reader.readEnum(fairy.Platform) orelse error.UnknownPlatform;
     }
 
     pub const ReceiveActionError = error{UnknownAction} || Io.Reader.Error;
@@ -294,17 +272,5 @@ pub const Reader = struct {
         };
         const path = buffer[0..byte_count];
         return try .fromSlice(path);
-    }
-
-    pub const ReceiveResolvePathResponseError = error{UnknownResolvePathResponse} || Io.Reader.Error;
-
-    pub fn receiveResolvePathResponse(reader: Reader) ReceiveResolvePathResponseError!ResolvePathResponse {
-        return try reader.readEnum(ResolvePathResponse) orelse error.UnknownResolvePathResponse;
-    }
-
-    pub const ReceiveCreateDirResponseError = error{UnknownCreateDirResponse} || Io.Reader.Error;
-
-    pub fn receiveCreateDirResponse(reader: Reader) ReceiveCreateDirResponseError!CreateDirResponse {
-        return try reader.readEnum(CreateDirResponse) orelse error.UnknownCreateDirResponse;
     }
 };

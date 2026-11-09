@@ -514,6 +514,7 @@ pub const CreateFileOptions = struct {
     initial_size: w.LARGE_INTEGER,
 };
 
+/// Creates a new file, or overwrites an existing one.
 pub fn createFile(parent: w.HANDLE, path: Path, options: CreateFileOptions) !w.HANDLE {
     var handle: w.HANDLE = undefined;
     var unicode_string = w.UNICODE_STRING.init(path.slice);
