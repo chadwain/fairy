@@ -35,17 +35,21 @@ pub const Database = struct {
     next_auto_scan_time_mutex: std.atomic.Mutex,
     next_auto_scan_time: Io.Clock.Timestamp,
 
-    host_send_event: std.atomic.Value(Host.SendEvent),
+    host_alert: std.atomic.Value(std.meta.Tag(Host.Alert)),
+    host_pending_event: std.atomic.Value(bool),
     host_event_inputs: HostEventInputs,
 
     debug: Debug,
 
     pub const Alert = enum(u32) {
+        /// Simply causes the database to wake up.
+        generic,
         /// The database will observe the latest auto-scan deadline.
         new_scan_deadline,
     };
 
     pub const HostEventInputs = struct {
+        event: Host.ClientEvent,
         path: Path,
         file_id: network.FileId,
         directory: bool,
@@ -76,7 +80,8 @@ pub const Database = struct {
             .next_auto_scan_time_mutex = .unlocked,
             .next_auto_scan_time = .{ .raw = .zero, .clock = clock }, // First scan happens immediately
 
-            .host_send_event = .init(.none),
+            .host_alert = .init(0),
+            .host_pending_event = .init(false),
             .host_event_inputs = undefined,
 
             .debug = debug,
@@ -106,11 +111,12 @@ pub const Database = struct {
 
         while (true) {
             // Handle alerts
-            const alert = db.alert.swap(0, .monotonic);
+            const alert = db.alert.swap(0, .acquire);
             const type_info = @typeInfo(Alert).@"enum";
             inline for (type_info.field_names, type_info.field_values) |name, value| {
                 if ((alert & comptime (1 << value)) != 0) {
                     switch (@field(Alert, name)) {
+                        .generic => {},
                         .new_scan_deadline => {
                             next_scan_time_cached, _ = db.setNextAutoScanDeadline(next_scan_time_cached);
                         },
@@ -134,9 +140,7 @@ pub const Database = struct {
             }
 
             // Communicate with the network Host
-            if (try db.sendHostEvent(io)) {
-                continue;
-            }
+            try db.sendEventsToHost(io);
 
             if (auto_scanning_disabled) {
                 try io.futexWait(std.meta.Tag(Alert), &db.alert.raw, 0);
@@ -146,9 +150,8 @@ pub const Database = struct {
         }
     }
 
-    /// Returns true if an event was sent.
-    fn sendHostEvent(db: *Database, io: Io) Io.Cancelable!bool {
-        if (db.host_send_event.load(.monotonic) != .none) return false;
+    fn sendEventsToHost(db: *Database, io: Io) Io.Cancelable!void {
+        if (db.host_pending_event.load(.acquire)) return;
 
         const Event = union(enum) {
             local: struct {
@@ -164,8 +167,6 @@ pub const Database = struct {
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
-            if (db.events.in_progress) return false;
-
             const local_events = db.events.local.items;
             if (local_events.len > 0) {
                 const event = local_events[0];
@@ -180,44 +181,44 @@ pub const Database = struct {
                 break :blk .{ .sync = .{ .file_id = file_id.*, .path = info.path } };
             }
 
-            return false;
+            return;
         };
 
-        const host_send_event: Host.SendEvent = blk: switch (event) {
+        switch (event) {
             .local => |local| {
                 db.debug.log("(local event) action: {s}, path: {f}", .{ @tagName(local.event.action), local.event.path.formatUtf8() });
                 switch (local.event.action) {
                     .new_regular => {
                         db.host_event_inputs = .{
+                            .event = .new_file,
                             .path = local.event.path,
                             .file_id = undefined,
                             .directory = false,
                         };
-                        break :blk .get_global_file_id;
                     },
                     .new_directory => {
                         db.host_event_inputs = .{
+                            .event = .new_file,
                             .path = local.event.path,
                             .file_id = undefined,
                             .directory = true,
                         };
-                        break :blk .get_global_file_id;
                     },
                     .delete_regular => {
                         db.host_event_inputs = .{
+                            .event = .delete_file,
                             .file_id = local.file_id.?,
                             .path = undefined,
                             .directory = undefined,
                         };
-                        break :blk .delete_file;
                     },
                     .delete_directory => {
                         db.host_event_inputs = .{
+                            .event = .delete_dir,
                             .file_id = local.file_id.?,
                             .path = undefined,
                             .directory = undefined,
                         };
-                        break :blk .delete_dir;
                     },
                 }
             },
@@ -225,26 +226,31 @@ pub const Database = struct {
                 // TODO: Try to immediately create an open file handle here
                 db.debug.log("(sync event) path: {f}", .{sync.path.formatUtf8()});
                 db.host_event_inputs = .{
+                    .event = .sync_file,
                     .file_id = sync.file_id,
                     .path = sync.path,
                     .directory = undefined,
                 };
-                break :blk .sync_file;
             },
-        };
+        }
 
-        db.events.in_progress = true;
-        db.host_send_event.store(host_send_event, .release);
-        io.futexWake(Host.SendEvent, &db.host_send_event.raw, 1);
-        return true;
+        db.host_pending_event.store(true, .release);
+        db.setHostAlert(.client_event);
+        io.futexWake(u32, &db.host_alert.raw, 1);
+    }
+
+    fn setHostAlert(db: *Database, comptime alert: Host.Alert) void {
+        _ = db.host_alert.bitSet(@backingInt(alert), .release);
     }
 
     fn wake(db: *Database, io: Io) void {
+        // At least one alert must be raised, otherwise the futexWake could be missed.
+        assert(db.alert.load(.monotonic) != 0);
         io.futexWake(std.meta.Tag(Alert), &db.alert.raw, 1);
     }
 
     fn setAlert(db: *Database, comptime alert: Alert) void {
-        _ = db.alert.bitSet(comptime (1 << @backingInt(alert)), .monotonic);
+        _ = db.alert.bitSet(@backingInt(alert), .release);
     }
 
     pub fn disableAutoScanning(db: *Database) void {
@@ -261,6 +267,7 @@ pub const Database = struct {
         assert(value != 0);
         if (value == 1) {
             db.debug.log("Automatic scanning enabled", .{});
+            db.setAlert(.generic);
             db.wake(io);
         } else {
             db.debug.log("Automatic scanning disabled ({} disablers)", .{value - 1});
@@ -446,7 +453,6 @@ pub const GlobalFilesystem = struct {
 pub const Events = struct {
     local: std.ArrayList(Local) = .empty,
     file_sync: std.AutoHashMapUnmanaged(network.FileId, void) = .empty,
-    in_progress: bool = false,
 
     pub const Local = struct {
         action: Action,
@@ -475,11 +481,9 @@ pub const Events = struct {
     }
 
     fn finishLocalEventWithPath(events: *Events, action: Local.Action, path: Path) void {
-        assert(events.in_progress);
         const event = events.local.orderedRemove(0);
         assert(event.action == action);
         assert(event.path.eql(path));
-        events.in_progress = false;
     }
 
     // TODO: Maybe this function should not exist
@@ -500,11 +504,9 @@ pub const Events = struct {
     }
 
     fn finishSyncEvent(events: *Events, file_id: network.FileId) void {
-        assert(events.in_progress);
         const db: *const Database = @alignCast(@fieldParentPtr("events", events));
         assert(!db.global_fs.files.get(file_id).?.directory);
         assert(events.file_sync.remove(file_id));
-        events.in_progress = false;
     }
 };
 
@@ -533,11 +535,6 @@ pub const LockedDatabase = struct {
     // called from Host
     fn setNewFileId(locked: LockedDatabase, path: Path, kind: network.FileKind, file_id_list: []const network.FileId) !void {
         assert(file_id_list.len > 0);
-        locked.db.events.finishLocalEventWithPath(switch (kind) {
-            .directory => .new_directory,
-            .regular => .new_regular,
-        }, path);
-
         const component_count: fairy.PathComponentCount = @intCast(file_id_list.len);
         try locked.db.global_fs.files.ensureUnusedCapacity(locked.db.allocator, component_count);
         try locked.db.global_fs.path_to_id.ensureUnusedCapacity(locked.db.allocator, component_count);
@@ -547,6 +544,11 @@ pub const LockedDatabase = struct {
             .directory => {},
         }
         errdefer comptime unreachable;
+
+        locked.db.events.finishLocalEventWithPath(switch (kind) {
+            .directory => .new_directory,
+            .regular => .new_regular,
+        }, path);
 
         var children_arena = locked.db.global_fs.children_arena.promote(locked.db.allocator);
         defer locked.db.global_fs.children_arena = children_arena.state;
@@ -1394,6 +1396,11 @@ pub const Host = struct {
     db: *Database,
     debug: Debug,
 
+    pub const Alert = enum(u32) {
+        thread_reply,
+        client_event,
+    };
+
     pub const MtStatus = enum(u32) {
         /// The message thread is unlocked.
         unlocked,
@@ -1405,12 +1412,11 @@ pub const Host = struct {
         incoming,
     };
 
-    pub const SendEvent = enum(u32) {
-        none,
-        get_global_file_id,
-        sync_file,
+    pub const ClientEvent = enum {
+        new_file,
         delete_file,
         delete_dir,
+        sync_file,
     };
 
     pub const Debug = struct {
@@ -1501,54 +1507,41 @@ pub const Host = struct {
         }
 
         while (true) {
-            while (true) : (try io.futexWait(SendEvent, &host.db.host_send_event.raw, .none)) {
-                // First, check if we own the current message thread.
-                // If not, check for events.
-
-                if (host.mt_status.cmpxchgStrong(.unlocked, .outgoing, .acquire, .monotonic)) |current_value| {
-                    assert(current_value != .transmitting);
-                    if (current_value == .outgoing) break; // We already had the lock
-                    continue;
-                }
-
-                const event = host.db.host_send_event.load(.monotonic);
-                if (event == .none) {
-                    assert(host.mt_status.swap(.unlocked, .release) == .outgoing);
-                    continue;
-                }
-
-                host.readEvent(event);
-                host.db.host_event_inputs = undefined;
-                assert(host.db.host_send_event.swap(.none, .release) == event);
-                host.db.wake(io);
-                break;
-            }
-
-            switch (host.mt) {
-                .out_new_file => |*out_new_file| switch (out_new_file.state) {
-                    .send_path => try out_new_file.sendPath(host, io, writer),
-                    .receive_decision => unreachable,
-                },
-                .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
-                    .send_file => try out_file_contents.sendFileContents(host, io, writer),
-                    .receive_result => unreachable,
-                },
-                .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
-                    .send_file_id => try out_delete_file.sendFileId(host, io, writer),
-                    .receive_confirmation => unreachable,
-                },
-                .out_delete_dir => |*out_delete_dir| switch (out_delete_dir.state) {
-                    .send_file_id => try out_delete_dir.sendFileId(host, io, writer),
-                    .receive_confirmation => unreachable,
-                },
+            try io.futexWait(u32, &host.db.host_alert.raw, 0);
+            const alert = host.db.host_alert.swap(0, .acquire);
+            inline for (comptime std.enums.values(Alert)) |value| {
+                const mask: u32 = 1 << @backingInt(value);
+                if (alert & mask != 0) switch (value) {
+                    .thread_reply => {
+                        assert(host.mt_status.load(.acquire) == .outgoing);
+                        try host.processMessageThread(io, writer);
+                    },
+                    .client_event => {
+                        assert(host.db.host_pending_event.load(.acquire));
+                        try host.processClientEvent(io, writer);
+                    },
+                };
             }
         }
     }
 
-    fn readEvent(host: *Host, event: SendEvent) void {
-        switch (event) {
-            .none => unreachable,
-            .get_global_file_id => {
+    fn processClientEvent(host: *Host, io: Io, writer: network.Writer) !void {
+        if (host.mt_status.cmpxchgStrong(.unlocked, .outgoing, .acquire, .monotonic)) |_| return;
+        host.readClientEvent();
+        try host.processMessageThread(io, writer);
+    }
+
+    fn finishClientEvent(host: *Host, io: Io) void {
+        host.db.host_pending_event.store(false, .release);
+        // Wake the database so that it has another chance to send client events.
+        host.db.setAlert(.generic);
+        host.db.wake(io);
+    }
+
+    fn readClientEvent(host: *Host) void {
+        defer host.db.host_event_inputs = undefined;
+        switch (host.db.host_event_inputs.event) {
+            .new_file => {
                 host.log(.info, "getting global file id for new file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
                 host.mt = .{
                     .out_new_file = .{
@@ -1585,6 +1578,27 @@ pub const Host = struct {
                         .file_id = host.db.host_event_inputs.file_id,
                     },
                 };
+            },
+        }
+    }
+
+    fn processMessageThread(host: *Host, io: Io, writer: network.Writer) !void {
+        switch (host.mt) {
+            .out_new_file => |*out_new_file| switch (out_new_file.state) {
+                .send_path => try out_new_file.sendPath(host, io, writer),
+                .receive_decision => unreachable,
+            },
+            .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
+                .send_file => try out_file_contents.sendFileContents(host, io, writer),
+                .receive_result => unreachable,
+            },
+            .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
+                .send_file_id => try out_delete_file.sendFileId(host, io, writer),
+                .receive_confirmation => unreachable,
+            },
+            .out_delete_dir => |*out_delete_dir| switch (out_delete_dir.state) {
+                .send_file_id => try out_delete_dir.sendFileId(host, io, writer),
+                .receive_confirmation => unreachable,
             },
         }
     }
@@ -1631,7 +1645,12 @@ pub const Host = struct {
             switch (header) {
                 .disconnect => break,
                 .new_thread => {
-                    return error.InvalidAction;
+                    const action = try reader.receiveAction();
+                    host.logNetworkAction(.incoming, action);
+
+                    switch (action) {
+                        else => return error.InvalidAction,
+                    }
                 },
                 .thread_reply => {
                     while (true) : (try io.futexWait(MtStatus, &host.mt_status.raw, .incoming)) {
@@ -1681,6 +1700,7 @@ pub const Host = struct {
             .unlocked => comptime unreachable,
             .incoming => {
                 host.setMessageThreadStatus(.incoming, .outgoing);
+                host.db.setHostAlert(.thread_reply);
                 host.wakeSendTask(io);
             },
             .outgoing => comptime unreachable,
@@ -1694,12 +1714,15 @@ pub const Host = struct {
     fn deleteMessageThread(host: *Host, io: Io) void {
         host.mt = undefined;
         host.setMessageThreadStatus(.incoming, .unlocked);
-        host.db.wake(io);
-        host.wakeSendTask(io);
+        if (host.db.host_pending_event.load(.monotonic)) {
+            host.db.setHostAlert(.client_event);
+            host.wakeSendTask(io);
+        }
     }
 
     fn wakeSendTask(host: *Host, io: Io) void {
-        io.futexWake(SendEvent, &host.db.host_send_event.raw, 1);
+        assert(host.db.host_alert.load(.monotonic) != 0);
+        io.futexWake(u32, &host.db.host_alert.raw, 1);
     }
 
     fn wakeReceiveTask(host: *Host, io: Io) void {
@@ -1807,6 +1830,7 @@ pub const MessageThread = union(enum) {
                         "received {f} for file {f}",
                         .{ file_id_list.items[file_id_list.items.len - 1], out_new_file.path.formatUtf8() },
                     );
+                    host.finishClientEvent(io);
                     host.deleteMessageThread(io);
                 },
                 .invalid_path,
@@ -1901,6 +1925,7 @@ pub const MessageThread = union(enum) {
                 },
                 else => return error.InvalidAction,
             }
+            host.finishClientEvent(io);
             host.deleteMessageThread(io);
         }
     };
@@ -1949,6 +1974,7 @@ pub const MessageThread = union(enum) {
                         locked.confirmDeleteFile(out_delete_file.file_id);
                     }
                     host.log(.info, "successfully deleted file: {f}", .{out_delete_file.file_id});
+                    host.finishClientEvent(io);
                     host.deleteMessageThread(io);
                 },
                 else => return error.InvalidAction,
@@ -2000,6 +2026,7 @@ pub const MessageThread = union(enum) {
                         locked.confirmDeleteDir(out_delete_dir.file_id);
                     }
                     host.log(.info, "successfully deleted directory: {f}", .{out_delete_dir.file_id});
+                    host.finishClientEvent(io);
                     host.deleteMessageThread(io);
                 },
                 else => return error.InvalidAction,
