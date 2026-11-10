@@ -27,17 +27,19 @@ pub const Action = enum(u8) {
     /// Payload: `FileKind` + A path
     resolve_path,
     /// Sent in response to a `resolve_path` message.
-    /// Payload: A `ResolvePathResponse`
     /// Payload(success): A sequence of `FileId`, one for each component of the requested path.
     resolve_path_response,
 
-    transfer_file_contents,
-    transfer_file_success,
-    transfer_file_failure,
+    /// The client witnesses a local file modification.
+    /// Payload: `FileId`
+    modify_file,
+    /// The server acknowledges the client's local file modification.
+    modify_file_confirm,
 
-    /// A client has seen a file get deleted on its local filesystem.
+    /// The client witnesses a local file deletion.
+    /// Payload: `FileId`
     delete_file,
-    /// The server notifies that a file has been globally deleted.
+    /// The server acknowledges the client's local file deletion.
     delete_file_confirm,
 
     delete_dir,

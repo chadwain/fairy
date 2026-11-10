@@ -21,28 +21,32 @@ next_file_id: ?std.meta.Tag(network.FileId),
 
 db: Database,
 events: Events,
+
+host_status: std.atomic.Value(HostStatus),
+host: *Host,
+
 debug: Debug,
 
-pub fn initWindows(sync_dir_path: [:0]const u16, allocator: Allocator) !Server {
+pub fn initWindows(sync_dir_path: [:0]const u16, allocator: Allocator, host: *Host) !Server {
     comptime assert(fairy.platform == .windows);
     // TODO: The length of this path must also be factored into path length calculations.
     const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
     const sync_dir = try fairy.windows.openSyncDir(sync_dir_path_nt.span());
     errdefer comptime unreachable;
 
-    return initCommon(sync_dir, allocator);
+    return initCommon(sync_dir, allocator, host);
 }
 
-pub fn initLinux(sync_dir_path: [:0]const u8, io: Io, allocator: Allocator) !Server {
+pub fn initLinux(sync_dir_path: [:0]const u8, io: Io, allocator: Allocator, host: *Host) !Server {
     comptime assert(fairy.platform == .linux);
     // TODO: The length of `sync_dir_path` must also be factored into path length calculations.
     const sync_dir = try Io.Dir.cwd().openDir(io, sync_dir_path, .{ .iterate = true });
     errdefer comptime unreachable;
 
-    return initCommon(sync_dir, allocator);
+    return initCommon(sync_dir, allocator, host);
 }
 
-fn initCommon(sync_dir: DirHandle, allocator: Allocator) Server {
+fn initCommon(sync_dir: DirHandle, allocator: Allocator, host: *Host) Server {
     return .{
         .sync_dir = sync_dir,
         .allocator = allocator,
@@ -54,25 +58,38 @@ fn initCommon(sync_dir: DirHandle, allocator: Allocator) Server {
 
         .db = .init,
         .events = .init,
+
+        .host_status = .init(.disconnected),
+        .host = host,
+
         .debug = .{},
     };
 }
 
-pub fn deinitWindows(server: *Server) void {
+pub fn deinitWindows(server: *Server, io: Io) void {
     comptime assert(fairy.platform == .windows);
+    server.deinitCommon(io);
     fairy.windows.closeHandle(server.sync_dir);
-
-    server.deinitCommon();
+    server.* = undefined;
 }
 
 pub fn deinitLinux(server: *Server, io: Io) void {
     comptime assert(fairy.platform == .linux);
+    server.deinitCommon(io);
     server.sync_dir.close(io);
-
-    server.deinitCommon();
+    server.* = undefined;
 }
 
-fn deinitCommon(server: *Server) void {
+fn deinitCommon(server: *Server, io: Io) void {
+    server.host.setAlert(.shutdown);
+    server.host.wakeSendTask(io);
+    while (true) {
+        switch (server.host_status.load(.monotonic)) {
+            .connected => io.futexWaitUncancelable(HostStatus, &server.host_status.raw, .connected),
+            .disconnected => break,
+        }
+    }
+
     var path_arena = server.path_arena.promote(server.allocator);
     path_arena.deinit();
 
@@ -81,11 +98,15 @@ fn deinitCommon(server: *Server) void {
 
     server.db.deinit(server.allocator);
     server.events.deinit(server.allocator);
-    server.* = undefined;
 }
 
 fn lock(server: *Server, io: Io) !Locked {
     try server.mutex.lock(io);
+    return .{ .server = server };
+}
+
+fn lockUncancelable(server: *Server, io: Io) Locked {
+    server.mutex.lockUncancelable(io);
     return .{ .server = server };
 }
 
@@ -102,6 +123,11 @@ pub const PathHashMap = switch (fairy.platform) {
 pub const DirHandle = switch (fairy.platform) {
     .windows => w.HANDLE,
     .linux => Io.Dir,
+};
+
+pub const HostStatus = enum(u32) {
+    connected,
+    disconnected,
 };
 
 pub const Database = struct {
@@ -179,14 +205,18 @@ pub const Database = struct {
 pub const Events = struct {
     /// Controls when the event loop wakes up.
     /// Does not protect a critical section.
-    alert: std.atomic.Value(Alert),
+    alert: std.atomic.Value(u32),
     delete: std.AutoArrayHashMapUnmanaged(network.FileId, void),
     sync: std.AutoHashMapUnmanaged(network.FileId, struct { canceled: bool = false }),
 
-    pub const Alert = enum(u32) { sleep, wake };
+    pub const Alert = enum {
+        generic,
+        delete_files,
+        completed_file_sync,
+    };
 
     const init: Events = .{
-        .alert = .init(.sleep),
+        .alert = .init(0),
         .delete = .empty,
         .sync = .empty,
     };
@@ -196,121 +226,109 @@ pub const Events = struct {
         events.sync.deinit(allocator);
     }
 
-    fn queueDeleteEventAssumeCapacity(events: *Events, file_id: network.FileId, io: Io) void {
-        if (events.sync.getPtr(file_id)) |sync| {
-            sync.canceled = true;
-        }
-        events.delete.putAssumeCapacityNoClobber(file_id, {});
-        events.alert.store(.wake, .monotonic);
-        io.futexWake(Events.Alert, &events.alert.raw, 1);
+    fn setAlert(events: *Events, comptime alert: Alert) void {
+        _ = events.alert.bitSet(@backingInt(alert), .monotonic);
     }
 };
 
 pub fn eventLoop(server: *Server, io: Io) !void {
     while (true) {
-        if (server.events.alert.cmpxchgStrong(.wake, .sleep, .monotonic, .monotonic)) |_| {
-            try io.futexWait(Events.Alert, &server.events.alert.raw, .sleep);
-            continue;
+        try io.futexWait(u32, &server.events.alert.raw, 0);
+        const alert = server.events.alert.swap(0, .monotonic);
+        inline for (comptime std.enums.values(Events.Alert)) |bit| {
+            if (alert & (1 << @backingInt(bit)) != 0) switch (bit) {
+                .generic => {},
+                .delete_files => {
+                    try server.mutex.lock(io);
+                    while (server.events.delete.count() > 0) : (try server.mutex.lock(io)) {
+                        const file_id = server.events.delete.keys()[0];
+
+                        // Delete events should cancel sync events.
+                        if (server.events.sync.get(file_id)) |value| {
+                            assert(value.canceled);
+                        }
+
+                        const info = server.db.files.getPtr(file_id).?;
+                        assert(info.status == .deleted);
+                        const path, const directory = .{ info.path, info.directory };
+                        server.mutex.unlock(io);
+
+                        server.debug.log(.info, "delete {s} with id {} at {f}", .{
+                            if (directory) "tree" else "file",
+                            @backingInt(file_id),
+                            path.formatUtf8(),
+                        });
+
+                        switch (directory) {
+                            true => {
+                                // TODO: Treat file not found as success
+                                switch (fairy.platform) {
+                                    .windows => try fairy.windows.deleteTree(server.sync_dir, path, server.allocator),
+                                    .linux => try server.sync_dir.deleteTree(io, path.slice),
+                                }
+                                errdefer comptime unreachable;
+
+                                const locked = server.lockUncancelable(io);
+                                defer locked.unlock(io);
+                                locked.server.events.delete.orderedRemoveAt(0);
+                                locked.deleteTree(file_id);
+                            },
+                            false => {
+                                // TODO: Treat file not found as success
+                                switch (fairy.platform) {
+                                    .windows => try fairy.windows.deleteFile(server.sync_dir, path),
+                                    .linux => try server.sync_dir.deleteFile(io, path.slice),
+                                }
+                                errdefer comptime unreachable;
+
+                                const locked = server.lockUncancelable(io);
+                                defer locked.unlock(io);
+                                locked.server.events.delete.orderedRemoveAt(0);
+                                locked.deleteFile(file_id);
+                            },
+                        }
+                    } else {
+                        server.mutex.unlock(io);
+                    }
+                },
+                .completed_file_sync => {
+                    assert(server.host.file_sync_status.swap(.none, .acquire) == .completed);
+                    server.debug.log(.info, "complete sync request for {}", .{server.host.file_sync_file_id});
+                    try server.mutex.lock(io);
+                    defer server.mutex.unlock(io);
+                    assert(server.events.sync.remove(server.host.file_sync_file_id));
+                },
+            };
         }
 
-        try server.mutex.lock(io);
-
-        if (server.events.delete.count() > 0) {
-            const file_id = server.events.delete.keys()[0];
-
-            // Delete events should cancel sync events.
-            if (server.events.sync.get(file_id)) |value| {
-                assert(value.canceled);
-            }
-
-            const info = server.db.files.getPtr(file_id).?;
-            assert(info.status == .deleted);
-            const path, const directory = .{ info.path, info.directory };
-            server.mutex.unlock(io);
-
-            switch (directory) {
-                true => {
-                    // TODO: Treat file not found as success
-                    switch (fairy.platform) {
-                        .windows => try fairy.windows.deleteTree(server.sync_dir, path, server.allocator),
-                        .linux => try server.sync_dir.deleteTree(io, path.slice),
+        if (server.host.file_sync_status.load(.monotonic) == .none) check_sync_events: {
+            const file_id = blk: {
+                try server.mutex.lock(io);
+                defer server.mutex.unlock(io);
+                while (server.events.sync.count() > 0) {
+                    var it = server.events.sync.iterator();
+                    const item = it.next().?;
+                    if (item.value_ptr.canceled) {
+                        server.events.sync.removeByPtr(item.key_ptr);
+                        continue;
                     }
+                    const info = server.db.files.getPtr(item.key_ptr.*).?;
+                    assert(!info.directory);
+                    break :blk item.key_ptr.*;
+                } else break :check_sync_events;
+            };
 
-                    server.mutex.lockUncancelable(io);
-                    defer server.mutex.unlock(io);
-
-                    server.events.delete.orderedRemoveAt(0);
-
-                    const Item = struct {
-                        children: []const network.FileId,
-                        index: fairy.FileCount = 0,
-                        state: State = .iterate,
-
-                        const State = enum { iterate, delete };
-                    };
-                    var stack: [fairy.max_path_components]Item = undefined;
-
-                    const root_dir_entry = server.db.directory_file_info.getEntry(file_id).?;
-                    stack[0] = .{ .children = root_dir_entry.value_ptr.children.keys() };
-
-                    var stack_len: fairy.PathComponentCount = 1;
-                    while (stack_len > 0) {
-                        const item = &stack[stack_len - 1];
-                        if (item.index == item.children.len) {
-                            item.* = undefined;
-                            stack_len -= 1;
-                            continue;
-                        }
-
-                        const child_file_id = item.children[item.index];
-                        const child_info = server.db.files.getEntry(child_file_id).?;
-
-                        if (child_info.value_ptr.directory and item.state == .iterate) enter_dir: {
-                            const dir_entry = server.db.directory_file_info.getPtr(child_file_id).?;
-                            const children = dir_entry.children.keys();
-                            if (children.len == 0) break :enter_dir;
-
-                            item.state = .delete;
-                            stack[stack_len] = .{ .children = children };
-                            stack_len += 1;
-                            continue;
-                        }
-
-                        if (child_info.value_ptr.directory) {
-                            item.state = .iterate;
-                            assert(server.db.directory_file_info.remove(child_file_id));
-                        } else {
-                            assert(server.db.regular_file_info.remove(child_file_id));
-                        }
-                        server.db.files.removeByPtr(child_info.key_ptr);
-
-                        item.index += 1;
-                    }
-
-                    assert(server.db.files.remove(file_id));
-                    server.db.directory_file_info.removeByPtr(root_dir_entry.key_ptr);
-                },
-                false => {
-                    // TODO: Treat file not found as success
-                    switch (fairy.platform) {
-                        .windows => try fairy.windows.deleteFile(server.sync_dir, path),
-                        .linux => try server.sync_dir.deleteFile(io, path.slice),
-                    }
-
-                    server.mutex.lockUncancelable(io);
-                    defer server.mutex.unlock(io);
-
-                    server.events.delete.orderedRemoveAt(0);
-                    assert(server.db.files.remove(file_id));
-                    assert(server.db.regular_file_info.remove(file_id));
-                },
-            }
-
-            continue;
+            server.debug.log(.info, "start sync request for file id {}", .{@backingInt(file_id)});
+            server.host.file_sync_file_id = file_id;
+            server.host.file_sync_status.store(.queued, .release);
+            server.host.setAlert(.sync_file);
+            server.host.wakeSendTask(io);
         }
-
-        server.mutex.unlock(io);
     }
+}
+
+fn wake(server: *Server, io: Io) void {
+    io.futexWake(u32, &server.events.alert.raw, 1);
 }
 
 const Diagnostics = union {
@@ -566,6 +584,7 @@ const Locked = struct {
             @sizeOf(network.history.Create) +
             @as(usize, num_new_files) * (@sizeOf(network.FileId) + Path.component_max_len + 1);
         s.db.history.ensureUnusedCapacity(s.allocator, history_needed_capacity) catch |err| return diag.errInternal(err);
+        if (!is_directory) s.events.sync.ensureUnusedCapacity(s.allocator, 1) catch |err| return diag.errInternal(err);
         errdefer comptime unreachable;
 
         var history_writer = Io.Writer.Allocating.fromArrayList(s.allocator, &s.db.history);
@@ -612,6 +631,7 @@ const Locked = struct {
                     .regular => locked.initRegularFile(file_id, item.component, item.path, parent_file_id),
                     .directory => _ = locked.initDirectoryFile(file_id, item.component, item.path, parent_file_id),
                 }
+                if (!is_directory) locked.queueSyncEventAssumeCapacity(file_id);
                 return file_id;
             }
         }
@@ -673,6 +693,12 @@ const Locked = struct {
         return gop.value_ptr;
     }
 
+    fn queueSyncEventAssumeCapacity(locked: Locked, file_id: network.FileId) void {
+        const events = &locked.server.events;
+        events.sync.putAssumeCapacity(file_id, .{});
+        events.setAlert(.generic);
+    }
+
     fn getReverseFileIdPath(
         locked: Locked,
         file_id: network.FileId,
@@ -698,10 +724,18 @@ const Locked = struct {
         return info.path;
     }
 
-    fn deleteGlobalFile(
+    fn queueDeleteEventAssumeCapacity(locked: Locked, file_id: network.FileId) void {
+        const events = &locked.server.events;
+        if (events.sync.getPtr(file_id)) |sync| {
+            sync.canceled = true;
+        }
+        events.delete.putAssumeCapacityNoClobber(file_id, {});
+        events.setAlert(.delete_files);
+    }
+
+    fn markFileAsDeleted(
         locked: Locked,
         file_id: network.FileId,
-        io: Io,
         diag: *Diagnostics,
     ) error{ Client, Global, Internal }!void {
         const s = locked.server;
@@ -744,14 +778,18 @@ const Locked = struct {
             .file_id = file_id,
         }, network.endian) catch unreachable;
 
-        s.events.queueDeleteEventAssumeCapacity(file_id, io);
+        locked.queueDeleteEventAssumeCapacity(file_id);
+    }
+
+    fn deleteFile(locked: Locked, file_id: network.FileId) void {
+        assert(locked.server.db.files.remove(file_id));
+        assert(locked.server.db.regular_file_info.remove(file_id));
     }
 
     /// Sets all files within a tree to the deleted status.
-    fn deleteGlobalDir(
+    fn markTreeAsDeleted(
         locked: Locked,
         root_file_id: network.FileId,
-        io: Io,
         diag: *Diagnostics,
     ) error{ Client, Global, Internal }!void {
         const s = locked.server;
@@ -825,16 +863,91 @@ const Locked = struct {
             .kind = .directory,
             .file_id = root_file_id,
         }, network.endian) catch unreachable;
-        s.events.queueDeleteEventAssumeCapacity(root_file_id, io);
+        locked.queueDeleteEventAssumeCapacity(root_file_id);
+    }
+
+    fn deleteTree(locked: Locked, file_id: network.FileId) void {
+        const Item = struct {
+            children: []const network.FileId,
+            index: fairy.FileCount = 0,
+            state: State = .iterate,
+
+            const State = enum { iterate, delete };
+        };
+        var stack: [fairy.max_path_components]Item = undefined;
+
+        const root_dir_entry = locked.server.db.directory_file_info.getEntry(file_id).?;
+        stack[0] = .{ .children = root_dir_entry.value_ptr.children.keys() };
+
+        var stack_len: fairy.PathComponentCount = 1;
+        while (stack_len > 0) {
+            const item = &stack[stack_len - 1];
+            if (item.index == item.children.len) {
+                item.* = undefined;
+                stack_len -= 1;
+                continue;
+            }
+
+            const child_file_id = item.children[item.index];
+            const child_info = locked.server.db.files.getEntry(child_file_id).?;
+
+            if (child_info.value_ptr.directory and item.state == .iterate) enter_dir: {
+                const dir_entry = locked.server.db.directory_file_info.getPtr(child_file_id).?;
+                const children = dir_entry.children.keys();
+                if (children.len == 0) break :enter_dir;
+
+                item.state = .delete;
+                stack[stack_len] = .{ .children = children };
+                stack_len += 1;
+                continue;
+            }
+
+            if (child_info.value_ptr.directory) {
+                item.state = .iterate;
+                assert(locked.server.db.directory_file_info.remove(child_file_id));
+            } else {
+                assert(locked.server.db.regular_file_info.remove(child_file_id));
+            }
+            locked.server.db.files.removeByPtr(child_info.key_ptr);
+
+            item.index += 1;
+        }
+
+        assert(locked.server.db.files.remove(file_id));
+        locked.server.db.directory_file_info.removeByPtr(root_dir_entry.key_ptr);
+    }
+
+    fn acknowledgeFileModification(
+        locked: Locked,
+        file_id: network.FileId,
+        diag: *Diagnostics,
+    ) error{ Client, Internal }!void {
+        const s = locked.server;
+        const info = s.db.files.getPtr(file_id) orelse return diag.errClient(error.UnknownFileId);
+        switch (info.status) {
+            .new => std.debug.panic("TODO", .{}),
+            .synced => {},
+            .deleted => return diag.errClient(error.UnknownFileId),
+        }
+        if (info.directory) return diag.errClient(error.NotRegularFile);
+
+        locked.server.events.sync.ensureUnusedCapacity(s.allocator, 1) catch |err| return diag.errInternal(err);
+        errdefer comptime unreachable;
+
+        locked.queueSyncEventAssumeCapacity(file_id);
     }
 };
 
 pub const Host = struct {
     setup: std.atomic.Value(Setup),
-    mt: MessageThread,
+    alert: std.atomic.Value(u32),
+
     mt_status: std.atomic.Value(MtStatus),
-    // TODO: Don't store this here, instead make it an argument to `run`
-    server: *Server,
+    mt: MessageThread,
+
+    file_sync_status: std.atomic.Value(FileSyncStatus),
+    file_sync_file_id: network.FileId,
+
     debug: Host.Debug,
 
     pub const Debug = struct {
@@ -845,6 +958,12 @@ pub const Host = struct {
         send_platform,
         recv_ack,
         end,
+    };
+
+    pub const Alert = enum {
+        shutdown,
+        thread_reply,
+        sync_file,
     };
 
     pub const MtStatus = enum(u32) {
@@ -858,18 +977,32 @@ pub const Host = struct {
         incoming,
     };
 
-    pub fn init(server: *Server, debug: Host.Debug) Host {
+    pub const FileSyncStatus = enum(u32) {
+        /// There is currently no file being synced.
+        none,
+        /// A file sync request has been queued.
+        queued,
+        /// The host is sending a file sync request.
+        sending,
+        /// The host is waiting for a file sync response.
+        waiting,
+        /// The file has been synced.
+        completed,
+    };
+
+    pub fn init(debug: Host.Debug) Host {
         return .{
             .setup = .init(.send_platform),
-            .mt = undefined,
+            .alert = .init(0),
+
             .mt_status = .init(.init),
-            .server = server,
+            .mt = undefined,
+
+            .file_sync_status = .init(.none),
+            .file_sync_file_id = undefined,
+
             .debug = debug,
         };
-    }
-
-    pub fn deinit(host: *Host) void {
-        host.* = undefined;
     }
 
     pub const RunError = Io.ConcurrentError || Io.Cancelable;
@@ -883,6 +1016,7 @@ pub const Host = struct {
     pub fn run(
         host: *Host,
         diag: ?*Host.Diagnostics,
+        server: *Server,
         io: Io,
         reader: *Io.Reader,
         writer: *Io.Writer,
@@ -907,16 +1041,33 @@ pub const Host = struct {
         var select = Io.Select(ns.SelectUnion).init(io, &select_buffer);
         defer while (select.cancel()) |result| ns.addToDiagnostics(diag, result);
 
-        try select.concurrent(.send_error, sendOutgoingMessages, .{ host, .init(writer), io });
-        try select.concurrent(.recv_error, receiveIncomingMessages, .{ host, .init(reader), io });
+        try select.concurrent(.send_error, sendOutgoingMessages, .{ host, server, .init(writer), io });
+        try select.concurrent(.recv_error, receiveIncomingMessages, .{ host, server, .init(reader), io });
 
         host.debugLog("started", .{});
+        if (server.host_status.swap(.connected, .monotonic) == .connected) {
+            std.debug.panic("TODO: Host already connected", .{});
+        }
+        defer {
+            server.host_status.store(.disconnected, .monotonic);
+            io.futexWake(HostStatus, &server.host_status.raw, 1);
+        }
+
         ns.addToDiagnostics(diag, try select.await());
+    }
+
+    fn setAlert(host: *Host, comptime alert: Alert) void {
+        _ = host.alert.bitSet(@backingInt(alert), .monotonic);
+    }
+
+    fn wakeSendTask(host: *Host, io: Io) void {
+        assert(host.alert.load(.monotonic) != 0);
+        io.futexWake(u32, &host.alert.raw, 1);
     }
 
     pub const SendError = Io.Writer.Error || Io.Cancelable || fairy.windows.SendFileError;
 
-    fn sendOutgoingMessages(host: *Host, writer: network.Writer, io: Io) SendError!void {
+    fn sendOutgoingMessages(host: *Host, server: *Server, writer: network.Writer, io: Io) SendError!void {
         {
             try writer.sendPlatform(fairy.platform);
             try writer.flush();
@@ -933,27 +1084,61 @@ pub const Host = struct {
         }
 
         while (true) {
-            while (true) {
-                const mt_status = host.mt_status.load(.acquire);
-                if (mt_status == .outgoing) break;
-                try io.futexWait(MtStatus, &host.mt_status.raw, mt_status);
-            }
-
-            switch (host.mt) {
-                .in_new_file => |*in_new_file| {
-                    try in_new_file.sendDecision(host, io, writer);
-                },
-                .in_file_contents => |*in_file_contents| {
-                    try in_file_contents.sendResult(host, io, writer);
-                },
-                .in_delete_file => |*in_delete_file| {
-                    try in_delete_file.sendConfirmation(host, io, writer);
-                },
-                .in_delete_dir => |*in_delete_dir| {
-                    try in_delete_dir.sendConfirmation(host, io, writer);
-                },
+            try io.futexWait(u32, &host.alert.raw, 0);
+            const alert = host.alert.swap(0, .monotonic);
+            inline for (comptime std.enums.values(Alert)) |value| {
+                const mask: u32 = 1 << @backingInt(value);
+                if (alert & mask != 0) switch (value) {
+                    .shutdown => {
+                        try shutdown(writer);
+                        return;
+                    },
+                    .thread_reply => {
+                        try host.processMessageThread(server, io, writer);
+                    },
+                    .sync_file => {
+                        try host.processServerSyncFileEvent(io, writer);
+                    },
+                };
             }
         }
+    }
+
+    fn shutdown(writer: network.Writer) !void {
+        try writer.sendMessageHeader(.disconnect);
+        try writer.flush();
+    }
+
+    fn processMessageThread(host: *Host, server: *Server, io: Io, writer: network.Writer) !void {
+        assert(host.mt_status.load(.acquire) == .outgoing);
+        switch (host.mt) {
+            .in_new_file => |*in_new_file| {
+                // TODO: This is the only place where `server` is needed
+                try in_new_file.sendResult(host, server, io, writer);
+            },
+            .in_delete_file => |*in_delete_file| {
+                try in_delete_file.sendConfirmation(host, io, writer);
+            },
+            .in_delete_dir => |*in_delete_dir| {
+                try in_delete_dir.sendConfirmation(host, io, writer);
+            },
+            .in_modify_file => |*in_modify_file| {
+                try in_modify_file.sendConfirmation(host, io, writer);
+            },
+        }
+    }
+
+    fn processServerSyncFileEvent(host: *Host, io: Io, writer: network.Writer) !void {
+        assert(host.file_sync_status.swap(.sending, .acquire) == .queued);
+        try host.sendFileSyncRequest(writer);
+        assert(host.file_sync_status.swap(.waiting, .release) == .sending);
+        io.futexWake(FileSyncStatus, &host.file_sync_status.raw, 1);
+    }
+
+    fn sendFileSyncRequest(host: *Host, writer: network.Writer) !void {
+        try writer.sendMessageHeader(.sync_file_request);
+        try writer.sendFileId(host.file_sync_file_id);
+        try writer.flush();
     }
 
     pub const RecvError = error{
@@ -978,7 +1163,7 @@ pub const Host = struct {
                 Io.File.Writer.Error,
         };
 
-    fn receiveIncomingMessages(host: *Host, reader: network.Reader, io: Io) RecvError!void {
+    fn receiveIncomingMessages(host: *Host, server: *Server, reader: network.Reader, io: Io) RecvError!void {
         {
             while (true) : (try io.futexWait(Setup, &host.setup.raw, .send_platform)) {
                 switch (host.setup.load(.acquire)) {
@@ -1010,16 +1195,16 @@ pub const Host = struct {
                     host.logMessage(.incoming, action);
                     switch (action) {
                         .resolve_path => {
-                            try MessageThread.InNewFile.initMessageThread(host, io, reader);
-                        },
-                        .transfer_file_contents => {
-                            try MessageThread.InFileContents.initMessageThread(host, io, reader);
+                            try MessageThread.InNewFile.initMessageThread(host, server, io, reader);
                         },
                         .delete_file => {
-                            try MessageThread.InDeleteFile.initMessageThread(host, io, reader);
+                            try MessageThread.InDeleteFile.initMessageThread(host, server, io, reader);
                         },
                         .delete_dir => {
-                            try MessageThread.InDeleteDir.initMessageThread(host, io, reader);
+                            try MessageThread.InDeleteDir.initMessageThread(host, server, io, reader);
+                        },
+                        .modify_file => {
+                            try MessageThread.InModifyFile.initMessageThread(host, server, io, reader);
                         },
                         else => return error.InvalidAction,
                     }
@@ -1030,7 +1215,19 @@ pub const Host = struct {
                 .sync_file_request => {
                     return error.UnexpectedIncomingMessage;
                 },
-                .sync_file_response => std.debug.panic("TODO", .{}),
+                .sync_file_response => {
+                    while (true) {
+                        switch (host.file_sync_status.load(.acquire)) {
+                            .none, .queued, .completed => return error.UnexpectedIncomingMessage,
+                            .sending => try io.futexWait(FileSyncStatus, &host.file_sync_status.raw, .sending),
+                            .waiting => break,
+                        }
+                    }
+                    try host.receiveSyncFileResponse(server, io, reader);
+                    assert(host.file_sync_status.swap(.completed, .release) == .waiting);
+                    server.events.setAlert(.completed_file_sync);
+                    server.wake(io);
+                },
             }
         }
     }
@@ -1038,7 +1235,8 @@ pub const Host = struct {
     fn setOutgoingMessage(host: *Host, io: Io, data: MessageThread) void {
         host.mt = data;
         assert(host.mt_status.cmpxchgStrong(.incoming, .outgoing, .release, .monotonic) == null);
-        io.futexWake(MtStatus, &host.mt_status.raw, 1);
+        host.setAlert(.thread_reply);
+        host.wakeSendTask(io);
     }
 
     fn beginTransmitting(host: *Host) void {
@@ -1051,10 +1249,8 @@ pub const Host = struct {
         io.futexWake(MtStatus, &host.mt_status.raw, 1);
     }
 
-    fn receiveSyncFileResponse(host: *Host, io: Io, reader: network.Reader) !void {
-        const file_id = try reader.receiveFileId();
-
-        // TODO: Open a temporary file instead
+    fn receiveSyncFileResponse(host: *Host, server: *Server, io: Io, reader: network.Reader) !void {
+        const file_id = host.file_sync_file_id;
         switch (fairy.platform) {
             .windows => {
                 const file_size = blk: {
@@ -1063,20 +1259,21 @@ pub const Host = struct {
                     break :blk windows_size;
                 };
                 const path = blk: {
-                    const locked = try host.server.lock(io);
+                    const locked = try server.lock(io);
                     defer locked.unlock(io);
                     var diag: Server.Diagnostics = undefined;
                     break :blk locked.getRegularFilePath(file_id, &diag) catch |err| switch (err) {
                         error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
                     };
                 };
-                const handle = host.server.createRegularFileWindows(path, file_size) catch |err| switch (err) {
+                // TODO: Open a temporary file instead
+                const handle = server.createRegularFileWindows(path, file_size) catch |err| switch (err) {
                     error.Unexpected => |e| return e,
                 };
                 defer fairy.windows.closeHandle(handle);
                 try fairy.windows.receiveFile(reader.io, handle, file_size);
                 {
-                    const locked = try host.server.lock(io);
+                    const locked = try server.lock(io);
                     defer locked.unlock(io);
                     const info = locked.server.db.files.getPtr(file_id) orelse std.debug.panic("TODO", .{});
                     switch (info.status) {
@@ -1089,14 +1286,15 @@ pub const Host = struct {
             .linux => {
                 const file_size = try reader.receiveFileSize();
                 const path = blk: {
-                    const locked = try host.server.lock(io);
+                    const locked = try server.lock(io);
                     defer locked.unlock(io);
                     var diag: Server.Diagnostics = undefined;
                     break :blk locked.getRegularFilePath(file_id, &diag) catch |err| switch (err) {
                         error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
                     };
                 };
-                const file = host.server.createRegularFileLinux(path, io) catch |err| switch (err) {
+                // TODO: Open a temporary file instead
+                const file = server.createRegularFileLinux(path, io) catch |err| switch (err) {
                     else => |e| return e,
                 };
                 defer file.close(io);
@@ -1133,9 +1331,9 @@ pub const Host = struct {
 
 pub const MessageThread = union(enum) {
     in_new_file: InNewFile,
-    in_file_contents: InFileContents,
     in_delete_file: InDeleteFile,
     in_delete_dir: InDeleteDir,
+    in_modify_file: InModifyFile,
 
     pub const InNewFile = struct {
         result: network.FileId,
@@ -1149,6 +1347,7 @@ pub const MessageThread = union(enum) {
 
         fn initMessageThread(
             host: *Host,
+            server: *Server,
             io: Io,
             reader: network.Reader,
         ) !void {
@@ -1164,7 +1363,7 @@ pub const MessageThread = union(enum) {
                 .linux => try reader.receiveLinuxPath(path_byte_count, &file_path_buffer),
             };
             const file_id = blk: {
-                const locked = try host.server.lock(io);
+                const locked = try server.lock(io);
                 defer locked.unlock(io);
 
                 var diag: Server.Diagnostics = undefined;
@@ -1174,6 +1373,7 @@ pub const MessageThread = union(enum) {
                     error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
                 };
             };
+            server.wake(io);
 
             const data: MessageThread = .{
                 .in_new_file = .{
@@ -1183,9 +1383,10 @@ pub const MessageThread = union(enum) {
             host.setOutgoingMessage(io, data);
         }
 
-        fn sendDecision(
+        fn sendResult(
             in_new_file: *const InNewFile,
             host: *Host,
+            server: *Server,
             io: Io,
             writer: network.Writer,
         ) !void {
@@ -1194,7 +1395,7 @@ pub const MessageThread = union(enum) {
 
             var reverse_file_ids_buffer: [fairy.max_path_components]network.FileId = undefined;
             const reversed_file_id_path = blk: {
-                const locked = try host.server.lock(io);
+                const locked = try server.lock(io);
                 defer locked.unlock(io);
                 break :blk locked.getReverseFileIdPath(in_new_file.result, &reverse_file_ids_buffer);
             };
@@ -1212,123 +1413,25 @@ pub const MessageThread = union(enum) {
         }
     };
 
-    pub const InFileContents = struct {
-        result: SendResult,
-
-        pub const SendResult = enum { success, failure };
-
-        fn initMessageThread(
-            host: *Host,
-            io: Io,
-            reader: network.Reader,
-        ) !void {
-            const file_id = try reader.receiveFileId();
-
-            // TODO: Open a temporary file instead
-            switch (fairy.platform) {
-                .windows => {
-                    const file_size = blk: {
-                        const file_size = try reader.receiveFileSize();
-                        const windows_size = std.math.cast(w.LARGE_INTEGER, file_size) orelse return error.InvalidFileSize;
-                        break :blk windows_size;
-                    };
-                    const path = blk: {
-                        const locked = try host.server.lock(io);
-                        defer locked.unlock(io);
-                        var diag: Server.Diagnostics = undefined;
-                        break :blk locked.getRegularFilePath(file_id, &diag) catch |err| switch (err) {
-                            error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
-                        };
-                    };
-                    const handle = host.server.createRegularFileWindows(path, file_size) catch |err| switch (err) {
-                        error.Unexpected => |e| return e,
-                    };
-                    defer fairy.windows.closeHandle(handle);
-                    try fairy.windows.receiveFile(reader.io, handle, file_size);
-                    {
-                        const locked = try host.server.lock(io);
-                        defer locked.unlock(io);
-                        const info = locked.server.db.files.getPtr(file_id) orelse std.debug.panic("TODO", .{});
-                        switch (info.status) {
-                            .new => info.status = .synced,
-                            .synced => {},
-                            .deleted => {},
-                        }
-                    }
-                },
-                .linux => {
-                    const file_size = try reader.receiveFileSize();
-                    const path = blk: {
-                        const locked = try host.server.lock(io);
-                        defer locked.unlock(io);
-                        var diag: Server.Diagnostics = undefined;
-                        break :blk locked.getRegularFilePath(file_id, &diag) catch |err| switch (err) {
-                            error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
-                        };
-                    };
-                    const file = host.server.createRegularFileLinux(path, io) catch |err| switch (err) {
-                        else => |e| return e,
-                    };
-                    defer file.close(io);
-                    var file_write_buffer: [512]u8 = undefined;
-                    var file_writer = file.writer(io, &file_write_buffer);
-                    reader.io.streamExact(&file_writer.interface, file_size) catch |err| switch (err) {
-                        error.WriteFailed => return file_writer.err.?,
-                        error.ReadFailed, error.EndOfStream => |e| return e,
-                    };
-                    file_writer.interface.flush() catch return file_writer.err.?;
-                },
-            }
-            const file_hash = try reader.receiveFileHash();
-            _ = file_hash; // TODO
-
-            const data: MessageThread = .{
-                .in_file_contents = .{
-                    .result = .success,
-                },
-            };
-            host.setOutgoingMessage(io, data);
-        }
-
-        fn sendResult(
-            in_file_contents: *const InFileContents,
-            host: *Host,
-            io: Io,
-            writer: network.Writer,
-        ) !void {
-            const action: network.Action = switch (in_file_contents.result) {
-                .success => .transfer_file_success,
-                .failure => .transfer_file_failure,
-            };
-            host.logMessage(.outgoing, action);
-
-            host.beginTransmitting();
-
-            try writer.sendMessageHeader(.thread_reply);
-            try writer.sendAction(action);
-            try writer.flush();
-
-            host.deleteMessageThread(io);
-        }
-    };
-
     pub const InDeleteFile = struct {
         fn initMessageThread(
             host: *Host,
+            server: *Server,
             io: Io,
             reader: network.Reader,
         ) !void {
             const file_id = try reader.receiveFileId();
             {
-                const locked = try host.server.lock(io);
+                const locked = try server.lock(io);
                 defer locked.unlock(io);
                 var diag: Server.Diagnostics = undefined;
-                locked.deleteGlobalFile(file_id, io, &diag) catch |err| switch (err) {
+                locked.markFileAsDeleted(file_id, &diag) catch |err| switch (err) {
                     error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
                     error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
                     error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
                 };
             }
+            server.wake(io);
 
             const data: MessageThread = .{
                 .in_delete_file = .{},
@@ -1358,20 +1461,22 @@ pub const MessageThread = union(enum) {
     pub const InDeleteDir = struct {
         fn initMessageThread(
             host: *Host,
+            server: *Server,
             io: Io,
             reader: network.Reader,
         ) !void {
             const file_id = try reader.receiveFileId();
             {
-                const locked = try host.server.lock(io);
+                const locked = try server.lock(io);
                 defer locked.unlock(io);
                 var diag: Server.Diagnostics = undefined;
-                locked.deleteGlobalDir(file_id, io, &diag) catch |err| switch (err) {
+                locked.markTreeAsDeleted(file_id, &diag) catch |err| switch (err) {
                     error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
                     error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
                     error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
                 };
             }
+            server.wake(io);
 
             const data: MessageThread = .{
                 .in_delete_dir = .{},
@@ -1386,6 +1491,52 @@ pub const MessageThread = union(enum) {
             writer: network.Writer,
         ) !void {
             const action: network.Action = .delete_dir_confirm;
+            host.logMessage(.outgoing, action);
+
+            host.beginTransmitting();
+
+            try writer.sendMessageHeader(.thread_reply);
+            try writer.sendAction(action);
+            try writer.flush();
+
+            host.deleteMessageThread(io);
+        }
+    };
+
+    pub const InModifyFile = struct {
+        fn initMessageThread(
+            host: *Host,
+            server: *Server,
+            io: Io,
+            reader: network.Reader,
+        ) !void {
+            const file_id = try reader.receiveFileId();
+            {
+                const locked = try server.lock(io);
+                defer locked.unlock(io);
+                var diag: Server.Diagnostics = undefined;
+                locked.acknowledgeFileModification(file_id, &diag) catch |err| switch (err) {
+                    error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
+                    error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
+                };
+            }
+            // NOTE: We could end up in a weird situation where the file sync starts
+            //       before the client receives our acknowledgement.
+            server.wake(io);
+
+            const data: MessageThread = .{
+                .in_modify_file = .{},
+            };
+            host.setOutgoingMessage(io, data);
+        }
+
+        fn sendConfirmation(
+            _: *const InModifyFile,
+            host: *Host,
+            io: Io,
+            writer: network.Writer,
+        ) !void {
+            const action: network.Action = .modify_file_confirm;
             host.logMessage(.outgoing, action);
 
             host.beginTransmitting();

@@ -154,16 +154,10 @@ pub const Database = struct {
         if (db.host_pending_event.load(.acquire)) return;
 
         const Event = union(enum) {
-            local: struct {
-                event: Events.Local,
-                file_id: ?network.FileId,
-            },
-            sync: struct {
-                file_id: network.FileId,
-                path: Path,
-            },
+            local: Events.Local,
+            modify,
         };
-        const event: Event = blk: {
+        const event: Event, const file_id: ?network.FileId = blk: {
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
@@ -171,14 +165,12 @@ pub const Database = struct {
             if (local_events.len > 0) {
                 const event = local_events[0];
                 const file_id = db.global_fs.path_to_id.get(event.path);
-                break :blk .{ .local = .{ .event = event, .file_id = file_id } };
+                break :blk .{ .{ .local = event }, file_id };
             }
 
-            var sync_events = db.events.file_sync.keyIterator();
-            if (sync_events.next()) |file_id| {
-                const info = db.global_fs.files.get(file_id.*).?;
-                assert(!info.directory);
-                break :blk .{ .sync = .{ .file_id = file_id.*, .path = info.path } };
+            var modify_events = db.events.modify.keyIterator();
+            if (modify_events.next()) |file_id| {
+                break :blk .{ .modify, file_id.* };
             }
 
             return;
@@ -186,12 +178,12 @@ pub const Database = struct {
 
         switch (event) {
             .local => |local| {
-                db.debug.log("(local event) action: {s}, path: {f}", .{ @tagName(local.event.action), local.event.path.formatUtf8() });
-                switch (local.event.action) {
+                db.debug.log("(local event) action: {s}, path: {f}", .{ @tagName(local.action), local.path.formatUtf8() });
+                switch (local.action) {
                     .new_regular => {
                         db.host_event_inputs = .{
                             .event = .new_file,
-                            .path = local.event.path,
+                            .path = local.path,
                             .file_id = undefined,
                             .directory = false,
                         };
@@ -199,7 +191,7 @@ pub const Database = struct {
                     .new_directory => {
                         db.host_event_inputs = .{
                             .event = .new_file,
-                            .path = local.event.path,
+                            .path = local.path,
                             .file_id = undefined,
                             .directory = true,
                         };
@@ -207,7 +199,7 @@ pub const Database = struct {
                     .delete_regular => {
                         db.host_event_inputs = .{
                             .event = .delete_file,
-                            .file_id = local.file_id.?,
+                            .file_id = file_id.?,
                             .path = undefined,
                             .directory = undefined,
                         };
@@ -215,20 +207,18 @@ pub const Database = struct {
                     .delete_directory => {
                         db.host_event_inputs = .{
                             .event = .delete_dir,
-                            .file_id = local.file_id.?,
+                            .file_id = file_id.?,
                             .path = undefined,
                             .directory = undefined,
                         };
                     },
                 }
             },
-            .sync => |sync| {
-                // TODO: Try to immediately create an open file handle here
-                db.debug.log("(sync event) path: {f}", .{sync.path.formatUtf8()});
+            .modify => {
                 db.host_event_inputs = .{
-                    .event = .sync_file,
-                    .file_id = sync.file_id,
-                    .path = sync.path,
+                    .event = .modify_file,
+                    .file_id = file_id.?,
+                    .path = undefined,
                     .directory = undefined,
                 };
             },
@@ -457,7 +447,7 @@ pub const GlobalFilesystem = struct {
 
 pub const Events = struct {
     local: std.ArrayList(Local) = .empty,
-    file_sync: std.AutoHashMapUnmanaged(network.FileId, void) = .empty,
+    modify: std.AutoHashMapUnmanaged(network.FileId, void) = .empty,
 
     pub const Local = struct {
         action: Action,
@@ -473,7 +463,7 @@ pub const Events = struct {
 
     pub fn deinit(events: *Events, allocator: Allocator) void {
         events.local.deinit(allocator);
-        events.file_sync.deinit(allocator);
+        events.modify.deinit(allocator);
         events.* = undefined;
     }
 
@@ -498,20 +488,16 @@ pub const Events = struct {
         events.finishLocalEventWithPath(action, path);
     }
 
-    fn ensureSyncEventCapacity(events: *Events, allocator: Allocator) !void {
-        try events.file_sync.ensureUnusedCapacity(allocator, 1);
+    fn ensureModifyEventCapacity(events: *Events, allocator: Allocator) !void {
+        try events.modify.ensureUnusedCapacity(allocator, 1);
     }
 
-    fn queueSyncEventAssumeCapacity(events: *Events, file_id: network.FileId) void {
-        const db: *const Database = @alignCast(@fieldParentPtr("events", events));
-        assert(!db.global_fs.files.get(file_id).?.directory);
-        events.file_sync.putAssumeCapacity(file_id, {});
+    fn queueModifyEventAssumeCapacity(events: *Events, file_id: network.FileId) void {
+        events.modify.putAssumeCapacity(file_id, {});
     }
 
-    fn finishSyncEvent(events: *Events, file_id: network.FileId) void {
-        const db: *const Database = @alignCast(@fieldParentPtr("events", events));
-        assert(!db.global_fs.files.get(file_id).?.directory);
-        assert(events.file_sync.remove(file_id));
+    fn finishModifyEvent(events: *Events, file_id: network.FileId) void {
+        assert(events.modify.remove(file_id));
     }
 };
 
@@ -535,9 +521,11 @@ pub const LockedDatabase = struct {
 
         _, const should_alert = locked.db.setNextAutoScanDeadline(Io.Clock.Timestamp.now(io, Database.clock).addDuration(Database.max_wait_time));
         if (should_alert) locked.db.setAlert(.new_scan_deadline);
+        locked.db.setAlert(.generic);
+        locked.db.wake(io);
     }
 
-    pub fn getRegularFilePath(locked: LockedDatabase, file_id: network.FileId) !Path {
+    fn getRegularFilePath(locked: LockedDatabase, file_id: network.FileId) !Path {
         const file_info = locked.db.global_fs.files.getPtr(file_id) orelse return error.FileDoesNotExist;
         if (file_info.directory) return error.NotRegularFile;
         return file_info.path;
@@ -550,10 +538,6 @@ pub const LockedDatabase = struct {
         try locked.db.global_fs.files.ensureUnusedCapacity(locked.db.allocator, component_count);
         try locked.db.global_fs.path_to_id.ensureUnusedCapacity(locked.db.allocator, component_count);
         try locked.db.global_fs.children.ensureUnusedCapacity(locked.db.allocator, component_count - @intFromBool(kind != .directory));
-        switch (kind) {
-            .regular => try locked.db.events.ensureSyncEventCapacity(locked.db.allocator),
-            .directory => {},
-        }
         errdefer comptime unreachable;
 
         locked.db.events.finishLocalEventWithPath(switch (kind) {
@@ -607,11 +591,6 @@ pub const LockedDatabase = struct {
             }
         }
         assert(it.next() == null);
-
-        switch (kind) {
-            .regular => locked.db.events.queueSyncEventAssumeCapacity(file_id_list[file_id_list.len - 1]),
-            .directory => {},
-        }
     }
 
     // called from Host
@@ -627,8 +606,8 @@ pub const LockedDatabase = struct {
     }
 
     // called from Host
-    fn markFileAsSynced(locked: LockedDatabase, file_id: network.FileId) void {
-        locked.db.events.finishSyncEvent(file_id);
+    fn confirmModifyFile(locked: LockedDatabase, file_id: network.FileId) void {
+        locked.db.events.finishModifyEvent(file_id);
     }
 
     pub const Debug = struct {
@@ -1172,12 +1151,12 @@ const scan = struct {
         if (meta_ptr.local_file_id == meta.local_file_id and
             meta_ptr.size == meta.size) return;
 
-        try events.ensureSyncEventCapacity(allocator);
+        try events.ensureModifyEventCapacity(allocator);
         errdefer comptime unreachable;
 
         meta_ptr.* = meta;
         const file_id = global_fs.path_to_id.get(info.key_ptr.*).?;
-        events.queueSyncEventAssumeCapacity(file_id);
+        events.queueModifyEventAssumeCapacity(file_id);
     }
 
     fn updateUntrackedRegularFile(
@@ -1332,7 +1311,6 @@ const scan = struct {
         allocator: Allocator,
     ) !void {
         // TODO: Delete/cancel any sync events associated with this file
-
         try events.ensureLocalEventCapacity(allocator);
         errdefer comptime unreachable;
 
@@ -1348,7 +1326,6 @@ const scan = struct {
         allocator: Allocator,
     ) !void {
         // TODO: Delete/cancel any sync events associated with this directory and its children
-
         try events.ensureLocalEventCapacity(allocator);
         errdefer comptime unreachable;
 
@@ -1401,10 +1378,13 @@ fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash
 pub const Host = struct {
     setup: std.atomic.Value(Setup),
     server_platform: fairy.Platform,
-    mt: MessageThread,
+
     mt_status: std.atomic.Value(MtStatus),
-    sync_request_file_id: network.FileId,
+    mt: MessageThread,
+
     sync_file_response_status: std.atomic.Value(FileSyncStatus),
+    sync_request_file_id: network.FileId,
+
     // TODO: Don't store this here, instead make it an argument to `run`
     db: *Database,
     debug: Debug,
@@ -1436,7 +1416,7 @@ pub const Host = struct {
         new_file,
         delete_file,
         delete_dir,
-        sync_file,
+        modify_file,
     };
 
     pub const Debug = struct {
@@ -1447,10 +1427,13 @@ pub const Host = struct {
         return .{
             .setup = .init(.recv_server_platform),
             .server_platform = undefined,
-            .mt = undefined,
+
             .mt_status = .init(.unlocked),
-            .sync_request_file_id = undefined,
+            .mt = undefined,
+
             .sync_file_response_status = .init(.done),
+            .sync_request_file_id = undefined,
+
             .db = db,
             .debug = debug,
         };
@@ -1567,22 +1550,15 @@ pub const Host = struct {
         defer host.db.host_event_inputs = undefined;
         switch (host.db.host_event_inputs.event) {
             .new_file => {
-                host.log(.info, "getting global file id for new file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
+                host.log(.info, "creating new {s} file: {f}", .{
+                    if (host.db.host_event_inputs.directory) "directory" else "file",
+                    host.db.host_event_inputs.path.formatUtf8(),
+                });
                 host.mt = .{
                     .out_new_file = .{
                         .state = .send_path,
                         .path = host.db.host_event_inputs.path,
                         .kind = if (host.db.host_event_inputs.directory) .directory else .regular,
-                    },
-                };
-            },
-            .sync_file => {
-                host.log(.info, "syncing file: {f}", .{host.db.host_event_inputs.path.formatUtf8()});
-                host.mt = .{
-                    .out_file_contents = .{
-                        .state = .send_file,
-                        .file_id = host.db.host_event_inputs.file_id,
-                        .path = host.db.host_event_inputs.path,
                     },
                 };
             },
@@ -1604,6 +1580,14 @@ pub const Host = struct {
                     },
                 };
             },
+            .modify_file => {
+                host.log(.info, "modified file: {f}", .{host.db.host_event_inputs.file_id});
+                host.mt = .{
+                    .out_modify_file = .{
+                        .file_id = host.db.host_event_inputs.file_id,
+                    },
+                };
+            },
         }
     }
 
@@ -1613,10 +1597,6 @@ pub const Host = struct {
                 .send_path => try out_new_file.sendPath(host, io, writer),
                 .receive_decision => unreachable,
             },
-            .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
-                .send_file => try out_file_contents.sendFileContents(host, io, writer),
-                .receive_result => unreachable,
-            },
             .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
                 .send_file_id => try out_delete_file.sendFileId(host, io, writer),
                 .receive_confirmation => unreachable,
@@ -1624,6 +1604,9 @@ pub const Host = struct {
             .out_delete_dir => |*out_delete_dir| switch (out_delete_dir.state) {
                 .send_file_id => try out_delete_dir.sendFileId(host, io, writer),
                 .receive_confirmation => unreachable,
+            },
+            .out_modify_file => |*out_modify_file| {
+                try out_modify_file.sendFileId(host, io, writer);
             },
         }
     }
@@ -1635,11 +1618,10 @@ pub const Host = struct {
         MultipleSyncFileRequests,
     } ||
         network.Reader.ReceivePlatformError ||
-        network.Reader.ReceiveActionError ||
         network.Reader.ReceiveMessageHeaderError ||
+        network.Reader.ReceiveActionError ||
         Io.Cancelable ||
-        Allocator.Error ||
-        fairy.windows.ReceiveFileError;
+        Allocator.Error;
 
     fn receiveMessages(host: *Host, reader: network.Reader, io: Io) ReceiveMessagesError!void {
         host.log(.debug, "receiving on thread {}", .{std.os.windows.GetCurrentThreadId()});
@@ -1685,10 +1667,6 @@ pub const Host = struct {
                             .receive_decision => try out_new_file.receiveDecision(host, reader, io, action),
                             .send_path => unreachable,
                         },
-                        .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
-                            .receive_result => try out_file_contents.receiveResult(host, reader, io, action),
-                            .send_file => unreachable,
-                        },
                         .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
                             .send_file_id => unreachable,
                             .receive_confirmation => try out_delete_file.receiveConfirmation(host, reader, io, action),
@@ -1696,6 +1674,9 @@ pub const Host = struct {
                         .out_delete_dir => |*out_delete_dir| switch (out_delete_dir.state) {
                             .send_file_id => unreachable,
                             .receive_confirmation => try out_delete_dir.receiveConfirmation(host, reader, io, action),
+                        },
+                        .out_modify_file => |*out_modify_file| {
+                            try out_modify_file.receiveConfirmation(host, reader, io, action);
                         },
                     }
                 },
@@ -1760,7 +1741,7 @@ pub const Host = struct {
         assert(host.sync_file_response_status.load(.acquire) == .starting);
 
         const file_id = host.sync_request_file_id;
-        host.log(.info, "syncing file: {f}", .{file_id});
+        host.log(.info, "syncing file id {}", .{@backingInt(file_id)});
 
         const path = blk: {
             const locked = try host.db.lock(io);
@@ -1786,6 +1767,7 @@ pub const Host = struct {
 
         assert(host.sync_file_response_status.cmpxchgStrong(.starting, .transmitting, .acq_rel, .monotonic) == null);
 
+        try writer.sendMessageHeader(.sync_file_response);
         try writer.sendFileSize(file_size);
         try fairy.windows.sendFile(writer.io, file, file_size);
         try writer.sendFileHash(&file_hash);
@@ -1811,9 +1793,9 @@ pub const Host = struct {
 
 pub const MessageThread = union(enum) {
     out_new_file: OutNewFile,
-    out_file_contents: OutFileContents,
     out_delete_file: OutDeleteFile,
     out_delete_dir: OutDeleteDir,
+    out_modify_file: OutModifyFile,
 
     pub const OutNewFile = struct {
         state: State,
@@ -1894,88 +1876,6 @@ pub const MessageThread = union(enum) {
                 "received {f} for file {f}",
                 .{ file_id_list.items[file_id_list.items.len - 1], out_new_file.path.formatUtf8() },
             );
-            host.finishClientEvent(io);
-            host.deleteMessageThread(io);
-        }
-    };
-
-    pub const OutFileContents = struct {
-        state: State,
-        file_id: network.FileId,
-        path: Path,
-
-        pub const State = enum {
-            send_file,
-            receive_result,
-        };
-
-        fn sendFileContents(
-            out_file_contents: *OutFileContents,
-            host: *Host,
-            io: Io,
-            writer: network.Writer,
-        ) !void {
-            assert(out_file_contents.state == .send_file);
-
-            const action: network.Action = .transfer_file_contents;
-            host.logNetworkAction(.outgoing, action);
-
-            const file = try host.db.openFileReadOnly(out_file_contents.path);
-            defer host.db.closeFile(file);
-            // TODO update the database with this new size information
-            const file_size = blk: {
-                const windows_size = try getFileSize(file);
-                const casted_size = std.math.cast(network.FileSize, windows_size) orelse
-                    std.debug.panic(
-                        "TODO: File too large to transfer: '{f}' with size {}",
-                        .{ out_file_contents.path.formatUtf8(), windows_size },
-                    );
-                break :blk casted_size;
-            };
-            const file_hash = network.FileHash{ .blake3 = @splat(0) }; // TODO: compute the hash while sending data
-
-            out_file_contents.state = .receive_result;
-
-            host.beginTransmitting();
-
-            try writer.sendMessageHeader(.new_thread);
-            try writer.sendAction(action);
-            try writer.sendFileId(out_file_contents.file_id);
-            try writer.sendFileSize(file_size);
-            try fairy.windows.sendFile(writer.io, file, file_size);
-            try writer.sendFileHash(&file_hash);
-            try writer.flush();
-
-            host.flipMessageThreadOwner(.transmitting, io);
-        }
-
-        fn receiveResult(
-            out_file_contents: *const OutFileContents,
-            host: *Host,
-            _: network.Reader,
-            io: Io,
-            action: network.Action,
-        ) !void {
-            switch (action) {
-                .transfer_file_success => {
-                    {
-                        const locked = try host.db.lock(io);
-                        defer locked.unlock(io);
-                        locked.markFileAsSynced(out_file_contents.file_id);
-                    }
-                    host.log(.info, "successfully synced file: {f}", .{out_file_contents.path.formatUtf8()});
-                },
-                .transfer_file_failure => {
-                    // TODO mark file as failed to sync
-                    {
-                        const locked = try host.db.lock(io);
-                        defer locked.unlock(io);
-                        locked.markFileAsSynced(out_file_contents.file_id);
-                    }
-                    host.log(.err, "failed to sync file: {f}", .{out_file_contents.path.formatUtf8()});
-                },
-                else => return error.InvalidAction,
-            }
             host.finishClientEvent(io);
             host.deleteMessageThread(io);
         }
@@ -2082,6 +1982,47 @@ pub const MessageThread = union(enum) {
                 },
                 else => return error.InvalidAction,
             }
+        }
+    };
+
+    pub const OutModifyFile = struct {
+        file_id: network.FileId,
+
+        fn sendFileId(
+            out_modify_file: *OutModifyFile,
+            host: *Host,
+            io: Io,
+            writer: network.Writer,
+        ) !void {
+            const action: network.Action = .modify_file;
+            host.logNetworkAction(.outgoing, action);
+
+            host.beginTransmitting();
+
+            try writer.sendMessageHeader(.new_thread);
+            try writer.sendAction(action);
+            try writer.sendFileId(out_modify_file.file_id);
+            try writer.flush();
+
+            host.flipMessageThreadOwner(.transmitting, io);
+        }
+
+        fn receiveConfirmation(
+            out_modify_file: *OutModifyFile,
+            host: *Host,
+            _: network.Reader,
+            io: Io,
+            action: network.Action,
+        ) !void {
+            if (action != .modify_file_confirm) return error.InvalidAction;
+            {
+                const locked = try host.db.lock(io);
+                defer locked.unlock(io);
+                locked.confirmModifyFile(out_modify_file.file_id);
+            }
+            host.log(.info, "successfully modified file: {f}", .{out_modify_file.file_id});
+            host.finishClientEvent(io);
+            host.deleteMessageThread(io);
         }
     };
 };

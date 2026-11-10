@@ -45,27 +45,28 @@ pub fn main(init: std.process.Init.Minimal) !void {
             while (net_server.accept(io)) |stream| {
                 defer stream.close(io);
 
+                var host: fairy.Server.Host = .init(.{ .name = "server" });
                 var fairy_server = switch (fairy.platform) {
-                    .windows => try fairy.Server.initWindows(sync_dir, allocator),
-                    .linux => try fairy.Server.initLinux(sync_dir, io, allocator),
+                    .windows => try fairy.Server.initWindows(sync_dir, allocator, &host),
+                    .linux => try fairy.Server.initLinux(sync_dir, io, allocator, &host),
                 };
                 defer switch (fairy.platform) {
-                    .windows => fairy_server.deinitWindows(),
+                    .windows => fairy_server.deinitWindows(io),
                     .linux => fairy_server.deinitLinux(io),
                 };
 
                 const U = union(enum) {
                     loop: @typeInfo(@TypeOf(fairy.Server.eventLoop)).@"fn".return_type.?,
                     cli: @typeInfo(@TypeOf(runServerCli)).@"fn".return_type.?,
-                    host: @typeInfo(@TypeOf(startHost)).@"fn".return_type.?,
+                    host: @typeInfo(@TypeOf(startServerHost)).@"fn".return_type.?,
                 };
                 var buffer: [3]U = undefined;
                 var select = Io.Select(U).init(io, &buffer);
                 defer select.cancelDiscard();
 
                 try select.concurrent(.loop, fairy.Server.eventLoop, .{ &fairy_server, io });
-                try select.concurrent(.host, startHost, .{ io, &fairy_server, stream });
                 try select.concurrent(.cli, runServerCli, .{ io, &fairy_server });
+                try select.concurrent(.host, startServerHost, .{ &host, io, &fairy_server, stream });
                 switch (try select.await()) {
                     .loop => continue,
                     .cli => |val| return try val,
@@ -76,6 +77,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .client => {
             var cdb = try fairy.client.Database.init(sync_dir, allocator, .{ .name = "client" });
             defer cdb.deinit();
+            cdb.disableAutoScanning();
 
             var cdb_run_task = try io.concurrent(fairy.client.Database.run, .{ &cdb, io });
             defer cdb_run_task.cancel(io) catch {};
@@ -125,7 +127,7 @@ fn runClientCli(io: Io, cdb: *fairy.client.Database) !void {
         break :blk msg;
     };
     printf("{s}", .{help});
-    var disabled_auto_scanning = false;
+    var disabled_auto_scanning = true;
     while (true) {
         var line: []const u8 = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.ReadFailed, error.EndOfStream => |e| return e,
@@ -268,30 +270,15 @@ fn startClientHost(io: Io, db: *fairy.client.Database, addr: Io.net.IpAddress) !
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
-    try startHost(io, db, stream);
-}
-
-fn startHost(
-    io: Io,
-    db: switch (host_type) {
-        .server => *fairy.Server,
-        .client => *fairy.client.Database,
-    },
-    stream: Io.net.Stream,
-) !void {
     var read_buffer: [buffer_size]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
     var write_buffer: [buffer_size]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
 
     const name = @tagName(host_type);
-    const Host = switch (host_type) {
-        .server => fairy.Server.Host,
-        .client => fairy.client.Host,
-    };
-    var host = Host.init(db, .{ .name = name });
+    var host = fairy.client.Host.init(db, .{ .name = name });
     defer host.deinit();
-    var diag: Host.Diagnostics = .{};
+    var diag: fairy.client.Host.Diagnostics = .{};
     defer {
         printf("{s} send result: {s}, recv result: {s}\n", .{
             name,
@@ -306,4 +293,32 @@ fn startHost(
         });
     }
     try host.run(&diag, io, &reader.interface, &writer.interface);
+}
+
+fn startServerHost(
+    host: *fairy.Server.Host,
+    io: Io,
+    server: *fairy.Server,
+    stream: Io.net.Stream,
+) !void {
+    var read_buffer: [buffer_size]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var write_buffer: [buffer_size]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+
+    const Host = fairy.Server.Host;
+    var diag: Host.Diagnostics = .{};
+    defer {
+        printf("server send result: {s}, recv result: {s}\n", .{
+            blk: {
+                const err = diag.send_error orelse break :blk "OK";
+                break :blk (if (err == error.WriteFailed) @errorName(writer.err.?) else @errorName(err));
+            },
+            blk: {
+                const err = diag.recv_error orelse break :blk "OK";
+                break :blk (if (err == error.ReadFailed) @errorName(reader.err.?) else @errorName(err));
+            },
+        });
+    }
+    try host.run(&diag, server, io, &reader.interface, &writer.interface);
 }
