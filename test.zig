@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     .linux => try fairy.Server.initLinux(sync_dir, io, allocator, &host),
                 };
                 defer switch (fairy.platform) {
-                    .windows => fairy_server.deinitWindows(io),
+                    .windows => fairy_server.deinitWindows(),
                     .linux => fairy_server.deinitLinux(io),
                 };
 

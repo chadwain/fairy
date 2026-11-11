@@ -21,14 +21,13 @@ pub const MessageHeader = enum(u8) {
 };
 
 pub const Action = enum(u8) {
-    /// The client asks the server to resolve a file path.
-    /// If successful, the server will ensure there is a `FileId` for every sub-component within the path.
+    /// The client sees a new local file.
     /// Sender: client
     /// Payload: `FileKind` + A path
-    resolve_path,
-    /// Sent in response to a `resolve_path` message.
-    /// Payload(success): A sequence of `FileId`, one for each component of the requested path.
-    resolve_path_response,
+    new_file,
+    /// The server tracks the new file.
+    /// Payload: A sequence of `FileId`, one for each component of the requested path.
+    new_file_confirm,
 
     /// The client witnesses a local file modification.
     /// Payload: `FileId`
@@ -41,9 +40,6 @@ pub const Action = enum(u8) {
     delete_file,
     /// The server acknowledges the client's local file deletion.
     delete_file_confirm,
-
-    delete_dir,
-    delete_dir_confirm,
 };
 
 pub const ack: u32 = 0xF0F0F0F0;
@@ -66,7 +62,6 @@ pub const history = struct {
     };
 
     pub const Delete = extern struct {
-        kind: FileKind,
         file_id: FileId,
     };
 };
@@ -85,13 +80,7 @@ pub const FileHash = struct {
     }
 };
 
-pub const FileId = enum(u32) {
-    _,
-
-    pub fn format(file_id: FileId, writer: *Io.Writer) Io.Writer.Error!void {
-        try writer.print("FileId({d})", .{@backingInt(file_id)});
-    }
-};
+pub const FileId = enum(u32) { _ };
 
 pub const FileSize = u64;
 
@@ -228,9 +217,7 @@ pub const Reader = struct {
         return int;
     }
 
-    pub const ReceiveLinuxPathByteCountError = Io.Reader.Error;
-
-    pub fn receiveLinuxPathByteCount(reader: Reader) ReceiveLinuxPathByteCountError!PathByteCount {
+    pub fn receiveLinuxPathByteCount(reader: Reader) Io.Reader.Error!PathByteCount {
         return try reader.io.takeInt(PathByteCount, endian);
     }
 

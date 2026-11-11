@@ -206,7 +206,7 @@ pub const Database = struct {
                     },
                     .delete_directory => {
                         db.host_event_inputs = .{
-                            .event = .delete_dir,
+                            .event = .delete_file,
                             .file_id = file_id.?,
                             .path = undefined,
                             .directory = undefined,
@@ -556,12 +556,12 @@ pub const LockedDatabase = struct {
             const gop = locked.db.global_fs.files.getOrPutAssumeCapacity(file_id);
             if (gop.found_existing) {
                 if (index < file_id_list.len - 1 and !gop.value_ptr.directory) std.debug.panic(
-                    "TODO client/server conflict: {f}: client says regular file, server says directory",
-                    .{file_id},
+                    "TODO client/server conflict: file id {}: client says regular file, server says directory",
+                    .{@backingInt(file_id)},
                 );
                 if (!gop.value_ptr.path.eql(component)) std.debug.panic(
-                    "TODO client/server conflict: {f}: client path '{f}', server path '{f}'",
-                    .{ file_id, gop.value_ptr.path.formatUtf8(), component.formatUtf8() },
+                    "TODO client/server conflict: file id {}: client path '{f}', server path '{f}'",
+                    .{ @backingInt(file_id), gop.value_ptr.path.formatUtf8(), component.formatUtf8() },
                 );
             } else {
                 if (index != file_id_list.len - 1) {
@@ -1415,7 +1415,6 @@ pub const Host = struct {
     pub const ClientEvent = enum {
         new_file,
         delete_file,
-        delete_dir,
         modify_file,
     };
 
@@ -1556,32 +1555,21 @@ pub const Host = struct {
                 });
                 host.mt = .{
                     .out_new_file = .{
-                        .state = .send_path,
                         .path = host.db.host_event_inputs.path,
                         .kind = if (host.db.host_event_inputs.directory) .directory else .regular,
                     },
                 };
             },
             .delete_file => {
-                host.log(.info, "deleting file: {f}", .{host.db.host_event_inputs.file_id});
+                host.log(.info, "deleting file id {}", .{@backingInt(host.db.host_event_inputs.file_id)});
                 host.mt = .{
                     .out_delete_file = .{
-                        .state = .send_file_id,
-                        .file_id = host.db.host_event_inputs.file_id,
-                    },
-                };
-            },
-            .delete_dir => {
-                host.log(.info, "deleting directory: {f}", .{host.db.host_event_inputs.file_id});
-                host.mt = .{
-                    .out_delete_dir = .{
-                        .state = .send_file_id,
                         .file_id = host.db.host_event_inputs.file_id,
                     },
                 };
             },
             .modify_file => {
-                host.log(.info, "modified file: {f}", .{host.db.host_event_inputs.file_id});
+                host.log(.info, "modified file id {}", .{@backingInt(host.db.host_event_inputs.file_id)});
                 host.mt = .{
                     .out_modify_file = .{
                         .file_id = host.db.host_event_inputs.file_id,
@@ -1593,17 +1581,11 @@ pub const Host = struct {
 
     fn processMessageThread(host: *Host, io: Io, writer: network.Writer) !void {
         switch (host.mt) {
-            .out_new_file => |*out_new_file| switch (out_new_file.state) {
-                .send_path => try out_new_file.sendPath(host, io, writer),
-                .receive_decision => unreachable,
+            .out_new_file => |*out_new_file| {
+                try out_new_file.sendPath(host, io, writer);
             },
-            .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
-                .send_file_id => try out_delete_file.sendFileId(host, io, writer),
-                .receive_confirmation => unreachable,
-            },
-            .out_delete_dir => |*out_delete_dir| switch (out_delete_dir.state) {
-                .send_file_id => try out_delete_dir.sendFileId(host, io, writer),
-                .receive_confirmation => unreachable,
+            .out_delete_file => |*out_delete_file| {
+                try out_delete_file.sendFileId(host, io, writer);
             },
             .out_modify_file => |*out_modify_file| {
                 try out_modify_file.sendFileId(host, io, writer);
@@ -1663,17 +1645,11 @@ pub const Host = struct {
                     host.logNetworkAction(.incoming, action);
 
                     switch (host.mt) {
-                        .out_new_file => |*out_new_file| switch (out_new_file.state) {
-                            .receive_decision => try out_new_file.receiveDecision(host, reader, io, action),
-                            .send_path => unreachable,
+                        .out_new_file => |*out_new_file| {
+                            try out_new_file.receiveDecision(host, reader, io, action);
                         },
-                        .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
-                            .send_file_id => unreachable,
-                            .receive_confirmation => try out_delete_file.receiveConfirmation(host, reader, io, action),
-                        },
-                        .out_delete_dir => |*out_delete_dir| switch (out_delete_dir.state) {
-                            .send_file_id => unreachable,
-                            .receive_confirmation => try out_delete_dir.receiveConfirmation(host, reader, io, action),
+                        .out_delete_file => |*out_delete_file| {
+                            try out_delete_file.receiveConfirmation(host, reader, io, action);
                         },
                         .out_modify_file => |*out_modify_file| {
                             try out_modify_file.receiveConfirmation(host, reader, io, action);
@@ -1758,8 +1734,8 @@ pub const Host = struct {
             const windows_size = try getFileSize(file);
             const casted_size = std.math.cast(network.FileSize, windows_size) orelse
                 std.debug.panic(
-                    "TODO: File too large to transfer: '{f}' with size {}",
-                    .{ file_id, windows_size },
+                    "TODO: File id {} too large to transfer: size is {} bytes",
+                    .{ @backingInt(file_id), windows_size },
                 );
             break :blk casted_size;
         };
@@ -1794,18 +1770,11 @@ pub const Host = struct {
 pub const MessageThread = union(enum) {
     out_new_file: OutNewFile,
     out_delete_file: OutDeleteFile,
-    out_delete_dir: OutDeleteDir,
     out_modify_file: OutModifyFile,
 
     pub const OutNewFile = struct {
-        state: State,
         path: Path,
         kind: network.FileKind,
-
-        pub const State = enum {
-            send_path,
-            receive_decision,
-        };
 
         fn sendPath(
             out_new_file: *OutNewFile,
@@ -1813,12 +1782,8 @@ pub const MessageThread = union(enum) {
             io: Io,
             writer: network.Writer,
         ) !void {
-            assert(out_new_file.state == .send_path);
-
-            const action: network.Action = .resolve_path;
+            const action: network.Action = .new_file;
             host.logNetworkAction(.outgoing, action);
-
-            out_new_file.state = .receive_decision;
 
             host.beginTransmitting();
 
@@ -1853,8 +1818,7 @@ pub const MessageThread = union(enum) {
             io: Io,
             action: network.Action,
         ) !void {
-            assert(out_new_file.state == .receive_decision);
-            if (action != .resolve_path_response) return error.InvalidAction;
+            if (action != .new_file_confirm) return error.InvalidAction;
 
             // TODO Store this in Database somewhere instead
             var file_id_buffer: [fairy.max_path_components]network.FileId = undefined;
@@ -1873,8 +1837,8 @@ pub const MessageThread = union(enum) {
 
             host.log(
                 .info,
-                "received {f} for file {f}",
-                .{ file_id_list.items[file_id_list.items.len - 1], out_new_file.path.formatUtf8() },
+                "received id {} for file {f}",
+                .{ @backingInt(file_id_list.items[file_id_list.items.len - 1]), out_new_file.path.formatUtf8() },
             );
             host.finishClientEvent(io);
             host.deleteMessageThread(io);
@@ -1882,7 +1846,6 @@ pub const MessageThread = union(enum) {
     };
 
     pub const OutDeleteFile = struct {
-        state: enum { send_file_id, receive_confirmation },
         file_id: network.FileId,
 
         fn sendFileId(
@@ -1891,12 +1854,8 @@ pub const MessageThread = union(enum) {
             io: Io,
             writer: network.Writer,
         ) !void {
-            assert(out_delete_file.state == .send_file_id);
-
             const action: network.Action = .delete_file;
             host.logNetworkAction(.outgoing, action);
-
-            out_delete_file.state = .receive_confirmation;
 
             host.beginTransmitting();
 
@@ -1915,68 +1874,18 @@ pub const MessageThread = union(enum) {
             io: Io,
             action: network.Action,
         ) !void {
-            assert(out_delete_file.state == .receive_confirmation);
-
             switch (action) {
                 .delete_file_confirm => {
                     {
                         const locked = try host.db.lock(io);
                         defer locked.unlock(io);
-                        locked.confirmDeleteFile(out_delete_file.file_id);
+                        const is_directory = locked.db.global_fs.files.get(out_delete_file.file_id).?.directory;
+                        switch (is_directory) {
+                            false => locked.confirmDeleteFile(out_delete_file.file_id),
+                            true => locked.confirmDeleteDir(out_delete_file.file_id),
+                        }
                     }
-                    host.log(.info, "successfully deleted file: {f}", .{out_delete_file.file_id});
-                    host.finishClientEvent(io);
-                    host.deleteMessageThread(io);
-                },
-                else => return error.InvalidAction,
-            }
-        }
-    };
-
-    pub const OutDeleteDir = struct {
-        state: enum { send_file_id, receive_confirmation },
-        file_id: network.FileId,
-
-        fn sendFileId(
-            out_delete_dir: *OutDeleteDir,
-            host: *Host,
-            io: Io,
-            writer: network.Writer,
-        ) !void {
-            assert(out_delete_dir.state == .send_file_id);
-
-            const action: network.Action = .delete_dir;
-            host.logNetworkAction(.outgoing, action);
-
-            out_delete_dir.state = .receive_confirmation;
-
-            host.beginTransmitting();
-
-            try writer.sendMessageHeader(.new_thread);
-            try writer.sendAction(action);
-            try writer.sendFileId(out_delete_dir.file_id);
-            try writer.flush();
-
-            host.flipMessageThreadOwner(.transmitting, io);
-        }
-
-        fn receiveConfirmation(
-            out_delete_dir: *OutDeleteDir,
-            host: *Host,
-            _: network.Reader,
-            io: Io,
-            action: network.Action,
-        ) !void {
-            assert(out_delete_dir.state == .receive_confirmation);
-
-            switch (action) {
-                .delete_dir_confirm => {
-                    {
-                        const locked = try host.db.lock(io);
-                        defer locked.unlock(io);
-                        locked.confirmDeleteDir(out_delete_dir.file_id);
-                    }
-                    host.log(.info, "successfully deleted directory: {f}", .{out_delete_dir.file_id});
+                    host.log(.info, "successfully deleted file id {}", .{@backingInt(out_delete_file.file_id)});
                     host.finishClientEvent(io);
                     host.deleteMessageThread(io);
                 },
@@ -2020,7 +1929,7 @@ pub const MessageThread = union(enum) {
                 defer locked.unlock(io);
                 locked.confirmModifyFile(out_modify_file.file_id);
             }
-            host.log(.info, "successfully modified file: {f}", .{out_modify_file.file_id});
+            host.log(.info, "successfully modified file id {}", .{@backingInt(out_modify_file.file_id)});
             host.finishClientEvent(io);
             host.deleteMessageThread(io);
         }

@@ -22,7 +22,7 @@ next_file_id: ?std.meta.Tag(network.FileId),
 db: Database,
 events: Events,
 
-host_status: std.atomic.Value(HostStatus),
+host_status: std.atomic.Value(HostStatus), // TODO: move to Host
 host: *Host,
 
 debug: Debug,
@@ -66,30 +66,21 @@ fn initCommon(sync_dir: DirHandle, allocator: Allocator, host: *Host) Server {
     };
 }
 
-pub fn deinitWindows(server: *Server, io: Io) void {
+pub fn deinitWindows(server: *Server) void {
     comptime assert(fairy.platform == .windows);
-    server.deinitCommon(io);
     fairy.windows.closeHandle(server.sync_dir);
+    server.deinitCommon();
     server.* = undefined;
 }
 
 pub fn deinitLinux(server: *Server, io: Io) void {
     comptime assert(fairy.platform == .linux);
-    server.deinitCommon(io);
     server.sync_dir.close(io);
+    server.deinitCommon();
     server.* = undefined;
 }
 
-fn deinitCommon(server: *Server, io: Io) void {
-    server.host.setAlert(.shutdown);
-    server.host.wakeSendTask(io);
-    while (true) {
-        switch (server.host_status.load(.monotonic)) {
-            .connected => io.futexWaitUncancelable(HostStatus, &server.host_status.raw, .connected),
-            .disconnected => break,
-        }
-    }
-
+fn deinitCommon(server: *Server) void {
     var path_arena = server.path_arena.promote(server.allocator);
     path_arena.deinit();
 
@@ -232,6 +223,17 @@ pub const Events = struct {
 };
 
 pub fn eventLoop(server: *Server, io: Io) !void {
+    defer {
+        server.host.setAlert(.shutdown);
+        server.host.wakeSendTask(io);
+        while (true) {
+            switch (server.host_status.load(.monotonic)) {
+                .connected => io.futexWaitUncancelable(HostStatus, &server.host_status.raw, .connected),
+                .disconnected => break,
+            }
+        }
+    }
+
     while (true) {
         try io.futexWait(u32, &server.events.alert.raw, 0);
         const alert = server.events.alert.swap(0, .monotonic);
@@ -271,7 +273,7 @@ pub fn eventLoop(server: *Server, io: Io) !void {
                                 const locked = server.lockUncancelable(io);
                                 defer locked.unlock(io);
                                 locked.server.events.delete.orderedRemoveAt(0);
-                                locked.deleteTree(file_id);
+                                locked.removeTree(file_id);
                             },
                             false => {
                                 // TODO: Treat file not found as success
@@ -284,7 +286,7 @@ pub fn eventLoop(server: *Server, io: Io) !void {
                                 const locked = server.lockUncancelable(io);
                                 defer locked.unlock(io);
                                 locked.server.events.delete.orderedRemoveAt(0);
-                                locked.deleteFile(file_id);
+                                locked.removeFile(file_id);
                             },
                         }
                     } else {
@@ -293,7 +295,9 @@ pub fn eventLoop(server: *Server, io: Io) !void {
                 },
                 .completed_file_sync => {
                     assert(server.host.file_sync_status.swap(.none, .acquire) == .completed);
-                    server.debug.log(.info, "complete sync request for {}", .{server.host.file_sync_file_id});
+                    server.debug.log(.info, "complete sync request for file id {}", .{
+                        @backingInt(server.host.file_sync_file_id),
+                    });
                     try server.mutex.lock(io);
                     defer server.mutex.unlock(io);
                     assert(server.events.sync.remove(server.host.file_sync_file_id));
@@ -483,20 +487,24 @@ pub const Debug = struct {
                 .create => {
                     const create = reader.takeStruct(network.history.Create, network.endian) catch unreachable;
                     try writer.print(
-                        "create: kind={s}, parent={?f}, length={}\n",
-                        .{ @tagName(create.kind), if (!create.top_level) create.parent else null, create.num_new_files },
+                        "create: kind={s}, parent={?}, length={}\n",
+                        .{
+                            @tagName(create.kind),
+                            if (!create.top_level) @backingInt(create.parent) else null,
+                            create.num_new_files,
+                        },
                     );
                     for (0..create.num_new_files) |_| {
                         const file_id = reader.takeEnumNonexhaustive(network.FileId, network.endian) catch unreachable;
                         const component = (reader.takeDelimiter(0) catch unreachable).?;
-                        try writer.print("\tid={f}, name={f}\n", .{ file_id, std.unicode.fmtUtf8(component) });
+                        try writer.print("\tid={}, name={f}\n", .{ @backingInt(file_id), std.unicode.fmtUtf8(component) });
                     }
                 },
                 .delete => {
                     const delete = reader.takeStruct(network.history.Delete, network.endian) catch unreachable;
                     try writer.print(
-                        "delete: kind={s}, id={f}\n",
-                        .{ @tagName(delete.kind), delete.file_id },
+                        "delete: id={}\n",
+                        .{@backingInt(delete.file_id)},
                     );
                 },
                 else => std.debug.panic("TODO", .{}),
@@ -724,15 +732,6 @@ const Locked = struct {
         return info.path;
     }
 
-    fn queueDeleteEventAssumeCapacity(locked: Locked, file_id: network.FileId) void {
-        const events = &locked.server.events;
-        if (events.sync.getPtr(file_id)) |sync| {
-            sync.canceled = true;
-        }
-        events.delete.putAssumeCapacityNoClobber(file_id, {});
-        events.setAlert(.delete_files);
-    }
-
     fn markFileAsDeleted(
         locked: Locked,
         file_id: network.FileId,
@@ -746,7 +745,6 @@ const Locked = struct {
             .synced => {},
             .deleted => return diag.errClient(error.UnknownFileId),
         }
-        if (file_info.directory) return diag.errClient(error.NotRegularFile);
 
         try locked.ensureUnusedRevision(diag);
         const history_needed_capacity = @sizeOf(network.history.Entry) +
@@ -756,60 +754,39 @@ const Locked = struct {
         errdefer comptime unreachable;
 
         file_info.status = .deleted;
+        if (file_info.directory) locked.markTreeAsDeleted(file_id);
 
-        const parent_children = if (file_info.parent) |parent_file_id|
+        const parent_dir_info = if (file_info.parent) |parent_file_id|
             s.db.directory_file_info.getPtr(parent_file_id).?
         else
             &s.db.sync_dir_entry;
-        assert(parent_children.children.swapRemove(file_id));
-        assert(parent_children.children_by_component.swapRemove(file_info.component));
+        assert(parent_dir_info.children.swapRemove(file_id));
+        assert(parent_dir_info.children_by_component.swapRemove(file_info.component));
 
-        var history_writer = Io.Writer.Allocating.fromArrayList(s.allocator, &s.db.history);
-        defer {
-            s.db.history = history_writer.toArrayList();
-            const revision = locked.createRevisionAssumeAvailable();
-            _ = revision; // TODO
+        {
+            var history_writer = Io.Writer.Allocating.fromArrayList(s.allocator, &s.db.history);
+            defer s.db.history = history_writer.toArrayList();
+            const history = &history_writer.writer;
+
+            history.writeInt(
+                std.meta.Tag(network.history.Entry),
+                @backingInt(network.history.Entry.delete),
+                network.endian,
+            ) catch unreachable;
+            history.writeStruct(network.history.Delete{
+                .file_id = file_id,
+            }, network.endian) catch unreachable;
         }
-        const history = &history_writer.writer;
 
-        history.writeInt(std.meta.Tag(network.history.Entry), @backingInt(network.history.Entry.delete), network.endian) catch unreachable;
-        history.writeStruct(network.history.Delete{
-            .kind = .regular,
-            .file_id = file_id,
-        }, network.endian) catch unreachable;
+        const revision = locked.createRevisionAssumeAvailable();
+        _ = revision; // TODO
 
         locked.queueDeleteEventAssumeCapacity(file_id);
     }
 
-    fn deleteFile(locked: Locked, file_id: network.FileId) void {
-        assert(locked.server.db.files.remove(file_id));
-        assert(locked.server.db.regular_file_info.remove(file_id));
-    }
-
-    /// Sets all files within a tree to the deleted status.
-    fn markTreeAsDeleted(
-        locked: Locked,
-        root_file_id: network.FileId,
-        diag: *Diagnostics,
-    ) error{ Client, Global, Internal }!void {
+    /// Sets all files within a tree (except the root) to the deleted status.
+    fn markTreeAsDeleted(locked: Locked, root_file_id: network.FileId) void {
         const s = locked.server;
-
-        const root_info = s.db.files.getPtr(root_file_id) orelse return diag.errClient(error.UnknownFileId);
-        switch (root_info.status) {
-            .new => std.debug.panic("TODO", .{}),
-            .synced => {},
-            .deleted => return diag.errClient(error.UnknownFileId),
-        }
-        if (!root_info.directory) return diag.errClient(error.NotDirectoryFile);
-
-        try locked.ensureUnusedRevision(diag);
-        const history_needed_capacity = @sizeOf(network.history.Entry) +
-            @sizeOf(network.history.Delete);
-        s.db.history.ensureUnusedCapacity(s.allocator, history_needed_capacity) catch |err| return diag.errInternal(err);
-        s.events.delete.ensureUnusedCapacity(s.allocator, 1) catch |err| return diag.errInternal(err);
-        errdefer comptime unreachable;
-
-        root_info.status = .deleted;
 
         const Item = struct {
             children: []const network.FileId,
@@ -842,31 +819,23 @@ const Locked = struct {
                 }
             }
         }
-
-        const parent_dir_info = if (root_info.parent) |parent_file_id|
-            s.db.directory_file_info.getPtr(parent_file_id).?
-        else
-            &s.db.sync_dir_entry;
-        assert(parent_dir_info.children.swapRemove(root_file_id));
-        assert(parent_dir_info.children_by_component.swapRemove(root_info.component));
-
-        var history_writer = Io.Writer.Allocating.fromArrayList(s.allocator, &s.db.history);
-        defer {
-            s.db.history = history_writer.toArrayList();
-            const revision = locked.createRevisionAssumeAvailable();
-            _ = revision; // TODO
-        }
-        const history = &history_writer.writer;
-
-        history.writeInt(std.meta.Tag(network.history.Entry), @backingInt(network.history.Entry.delete), network.endian) catch unreachable;
-        history.writeStruct(network.history.Delete{
-            .kind = .directory,
-            .file_id = root_file_id,
-        }, network.endian) catch unreachable;
-        locked.queueDeleteEventAssumeCapacity(root_file_id);
     }
 
-    fn deleteTree(locked: Locked, file_id: network.FileId) void {
+    fn queueDeleteEventAssumeCapacity(locked: Locked, file_id: network.FileId) void {
+        const events = &locked.server.events;
+        if (events.sync.getPtr(file_id)) |sync| {
+            sync.canceled = true;
+        }
+        events.delete.putAssumeCapacityNoClobber(file_id, {});
+        events.setAlert(.delete_files);
+    }
+
+    fn removeFile(locked: Locked, file_id: network.FileId) void {
+        assert(locked.server.db.files.remove(file_id));
+        assert(locked.server.db.regular_file_info.remove(file_id));
+    }
+
+    fn removeTree(locked: Locked, file_id: network.FileId) void {
         const Item = struct {
             children: []const network.FileId,
             index: fairy.FileCount = 0,
@@ -986,7 +955,7 @@ pub const Host = struct {
         sending,
         /// The host is waiting for a file sync response.
         waiting,
-        /// The file has been synced.
+        /// The file sync request has been completed.
         completed,
     };
 
@@ -1119,9 +1088,6 @@ pub const Host = struct {
             .in_delete_file => |*in_delete_file| {
                 try in_delete_file.sendConfirmation(host, io, writer);
             },
-            .in_delete_dir => |*in_delete_dir| {
-                try in_delete_dir.sendConfirmation(host, io, writer);
-            },
             .in_modify_file => |*in_modify_file| {
                 try in_modify_file.sendConfirmation(host, io, writer);
             },
@@ -1160,7 +1126,8 @@ pub const Host = struct {
             .linux => Io.Dir.CreateDirPathOpenError ||
                 Io.File.OpenError ||
                 Io.Dir.DeleteFileError ||
-                Io.File.Writer.Error,
+                Io.File.Writer.Error ||
+                network.Reader.ReceiveLinuxPathError,
         };
 
     fn receiveIncomingMessages(host: *Host, server: *Server, reader: network.Reader, io: Io) RecvError!void {
@@ -1194,14 +1161,11 @@ pub const Host = struct {
                     const action = try reader.receiveAction();
                     host.logMessage(.incoming, action);
                     switch (action) {
-                        .resolve_path => {
+                        .new_file => {
                             try MessageThread.InNewFile.initMessageThread(host, server, io, reader);
                         },
                         .delete_file => {
                             try MessageThread.InDeleteFile.initMessageThread(host, server, io, reader);
-                        },
-                        .delete_dir => {
-                            try MessageThread.InDeleteDir.initMessageThread(host, server, io, reader);
                         },
                         .modify_file => {
                             try MessageThread.InModifyFile.initMessageThread(host, server, io, reader);
@@ -1332,7 +1296,6 @@ pub const Host = struct {
 pub const MessageThread = union(enum) {
     in_new_file: InNewFile,
     in_delete_file: InDeleteFile,
-    in_delete_dir: InDeleteDir,
     in_modify_file: InModifyFile,
 
     pub const InNewFile = struct {
@@ -1390,7 +1353,7 @@ pub const MessageThread = union(enum) {
             io: Io,
             writer: network.Writer,
         ) !void {
-            const action: network.Action = .resolve_path_response;
+            const action: network.Action = .new_file_confirm;
             host.logMessage(.outgoing, action);
 
             var reverse_file_ids_buffer: [fairy.max_path_components]network.FileId = undefined;
@@ -1446,51 +1409,6 @@ pub const MessageThread = union(enum) {
             writer: network.Writer,
         ) !void {
             const action: network.Action = .delete_file_confirm;
-            host.logMessage(.outgoing, action);
-
-            host.beginTransmitting();
-
-            try writer.sendMessageHeader(.thread_reply);
-            try writer.sendAction(action);
-            try writer.flush();
-
-            host.deleteMessageThread(io);
-        }
-    };
-
-    pub const InDeleteDir = struct {
-        fn initMessageThread(
-            host: *Host,
-            server: *Server,
-            io: Io,
-            reader: network.Reader,
-        ) !void {
-            const file_id = try reader.receiveFileId();
-            {
-                const locked = try server.lock(io);
-                defer locked.unlock(io);
-                var diag: Server.Diagnostics = undefined;
-                locked.markTreeAsDeleted(file_id, &diag) catch |err| switch (err) {
-                    error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
-                    error.Global => std.debug.panic("TODO: Global error: {s}", .{@errorName(diag.global)}),
-                    error.Internal => std.debug.panic("TODO: Internal error: {s}", .{@errorName(diag.internal)}),
-                };
-            }
-            server.wake(io);
-
-            const data: MessageThread = .{
-                .in_delete_dir = .{},
-            };
-            host.setOutgoingMessage(io, data);
-        }
-
-        fn sendConfirmation(
-            _: *InDeleteDir,
-            host: *Host,
-            io: Io,
-            writer: network.Writer,
-        ) !void {
-            const action: network.Action = .delete_dir_confirm;
             host.logMessage(.outgoing, action);
 
             host.beginTransmitting();
