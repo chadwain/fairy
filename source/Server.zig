@@ -3,7 +3,6 @@ const Server = @This();
 const std = @import("std");
 const assert = std.debug.assert;
 const w = std.os.windows;
-const wtf16 = std.unicode.wtf8ToWtf16LeStringLiteral;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -22,31 +21,31 @@ next_file_id: ?std.meta.Tag(network.FileId),
 db: Database,
 events: Events,
 
-host_status: std.atomic.Value(HostStatus), // TODO: move to Host
-host: *Host,
+cc_status: std.atomic.Value(ClientConnectionStatus),
+host: Host,
 
 debug: Debug,
 
-pub fn initWindows(sync_dir_path: [:0]const u16, allocator: Allocator, host: *Host) !Server {
+pub fn initWindows(sync_dir_path: [:0]const u16, allocator: Allocator) !Server {
     comptime assert(fairy.platform == .windows);
     // TODO: The length of this path must also be factored into path length calculations.
     const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
     const sync_dir = try fairy.windows.openSyncDir(sync_dir_path_nt.span());
     errdefer comptime unreachable;
 
-    return initCommon(sync_dir, allocator, host);
+    return initCommon(sync_dir, allocator);
 }
 
-pub fn initLinux(sync_dir_path: [:0]const u8, io: Io, allocator: Allocator, host: *Host) !Server {
+pub fn initLinux(sync_dir_path: [:0]const u8, io: Io, allocator: Allocator) !Server {
     comptime assert(fairy.platform == .linux);
     // TODO: The length of `sync_dir_path` must also be factored into path length calculations.
     const sync_dir = try Io.Dir.cwd().openDir(io, sync_dir_path, .{ .iterate = true });
     errdefer comptime unreachable;
 
-    return initCommon(sync_dir, allocator, host);
+    return initCommon(sync_dir, allocator);
 }
 
-fn initCommon(sync_dir: DirHandle, allocator: Allocator, host: *Host) Server {
+fn initCommon(sync_dir: DirHandle, allocator: Allocator) Server {
     return .{
         .sync_dir = sync_dir,
         .allocator = allocator,
@@ -59,8 +58,8 @@ fn initCommon(sync_dir: DirHandle, allocator: Allocator, host: *Host) Server {
         .db = .init,
         .events = .init,
 
-        .host_status = .init(.disconnected),
-        .host = host,
+        .cc_status = undefined,
+        .host = undefined,
 
         .debug = .{},
     };
@@ -116,8 +115,14 @@ pub const DirHandle = switch (fairy.platform) {
     .linux => Io.Dir,
 };
 
-pub const HostStatus = enum(u32) {
+pub const ClientConnectionStatus = enum(u32) {
+    /// There is no client connected.
+    uninitialized,
+    /// A client has been accepted. The server will be alerted about this new status.
+    accepted,
+    /// Server/client communication is ready.
     connected,
+    /// The client was disconnected. The server will be alerted about this new status.
     disconnected,
 };
 
@@ -204,6 +209,8 @@ pub const Events = struct {
         generic,
         delete_files,
         completed_file_sync,
+        accept_client,
+        connection_close,
     };
 
     const init: Events = .{
@@ -222,17 +229,16 @@ pub const Events = struct {
     }
 };
 
-pub fn eventLoop(server: *Server, io: Io) !void {
-    defer {
-        server.host.setAlert(.shutdown);
-        server.host.wakeSendTask(io);
-        while (true) {
-            switch (server.host_status.load(.monotonic)) {
-                .connected => io.futexWaitUncancelable(HostStatus, &server.host_status.raw, .connected),
-                .disconnected => break,
-            }
-        }
-    }
+fn wake(server: *Server, io: Io) void {
+    io.futexWake(u32, &server.events.alert.raw, 1);
+}
+
+pub fn eventLoop(server: *Server, io: Io, listen_addr: Io.net.IpAddress) !void {
+    server.host = undefined;
+    server.cc_status = .init(.uninitialized);
+
+    var accept_task = try io.concurrent(acceptClients, .{ server, io, listen_addr });
+    defer accept_task.cancel(io) catch {};
 
     while (true) {
         try io.futexWait(u32, &server.events.alert.raw, 0);
@@ -255,7 +261,7 @@ pub fn eventLoop(server: *Server, io: Io) !void {
                         const path, const directory = .{ info.path, info.directory };
                         server.mutex.unlock(io);
 
-                        server.debug.log(.info, "delete {s} with id {} at {f}", .{
+                        server.log(.info, "delete {s} with id {} at {f}", .{
                             if (directory) "tree" else "file",
                             @backingInt(file_id),
                             path.formatUtf8(),
@@ -295,44 +301,112 @@ pub fn eventLoop(server: *Server, io: Io) !void {
                 },
                 .completed_file_sync => {
                     assert(server.host.file_sync_status.swap(.none, .acquire) == .completed);
-                    server.debug.log(.info, "complete sync request for file id {}", .{
+                    server.log(.info, "complete sync request for file id {}", .{
                         @backingInt(server.host.file_sync_file_id),
                     });
                     try server.mutex.lock(io);
                     defer server.mutex.unlock(io);
                     assert(server.events.sync.remove(server.host.file_sync_file_id));
                 },
+                .accept_client => {
+                    assert(server.cc_status.load(.acquire) == .accepted);
+                    server.host = Host.init(.{ .name = "server" });
+                    assert(server.cc_status.swap(.connected, .release) == .accepted);
+                    io.futexWake(ClientConnectionStatus, &server.cc_status.raw, 1);
+                },
+                .connection_close => {
+                    assert(server.cc_status.load(.acquire) == .disconnected);
+                    server.host = undefined;
+                    assert(server.cc_status.swap(.uninitialized, .release) == .disconnected);
+                    io.futexWake(ClientConnectionStatus, &server.cc_status.raw, 1);
+                },
             };
         }
 
-        if (server.host.file_sync_status.load(.monotonic) == .none) check_sync_events: {
-            const file_id = blk: {
-                try server.mutex.lock(io);
-                defer server.mutex.unlock(io);
-                while (server.events.sync.count() > 0) {
-                    var it = server.events.sync.iterator();
-                    const item = it.next().?;
-                    if (item.value_ptr.canceled) {
-                        server.events.sync.removeByPtr(item.key_ptr);
-                        continue;
-                    }
-                    const info = server.db.files.getPtr(item.key_ptr.*).?;
-                    assert(!info.directory);
-                    break :blk item.key_ptr.*;
-                } else break :check_sync_events;
-            };
+        if (server.cc_status.load(.monotonic) == .connected) {
+            if (server.host.file_sync_status.load(.monotonic) == .none) check_sync_events: {
+                const file_id = blk: {
+                    try server.mutex.lock(io);
+                    defer server.mutex.unlock(io);
+                    while (server.events.sync.count() > 0) {
+                        var it = server.events.sync.iterator();
+                        const item = it.next().?;
+                        if (item.value_ptr.canceled) {
+                            server.events.sync.removeByPtr(item.key_ptr);
+                            continue;
+                        }
+                        const info = server.db.files.getPtr(item.key_ptr.*).?;
+                        assert(!info.directory);
+                        break :blk item.key_ptr.*;
+                    } else break :check_sync_events;
+                };
 
-            server.debug.log(.info, "start sync request for file id {}", .{@backingInt(file_id)});
-            server.host.file_sync_file_id = file_id;
-            server.host.file_sync_status.store(.queued, .release);
-            server.host.setAlert(.sync_file);
-            server.host.wakeSendTask(io);
+                server.log(.info, "start sync request for file id {}", .{@backingInt(file_id)});
+                server.host.file_sync_file_id = file_id;
+                server.host.file_sync_status.store(.queued, .release);
+                server.host.setAlert(.sync_file);
+                server.host.wakeSendTask(io);
+            }
         }
     }
 }
 
-fn wake(server: *Server, io: Io) void {
-    io.futexWake(u32, &server.events.alert.raw, 1);
+fn acceptClients(server: *Server, io: Io, listen_addr: Io.net.IpAddress) !void {
+    var net_server = try listen_addr.listen(io, .{});
+    defer net_server.deinit(io);
+
+    while (true) {
+        while (server.cc_status.load(.monotonic) != .uninitialized) {
+            try io.futexWait(ClientConnectionStatus, &server.cc_status.raw, .uninitialized);
+        }
+
+        const stream = try net_server.accept(io);
+        server.log(.info, "accept connection at {f}", .{stream.socket.address});
+        defer {
+            server.log(.info, "close connection at {f}", .{stream.socket.address});
+            stream.close(io);
+        }
+
+        assert(server.cc_status.swap(.accepted, .release) == .uninitialized);
+        server.events.setAlert(.accept_client);
+        server.wake(io);
+
+        while (true) {
+            switch (server.cc_status.load(.acquire)) {
+                .accepted => try io.futexWait(ClientConnectionStatus, &server.cc_status.raw, .accepted),
+                .connected => break,
+                else => unreachable,
+            }
+        }
+
+        defer {
+            assert(server.cc_status.swap(.disconnected, .release) == .connected);
+            server.events.setAlert(.connection_close);
+            server.wake(io);
+        }
+
+        const buffer_size = network.min_reader_writer_buffer_size;
+        var read_buffer: [buffer_size]u8 = undefined;
+        var reader = stream.reader(io, &read_buffer);
+        var write_buffer: [buffer_size]u8 = undefined;
+        var writer = stream.writer(io, &write_buffer);
+
+        var diag: Host.Diagnostics = .{};
+        defer {
+            server.log(.debug, "disconnect host {s}, send result: {s}, recv result: {s}", .{
+                server.host.debug.name,
+                blk: {
+                    const err = diag.send_error orelse break :blk "OK";
+                    break :blk (if (err == error.WriteFailed) @errorName(writer.err.?) else @errorName(err));
+                },
+                blk: {
+                    const err = diag.recv_error orelse break :blk "OK";
+                    break :blk (if (err == error.ReadFailed) @errorName(reader.err.?) else @errorName(err));
+                },
+            });
+        }
+        try server.host.run(&diag, server, io, &reader.interface, &writer.interface);
+    }
 }
 
 const Diagnostics = union {
@@ -377,6 +451,10 @@ const Diagnostics = union {
         return error.Internal;
     }
 };
+
+fn log(_: *const Server, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype) void {
+    @field(fairy.log, @tagName(level))("(server) " ++ fmt, args);
+}
 
 /// Creates a regular file for writing to. Creates parent directories as necessary.
 fn createRegularFileWindows(server: *Server, full_path: Path, file_size: w.LARGE_INTEGER) !w.HANDLE {
@@ -442,10 +520,6 @@ fn createRegularFileLinux(server: *Server, full_path: Path, io: Io) !Io.File {
 }
 
 pub const Debug = struct {
-    fn log(_: *const Debug, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype) void {
-        @field(fairy.log, @tagName(level))("(server) " ++ fmt, args);
-    }
-
     pub fn printFileEntries(debug: *Debug, writer: *Io.Writer, io: Io) !void {
         const server: *Server = @alignCast(@fieldParentPtr("debug", debug));
         try server.mutex.lock(io);
@@ -530,7 +604,7 @@ const Locked = struct {
     fn createRevisionAssumeAvailable(locked: Locked) network.RevisionId {
         locked.server.db.revisions.appendAssumeCapacity(locked.server.db.history.items.len);
         const int: std.meta.Tag(network.RevisionId) = @intCast(locked.server.db.revisions.items.len);
-        locked.server.debug.log(.info, "created revision {}", .{int});
+        locked.server.log(.info, "created revision {}", .{int});
         return @fromBackingInt(int);
     }
 
@@ -1013,15 +1087,6 @@ pub const Host = struct {
         try select.concurrent(.send_error, sendOutgoingMessages, .{ host, server, .init(writer), io });
         try select.concurrent(.recv_error, receiveIncomingMessages, .{ host, server, .init(reader), io });
 
-        host.debugLog("started", .{});
-        if (server.host_status.swap(.connected, .monotonic) == .connected) {
-            std.debug.panic("TODO: Host already connected", .{});
-        }
-        defer {
-            server.host_status.store(.disconnected, .monotonic);
-            io.futexWake(HostStatus, &server.host_status.raw, 1);
-        }
-
         ns.addToDiagnostics(diag, try select.await());
     }
 
@@ -1236,16 +1301,6 @@ pub const Host = struct {
                 };
                 defer fairy.windows.closeHandle(handle);
                 try fairy.windows.receiveFile(reader.io, handle, file_size);
-                {
-                    const locked = try server.lock(io);
-                    defer locked.unlock(io);
-                    const info = locked.server.db.files.getPtr(file_id) orelse std.debug.panic("TODO", .{});
-                    switch (info.status) {
-                        .new => info.status = .synced,
-                        .synced => {},
-                        .deleted => {},
-                    }
-                }
             },
             .linux => {
                 const file_size = try reader.receiveFileSize();
@@ -1274,6 +1329,16 @@ pub const Host = struct {
         const file_hash = try reader.receiveFileHash();
         _ = file_hash; // TODO
 
+        {
+            const locked = try server.lock(io);
+            defer locked.unlock(io);
+            const info = locked.server.db.files.getPtr(file_id) orelse std.debug.panic("TODO", .{});
+            switch (info.status) {
+                .new => info.status = .synced,
+                .synced => {},
+                .deleted => {},
+            }
+        }
     }
 
     fn debugLog(host: *const Host, comptime fmt: []const u8, args: anytype) void {
