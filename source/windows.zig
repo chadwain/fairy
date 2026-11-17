@@ -510,12 +510,92 @@ pub fn closeHandle(handle: w.HANDLE) void {
     }
 }
 
-pub const CreateFileOptions = struct {
-    initial_size: w.LARGE_INTEGER,
+/// Creates the directory specified by `path` and returns a handle to it.
+/// Creates intermediate directories as necessary.
+pub fn createDirPath(root_dir: w.HANDLE, path: Path) !w.HANDLE {
+    // TODO: We must check that the opened dirs have the same case as in `path`
+    var it = path.backwardsPathIterator();
+    var dir_handle = blk: {
+        while (it.previous()) |sub_path| {
+            const handle = createDir(root_dir, sub_path) catch |err| switch (err) {
+                error.ParentDirNotFound => continue,
+                error.Unexpected => |e| return e,
+            };
+            break :blk handle;
+        } else std.debug.panic("TODO: Could not create a file in the root directory", .{});
+    };
+    defer closeHandle(dir_handle);
+    errdefer std.debug.panic("TODO: Delete intermediate directories and files", .{});
+
+    it.setDirection(.forwards);
+    var component = it.nextComponent().?;
+    while (true) {
+        const child_handle = createDir(dir_handle, component) catch |err| switch (err) {
+            error.ParentDirNotFound => {
+                std.debug.panic("TODO: Directory not found even though we have an open handle to it (?)", .{});
+            },
+            error.Unexpected => |e| return e,
+        };
+        errdefer comptime unreachable;
+
+        component = it.nextComponent() orelse return child_handle;
+        closeHandle(dir_handle);
+        dir_handle = child_handle;
+    }
+
+    unreachable;
+}
+
+pub const FileClass = enum {
+    /// A read-only file.
+    read,
+    /// A write-only file.
+    write,
+    /// A file that is intended to be renamed.
+    rename,
+
+    pub fn accessMask(class: FileClass) w.ACCESS_MASK {
+        return switch (class) {
+            .read => .{
+                .STANDARD = .{ .SYNCHRONIZE = true },
+                .GENERIC = .{ .READ = true },
+            },
+            .write => .{
+                .SPECIFIC = .{
+                    .FILE = .{
+                        .WRITE_DATA = true,
+                        .APPEND_DATA = true,
+                    },
+                },
+                .STANDARD = .{
+                    .RIGHTS = .{
+                        // .READ_CONTROL = true,
+                    },
+                    .SYNCHRONIZE = true,
+                },
+            },
+            .rename => .{
+                .STANDARD = .{
+                    .RIGHTS = .{
+                        .DELETE = true,
+                        // .READ_CONTROL = true,
+                    },
+                    .SYNCHRONIZE = true,
+                },
+            },
+        };
+    }
 };
 
+pub const CreateFileOptions = struct {
+    initial_size: w.LARGE_INTEGER,
+    class: FileClass,
+};
+
+pub const CreateFileError = error{ ParentDirNotFound, Unexpected };
+
 /// Creates a new file, or overwrites an existing one.
-pub fn createFile(parent: w.HANDLE, path: Path, options: CreateFileOptions) !w.HANDLE {
+pub fn createFile(parent: w.HANDLE, path: Path, options: CreateFileOptions) CreateFileError!w.HANDLE {
     var handle: w.HANDLE = undefined;
     var unicode_string = w.UNICODE_STRING.init(path.slice);
     const object_attributes: w.OBJECT.ATTRIBUTES = .{
@@ -532,10 +612,7 @@ pub fn createFile(parent: w.HANDLE, path: Path, options: CreateFileOptions) !w.H
 
     const status = w.ntdll.NtCreateFile(
         &handle,
-        .{
-            .STANDARD = .{ .SYNCHRONIZE = true },
-            .GENERIC = .{ .READ = true, .WRITE = true },
-        },
+        options.class.accessMask(),
         &object_attributes,
         &iosb,
         &options.initial_size,
@@ -557,11 +634,7 @@ pub fn createFile(parent: w.HANDLE, path: Path, options: CreateFileOptions) !w.H
     }
 }
 
-pub const OpenFileOptions = enum {
-    read,
-};
-
-pub fn openFile(parent: w.HANDLE, path: Path, options: OpenFileOptions) !w.HANDLE {
+pub fn openFile(parent: w.HANDLE, path: Path, class: FileClass) !w.HANDLE {
     var handle: w.HANDLE = undefined;
     var unicode_string = w.UNICODE_STRING.init(path.slice);
     const object_attributes: w.OBJECT.ATTRIBUTES = .{
@@ -576,25 +649,48 @@ pub fn openFile(parent: w.HANDLE, path: Path, options: OpenFileOptions) !w.HANDL
     };
     var iosb: w.IO_STATUS_BLOCK = undefined;
 
-    const status = switch (options) {
-        .read => w.ntdll.NtOpenFile(
-            &handle,
-            .{
-                .STANDARD = .{ .SYNCHRONIZE = true },
-                .GENERIC = .{ .READ = true },
-            },
-            &object_attributes,
-            &iosb,
-            .{ .READ = true },
-            .{
-                .NON_DIRECTORY_FILE = true,
-                .IO = .SYNCHRONOUS_NONALERT,
-            },
-        ),
-    };
+    const status = w.ntdll.NtOpenFile(
+        &handle,
+        class.accessMask(),
+        &object_attributes,
+        &iosb,
+        .{ .READ = true },
+        .{
+            .NON_DIRECTORY_FILE = true,
+            .IO = .SYNCHRONOUS_NONALERT,
+        },
+    );
 
     switch (status) {
         .SUCCESS => return handle,
+        else => return w.unexpectedStatus(status),
+    }
+}
+
+pub fn renameFile(
+    handle: w.HANDLE,
+    new_parent: w.HANDLE,
+    /// Must be a single component.
+    new_name: Path,
+) !void {
+    var iosb: w.IO_STATUS_BLOCK = undefined;
+    // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+    const RenameInformation = extern struct {
+        ReplaceIfExists: w.BOOLEAN,
+        RootDirectory: w.HANDLE,
+        FileNameLength: w.ULONG,
+        FileName: [Path.component_max_len]w.WCHAR,
+    };
+    var information: RenameInformation = .{
+        .ReplaceIfExists = .TRUE,
+        .RootDirectory = new_parent,
+        .FileNameLength = new_name.byteCount(),
+        .FileName = undefined,
+    };
+    @memcpy((&information.FileName)[0..new_name.slice.len], new_name.slice);
+    const status = w.ntdll.NtSetInformationFile(handle, &iosb, &information, @sizeOf(RenameInformation), .Rename);
+    switch (status) {
+        .SUCCESS => {},
         else => return w.unexpectedStatus(status),
     }
 }

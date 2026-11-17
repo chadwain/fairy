@@ -10,6 +10,7 @@ const fairy = @import("fairy.zig");
 const network = fairy.network;
 
 sync_dir: DirHandle,
+temp_dir: DirHandle,
 mutex: Io.Mutex, // TODO: Compare with RwLock
 
 allocator: Allocator,
@@ -26,28 +27,36 @@ host: Host,
 
 debug: Debug,
 
-pub fn initWindows(sync_dir_path: [:0]const u16, allocator: Allocator) !Server {
+pub fn initWindows(sync_dir_path: [:0]const u16, temp_dir_path: [:0]const u16, allocator: Allocator) !Server {
     comptime assert(fairy.platform == .windows);
     // TODO: The length of this path must also be factored into path length calculations.
     const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
     const sync_dir = try fairy.windows.openSyncDir(sync_dir_path_nt.span());
+    errdefer fairy.windows.closeHandle(sync_dir);
+
+    const temp_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, temp_dir_path, .{ .allow_relative = false });
+    const temp_dir = try fairy.windows.openSyncDir(temp_dir_path_nt.span());
     errdefer comptime unreachable;
 
-    return initCommon(sync_dir, allocator);
+    return initCommon(sync_dir, temp_dir, allocator);
 }
 
-pub fn initLinux(sync_dir_path: [:0]const u8, io: Io, allocator: Allocator) !Server {
+pub fn initLinux(sync_dir_path: []const u8, temp_dir_path: []const u8, io: Io, allocator: Allocator) !Server {
     comptime assert(fairy.platform == .linux);
     // TODO: The length of `sync_dir_path` must also be factored into path length calculations.
     const sync_dir = try Io.Dir.cwd().openDir(io, sync_dir_path, .{ .iterate = true });
+    errdefer sync_dir.close(io);
+
+    const temp_dir = try Io.Dir.cwd().openDir(io, temp_dir_path, .{ .iterate = true });
     errdefer comptime unreachable;
 
-    return initCommon(sync_dir, allocator);
+    return initCommon(sync_dir, temp_dir, allocator);
 }
 
-fn initCommon(sync_dir: DirHandle, allocator: Allocator) Server {
+fn initCommon(sync_dir: DirHandle, temp_dir: DirHandle, allocator: Allocator) Server {
     return .{
         .sync_dir = sync_dir,
+        .temp_dir = temp_dir,
         .allocator = allocator,
         .mutex = .init,
         .path_arena = .{},
@@ -301,12 +310,54 @@ pub fn eventLoop(server: *Server, io: Io, listen_addr: Io.net.IpAddress) !void {
                 },
                 .completed_file_sync => {
                     assert(server.host.file_sync_status.swap(.none, .acquire) == .completed);
-                    server.log(.info, "complete sync request for file id {}", .{
-                        @backingInt(server.host.file_sync_file_id),
-                    });
-                    try server.mutex.lock(io);
-                    defer server.mutex.unlock(io);
-                    assert(server.events.sync.remove(server.host.file_sync_file_id));
+                    const file_id = server.host.file_sync_file_id;
+                    const parent_dir_path, const file_name = blk: {
+                        const actual_path = blk2: {
+                            const locked = try server.lock(io);
+                            defer locked.unlock(io);
+                            var diag: Diagnostics = undefined;
+                            break :blk2 locked.getRegularFilePath(file_id, &diag) catch |err| switch (err) {
+                                error.Client => std.debug.panic("TODO: Client err: {s}", .{@errorName(diag.client)}),
+                            };
+                        };
+                        var it = actual_path.backwardsPathIterator();
+                        const file_name = it.previousComponent().?;
+                        const parent_dir_path = it.previous();
+                        break :blk .{ parent_dir_path, file_name };
+                    };
+                    switch (fairy.platform) {
+                        .windows => {
+                            // TODO: Have the host keep the temp file open, so that we don't have to open it again.
+                            const temp_file = try fairy.windows.openFile(server.temp_dir, server.host.tempFilePath(), .rename);
+                            defer fairy.windows.closeHandle(temp_file);
+                            const parent_dir = if (parent_dir_path) |path|
+                                try fairy.windows.createDirPath(server.sync_dir, path)
+                            else
+                                server.sync_dir;
+                            defer if (parent_dir_path) |_| fairy.windows.closeHandle(parent_dir);
+                            try fairy.windows.renameFile(temp_file, parent_dir, file_name);
+                        },
+                        .linux => {
+                            const parent_dir = if (parent_dir_path) |path|
+                                try server.sync_dir.createDirPathOpen(
+                                    io,
+                                    path.slice,
+                                    .{ .open_options = .{ .follow_symlinks = false } },
+                                )
+                            else
+                                server.sync_dir;
+                            defer if (parent_dir_path) |_| parent_dir.close(io);
+                            try server.temp_dir.rename(server.host.tempFilePath().slice, parent_dir, file_name.slice, io);
+                        },
+                    }
+
+                    {
+                        try server.mutex.lock(io);
+                        defer server.mutex.unlock(io);
+                        assert(server.events.sync.remove(server.host.file_sync_file_id));
+                    }
+
+                    server.log(.info, "complete sync request for file id {}", .{@backingInt(file_id)});
                 },
                 .accept_client => {
                     assert(server.cc_status.load(.acquire) == .accepted);
@@ -420,6 +471,7 @@ const Diagnostics = union {
         NotRegularFile,
         NotDirectoryFile,
         FileAlreadyExists,
+        DeletedFile,
     };
 
     /// Errors that arise because of operations that cannot be completed.
@@ -454,69 +506,6 @@ const Diagnostics = union {
 
 fn log(_: *const Server, comptime level: std.log.Level, comptime fmt: []const u8, args: anytype) void {
     @field(fairy.log, @tagName(level))("(server) " ++ fmt, args);
-}
-
-/// Creates a regular file for writing to. Creates parent directories as necessary.
-fn createRegularFileWindows(server: *Server, full_path: Path, file_size: w.LARGE_INTEGER) !w.HANDLE {
-    // TODO: Take the parent dir as a parameter instead of the server
-    // TODO: We must check that the opened dirs have the same case as in `full_path`
-    var it = full_path.backwardsPathIterator();
-    const last_component = it.previousComponent().?;
-    var is_sync_dir = it.empty();
-    var dir_handle = if (is_sync_dir) server.sync_dir else blk: {
-        while (it.previous()) |path| {
-            const handle = fairy.windows.createDir(server.sync_dir, path) catch |err| switch (err) {
-                error.ParentDirNotFound => continue,
-                error.Unexpected => |e| return e,
-            };
-            break :blk handle;
-        } else std.debug.panic("TODO: Could not create a file in the sync directory", .{});
-    };
-    defer if (!is_sync_dir) fairy.windows.closeHandle(dir_handle);
-    errdefer std.debug.panic("TODO: Delete intermediate directories and files", .{});
-
-    it.setDirection(.forwards);
-    while (it.nextComponent()) |component| {
-        if (component.slice.ptr == last_component.slice.ptr) break;
-        const child_handle = fairy.windows.createDir(dir_handle, component) catch |err| switch (err) {
-            error.ParentDirNotFound => {
-                std.debug.panic("TODO: Directory not found even though we have an open handle to it (?)", .{});
-            },
-            error.Unexpected => |e| return e,
-        };
-        errdefer comptime unreachable;
-        if (!is_sync_dir) fairy.windows.closeHandle(dir_handle);
-        dir_handle = child_handle;
-        is_sync_dir = false;
-    }
-
-    const handle = fairy.windows.createFile(dir_handle, last_component, .{ .initial_size = file_size }) catch |err| switch (err) {
-        error.ParentDirNotFound => {
-            std.debug.panic("TODO: Directory not found even though we have an open handle to it (?)", .{});
-        },
-        error.Unexpected => |e| return e,
-    };
-    return handle;
-}
-
-/// Creates a regular file for writing to. Creates parent directories as necessary.
-fn createRegularFileLinux(server: *Server, full_path: Path, io: Io) !Io.File {
-    // TODO: Take the parent dir as a parameter instead of the server
-    var it = full_path.backwardsPathIterator();
-    const last_component = it.previousComponent().?;
-    const top_level = it.empty();
-    const dir_handle = if (top_level)
-        server.sync_dir
-    else
-        try server.sync_dir.createDirPathOpen(
-            io,
-            it.previous().?.slice,
-            .{ .open_options = .{ .follow_symlinks = false } },
-        );
-    defer if (!top_level) dir_handle.close(io);
-    errdefer std.debug.panic("TODO: Delete intermediate directories and files", .{});
-
-    return try dir_handle.createFile(io, last_component.slice, .{ .truncate = true });
 }
 
 pub const Debug = struct {
@@ -803,6 +792,10 @@ const Locked = struct {
     fn getRegularFilePath(locked: Locked, file_id: network.FileId, diag: *Diagnostics) error{Client}!Path {
         const info = locked.server.db.files.getPtr(file_id) orelse return diag.errClient(error.UnknownFileId);
         if (info.directory) return diag.errClient(error.NotRegularFile);
+        switch (info.status) {
+            .new, .synced => {},
+            .deleted => return diag.errClient(error.DeletedFile),
+        }
         return info.path;
     }
 
@@ -1027,8 +1020,8 @@ pub const Host = struct {
         queued,
         /// The host is sending a file sync request.
         sending,
-        /// The host is waiting for a file sync response.
-        waiting,
+        /// The host is receiving a file sync response.
+        receiving,
         /// The file sync request has been completed.
         completed,
     };
@@ -1162,7 +1155,7 @@ pub const Host = struct {
     fn processServerSyncFileEvent(host: *Host, io: Io, writer: network.Writer) !void {
         assert(host.file_sync_status.swap(.sending, .acquire) == .queued);
         try host.sendFileSyncRequest(writer);
-        assert(host.file_sync_status.swap(.waiting, .release) == .sending);
+        assert(host.file_sync_status.swap(.receiving, .release) == .sending);
         io.futexWake(FileSyncStatus, &host.file_sync_status.raw, 1);
     }
 
@@ -1185,7 +1178,8 @@ pub const Host = struct {
         Io.Cancelable ||
         Allocator.Error ||
         switch (fairy.platform) {
-            .windows => fairy.windows.ReceiveFileError ||
+            .windows => fairy.windows.CreateFileError ||
+                fairy.windows.ReceiveFileError ||
                 network.Reader.ReceiveWindowsPathByteCountError ||
                 network.Reader.ReceiveWindowsPathError,
             .linux => Io.Dir.CreateDirPathOpenError ||
@@ -1249,11 +1243,11 @@ pub const Host = struct {
                         switch (host.file_sync_status.load(.acquire)) {
                             .none, .queued, .completed => return error.UnexpectedIncomingMessage,
                             .sending => try io.futexWait(FileSyncStatus, &host.file_sync_status.raw, .sending),
-                            .waiting => break,
+                            .receiving => break,
                         }
                     }
                     try host.receiveSyncFileResponse(server, io, reader);
-                    assert(host.file_sync_status.swap(.completed, .release) == .waiting);
+                    assert(host.file_sync_status.swap(.completed, .release) == .receiving);
                     server.events.setAlert(.completed_file_sync);
                     server.wake(io);
                 },
@@ -1278,42 +1272,40 @@ pub const Host = struct {
         io.futexWake(MtStatus, &host.mt_status.raw, 1);
     }
 
+    fn tempFilePath(host: *Host) Path {
+        _ = host; // TODO: make the path depend on host
+        const string = "temp";
+        return .assumeValidPath(switch (fairy.platform) {
+            .windows => std.unicode.wtf8ToWtf16LeStringLiteral(string),
+            .linux => string,
+        });
+    }
+
     fn receiveSyncFileResponse(host: *Host, server: *Server, io: Io, reader: network.Reader) !void {
-        const file_id = host.file_sync_file_id;
+        const file_size = switch (fairy.platform) {
+            .windows => blk: {
+                const file_size = try reader.receiveFileSize();
+                const windows_size = std.math.cast(w.LARGE_INTEGER, file_size) orelse return error.InvalidFileSize;
+                break :blk windows_size;
+            },
+            .linux => try reader.receiveFileSize(),
+        };
+        const temp_file_path = host.tempFilePath();
         switch (fairy.platform) {
             .windows => {
-                const file_size = blk: {
-                    const file_size = try reader.receiveFileSize();
-                    const windows_size = std.math.cast(w.LARGE_INTEGER, file_size) orelse return error.InvalidFileSize;
-                    break :blk windows_size;
-                };
-                const path = blk: {
-                    const locked = try server.lock(io);
-                    defer locked.unlock(io);
-                    var diag: Server.Diagnostics = undefined;
-                    break :blk locked.getRegularFilePath(file_id, &diag) catch |err| switch (err) {
-                        error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
-                    };
-                };
-                // TODO: Open a temporary file instead
-                const handle = server.createRegularFileWindows(path, file_size) catch |err| switch (err) {
-                    error.Unexpected => |e| return e,
+                const handle = fairy.windows.createFile(
+                    server.temp_dir,
+                    temp_file_path,
+                    .{ .initial_size = file_size, .class = .write },
+                ) catch |err| switch (err) {
+                    else => |e| return e,
                 };
                 defer fairy.windows.closeHandle(handle);
                 try fairy.windows.receiveFile(reader.io, handle, file_size);
             },
             .linux => {
-                const file_size = try reader.receiveFileSize();
-                const path = blk: {
-                    const locked = try server.lock(io);
-                    defer locked.unlock(io);
-                    var diag: Server.Diagnostics = undefined;
-                    break :blk locked.getRegularFilePath(file_id, &diag) catch |err| switch (err) {
-                        error.Client => std.debug.panic("TODO: Client error: {s}", .{@errorName(diag.client)}),
-                    };
-                };
                 // TODO: Open a temporary file instead
-                const file = server.createRegularFileLinux(path, io) catch |err| switch (err) {
+                const file = server.temp_dir.createFile(io, temp_file_path.slice, .{}) catch |err| switch (err) {
                     else => |e| return e,
                 };
                 defer file.close(io);
@@ -1328,17 +1320,6 @@ pub const Host = struct {
         }
         const file_hash = try reader.receiveFileHash();
         _ = file_hash; // TODO
-
-        {
-            const locked = try server.lock(io);
-            defer locked.unlock(io);
-            const info = locked.server.db.files.getPtr(file_id) orelse std.debug.panic("TODO", .{});
-            switch (info.status) {
-                .new => info.status = .synced,
-                .synced => {},
-                .deleted => {},
-            }
-        }
     }
 
     fn debugLog(host: *const Host, comptime fmt: []const u8, args: anytype) void {

@@ -25,23 +25,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer threaded_io.deinit();
     const io = threaded_io.io();
 
-    const args = try Args.init(init.args, &arena);
-    const port = try args.port();
-    const addr = try Io.net.IpAddress.parseIp4("127.0.0.1", port);
-    const sync_dir = switch (fairy.platform) {
-        .windows => try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir()),
-        .linux => args.syncDir(),
-    };
-    defer switch (fairy.platform) {
-        .windows => allocator.free(sync_dir),
-        .linux => {},
-    };
-
     switch (host_type) {
         .server => {
+            const args = try ServerArgs.init(init.args, &arena);
+            const addr = Io.net.IpAddress{ .ip4 = .loopback(args.port) };
+
             var fairy_server = switch (fairy.platform) {
-                .windows => try fairy.Server.initWindows(sync_dir, allocator),
-                .linux => try fairy.Server.initLinux(sync_dir, io, allocator),
+                .windows => try fairy.Server.initWindows(args.sync_dir, args.temp_dir, allocator),
+                .linux => try fairy.Server.initLinux(args.sync_dir, args.temp_dir, io, allocator),
             };
             defer switch (fairy.platform) {
                 .windows => fairy_server.deinitWindows(),
@@ -63,6 +54,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         },
         .client => {
+            const args = try ClientArgs.init(init.args, &arena);
+            const port = try args.port();
+            const addr = try Io.net.IpAddress.parseIp4("127.0.0.1", port);
+            const sync_dir = switch (fairy.platform) {
+                .windows => try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir()),
+                .linux => args.syncDir(),
+            };
+            defer switch (fairy.platform) {
+                .windows => allocator.free(sync_dir),
+                .linux => {},
+            };
+
             var cdb = try fairy.client.Database.init(sync_dir, allocator, .{ .name = "client" });
             defer cdb.deinit();
             cdb.disableAutoScanning();
@@ -231,10 +234,10 @@ fn runServerCli(io: Io, server: *fairy.Server) !void {
     }
 }
 
-const Args = struct {
+const ClientArgs = struct {
     slice: []const [:0]const u8,
 
-    fn init(args: std.process.Args, arena: *std.heap.ArenaAllocator) !Args {
+    fn init(args: std.process.Args, arena: *std.heap.ArenaAllocator) !ClientArgs {
         const slice = try args.toSlice(arena.allocator());
 
         switch (slice.len) {
@@ -243,12 +246,45 @@ const Args = struct {
         }
     }
 
-    fn port(args: Args) !u16 {
+    fn port(args: ClientArgs) !u16 {
         return try std.fmt.parseInt(u16, args.slice[1], 10);
     }
 
-    fn syncDir(args: Args) [:0]const u8 {
+    fn syncDir(args: ClientArgs) [:0]const u8 {
         return args.slice[2];
+    }
+};
+
+const ServerArgs = struct {
+    port: u16,
+    sync_dir: String,
+    temp_dir: String,
+
+    const String = switch (fairy.platform) {
+        .windows => [:0]const u16,
+        .linux => []const u8,
+    };
+
+    fn init(args: std.process.Args, arena: *std.heap.ArenaAllocator) !ServerArgs {
+        const slice = try args.toSlice(arena.allocator());
+        if (slice.len != 4) return error.InvalidArguments;
+
+        const port = try std.fmt.parseInt(u16, slice[1], 10);
+        const sync_dir = try convertArg(slice[2], arena);
+        const temp_dir = try convertArg(slice[3], arena);
+
+        return .{
+            .port = port,
+            .sync_dir = sync_dir,
+            .temp_dir = temp_dir,
+        };
+    }
+
+    fn convertArg(arg: [:0]const u8, arena: *std.heap.ArenaAllocator) !String {
+        return switch (fairy.platform) {
+            .windows => try std.unicode.wtf8ToWtf16LeAllocZ(arena.allocator(), arg),
+            .linux => arg,
+        };
     }
 };
 
