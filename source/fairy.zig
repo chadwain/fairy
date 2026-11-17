@@ -1,6 +1,6 @@
 pub const client = @import("client.zig");
-pub const linux = @import("linux.zig");
 pub const network = @import("network.zig");
+pub const Path = @import("Path.zig");
 pub const Server = @import("Server.zig");
 pub const windows = @import("windows.zig");
 
@@ -13,11 +13,6 @@ pub const platform: Platform = switch (@import("builtin").target.os.tag) {
     .linux => .linux,
     else => @compileError("Unsupported OS"),
 };
-
-pub const PathComponentCount = u8;
-/// The maximum number of components in a file/folder path that will be recognized.
-/// If a path has more components than this, the file/folder will not be tracked.
-pub const max_path_components: PathComponentCount = 255;
 
 pub const FileCount = u32;
 
@@ -34,7 +29,6 @@ comptime {
     }
 
     if (@import("builtin").is_test) {
-        _ = windows.Path;
-        _ = linux.Path;
+        _ = Path;
     }
 }

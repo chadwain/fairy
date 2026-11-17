@@ -9,9 +9,9 @@ const fairy = @import("fairy.zig");
 const network = fairy.network;
 const print = fairy.print;
 const printf = fairy.printf;
-const Path = fairy.windows.Path;
-const PathHashMap = fairy.windows.PathHashMap;
-const PathArrayHashMap = fairy.windows.PathArrayHashMap;
+const Path = fairy.Path;
+const PathHashMap = Path.HashMap;
+const PathArrayHashMap = Path.ArrayHashMap;
 
 const cpu_endian = @import("builtin").cpu.arch.endian();
 
@@ -397,14 +397,14 @@ pub const GlobalFilesystem = struct {
             const Index = u32; // TODO: Temporary, decide on an index type to use for iterating over children
             const State = enum { iterate, delete };
         };
-        var stack: [fairy.max_path_components]Item = undefined;
+        var stack: [Path.max_components]Item = undefined;
 
         const root_info = global_fs.files.fetchRemove(file_id).?;
         assert(root_info.value.directory);
         const root_children = global_fs.children.fetchRemove(file_id).?;
         stack[0] = .{ .children = root_children.value.keys(), .index = 0, .state = .iterate };
 
-        var stack_len: fairy.PathComponentCount = 1;
+        var stack_len: Path.ComponentCount = 1;
         while (stack_len > 0) {
             const item = &stack[stack_len - 1];
             if (item.index == item.children.len) {
@@ -534,7 +534,7 @@ pub const LockedDatabase = struct {
     // called from Host
     fn setNewFileId(locked: LockedDatabase, path: Path, kind: network.FileKind, file_id_list: []const network.FileId) !void {
         assert(file_id_list.len > 0);
-        const component_count: fairy.PathComponentCount = @intCast(file_id_list.len);
+        const component_count: Path.ComponentCount = @intCast(file_id_list.len);
         try locked.db.global_fs.files.ensureUnusedCapacity(locked.db.allocator, component_count);
         try locked.db.global_fs.path_to_id.ensureUnusedCapacity(locked.db.allocator, component_count);
         try locked.db.global_fs.children.ensureUnusedCapacity(locked.db.allocator, component_count - @intFromBool(kind != .directory));
@@ -549,19 +549,19 @@ pub const LockedDatabase = struct {
         defer locked.db.global_fs.children_arena = children_arena.state;
         const children_allocator = children_arena.allocator();
 
-        var it = path.pathIterator();
+        var it = path.forwardsIterator();
 
         for (file_id_list, 0..) |file_id, index| {
-            const component = it.next().?;
+            const sub_path = it.nextPath().?;
             const gop = locked.db.global_fs.files.getOrPutAssumeCapacity(file_id);
             if (gop.found_existing) {
                 if (index < file_id_list.len - 1 and !gop.value_ptr.directory) std.debug.panic(
                     "TODO client/server conflict: file id {}: client says regular file, server says directory",
                     .{@backingInt(file_id)},
                 );
-                if (!gop.value_ptr.path.eql(component)) std.debug.panic(
+                if (!gop.value_ptr.path.eql(sub_path)) std.debug.panic(
                     "TODO client/server conflict: file id {}: client path '{f}', server path '{f}'",
-                    .{ @backingInt(file_id), gop.value_ptr.path.formatUtf8(), component.formatUtf8() },
+                    .{ @backingInt(file_id), gop.value_ptr.path.formatUtf8(), sub_path.formatUtf8() },
                 );
             } else {
                 if (index != file_id_list.len - 1) {
@@ -590,7 +590,7 @@ pub const LockedDatabase = struct {
                 parent_children.putNoClobber(children_allocator, file_id, {}) catch |err| std.debug.panic("TODO: {s}", .{@errorName(err)});
             }
         }
-        assert(it.next() == null);
+        assert(it.nextPath() == null);
     }
 
     // called from Host
@@ -870,8 +870,8 @@ const scan = struct {
 
             if (set_to_untracked) return;
 
-            const component_count: fairy.PathComponentCount = @intCast(ctx.open_dir_handles.items.len - 1); // Don't count the sync dir itself as a component.
-            if (component_count == fairy.max_path_components) return; // TODO: track the folder, but don't track its contents.
+            const component_count: Path.ComponentCount = @intCast(ctx.open_dir_handles.items.len - 1); // Don't count the sync dir itself as a component.
+            if (component_count == Path.max_components) return; // TODO: track the folder, but don't track its contents.
 
             const copied_name = try allocator.dupe(u16, name);
             try ctx.pending_dirs.append(allocator, copied_name);
@@ -1025,8 +1025,8 @@ const scan = struct {
     }
 
     fn deleteUnseenFiles(ctx: *Context) !void {
-        var stack: [fairy.max_path_components]Path = undefined;
-        var stack_len: fairy.PathComponentCount = 0;
+        var stack: [Path.max_components]Path = undefined;
+        var stack_len: Path.ComponentCount = 0;
         while (true) {
             const children = if (stack_len == 0) ctx.local_fs.top_level_children else ctx.local_fs.children.get(stack[stack_len - 1]).?;
             var it = children.keyIterator();
@@ -1038,7 +1038,7 @@ const scan = struct {
                 const info = ctx.local_fs.files.getEntry(child.*).?;
 
                 if (file_info.already_seen) {
-                    if (info.value_ptr.directory and stack_len < fairy.max_path_components) {
+                    if (info.value_ptr.directory and stack_len < Path.max_components) {
                         stack[stack_len] = child.*;
                         stack_len += 1;
                     }
@@ -1262,12 +1262,12 @@ const scan = struct {
             children: PathHashMap(void),
             child_iterator: PathHashMap(void).KeyIterator,
         };
-        var stack: [fairy.max_path_components]StackItem = undefined;
+        var stack: [Path.max_components]StackItem = undefined;
         stack[0] = .{
             .children = undefined,
             .child_iterator = root_children.keyIterator(),
         };
-        var stack_len: fairy.PathComponentCount = 1;
+        var stack_len: Path.ComponentCount = 1;
 
         while (true) {
             const stack_item = &stack[stack_len - 1];
@@ -1279,7 +1279,7 @@ const scan = struct {
 
                 if (info.value.directory) {
                     var children = local_fs.children.fetchRemove(child_path).?.value;
-                    if (stack_len != fairy.max_path_components) {
+                    if (stack_len != Path.max_components) {
                         stack[stack_len] = .{
                             .children = children,
                             .child_iterator = children.keyIterator(),
@@ -1287,7 +1287,7 @@ const scan = struct {
                         stack_len += 1;
                     } else {
                         if (children.count() > 0) {
-                            std.debug.panic("TODO: Guarantee that paths never have more than {} components", .{fairy.max_path_components});
+                            std.debug.panic("TODO: Guarantee that paths never have more than {} components", .{Path.max_components});
                         }
                         children.deinit(allocator);
                     }
@@ -1793,17 +1793,16 @@ pub const MessageThread = union(enum) {
             switch (host.server_platform) {
                 .windows => {
                     try writer.sendWindowsPathByteCount(out_new_file.path.byteCount());
-                    try writer.sendWindowsPath(out_new_file.path);
+                    try writer.sendWindowsPath(out_new_file.path.slice);
                 },
                 .linux => {
                     // TODO: Make a proper path conversion function
-                    var buffer: [fairy.linux.Path.max_len]u8 = undefined;
+                    var buffer: [Path.max_len]u8 = undefined;
                     var fba = std.heap.FixedBufferAllocator.init(&buffer);
                     const wtf8 = std.unicode.wtf16LeToWtf8Alloc(fba.allocator(), out_new_file.path.slice) catch std.debug.panic("TODO: OOM", .{});
                     std.mem.replaceScalar(u8, wtf8, '\\', '/');
-                    const path = fairy.linux.Path.assumeValidPath(wtf8);
-                    try writer.sendLinuxPathByteCount(path.byteCount());
-                    try writer.sendLinuxPath(path);
+                    try writer.sendLinuxPathByteCount(@intCast(wtf8.len));
+                    try writer.sendLinuxPath(wtf8);
                 },
             }
             try writer.flush();
@@ -1821,10 +1820,10 @@ pub const MessageThread = union(enum) {
             if (action != .new_file_confirm) return error.InvalidAction;
 
             // TODO Store this in Database somewhere instead
-            var file_id_buffer: [fairy.max_path_components]network.FileId = undefined;
+            var file_id_buffer: [Path.max_components]network.FileId = undefined;
             var file_id_list: std.ArrayList(network.FileId) = .initBuffer(&file_id_buffer);
-            var it = out_new_file.path.pathIterator();
-            while (it.next()) |_| {
+            var it = out_new_file.path.forwardsIterator();
+            while (it.nextPath()) |_| {
                 const ptr = file_id_list.addOneBounded() catch unreachable;
                 ptr.* = try reader.receiveFileId();
             }

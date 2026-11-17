@@ -8,6 +8,7 @@ const Io = std.Io;
 
 const fairy = @import("fairy.zig");
 const network = fairy.network;
+const Path = fairy.Path;
 
 sync_dir: DirHandle,
 temp_dir: DirHandle,
@@ -108,16 +109,6 @@ fn lockUncancelable(server: *Server, io: Io) Locked {
     server.mutex.lockUncancelable(io);
     return .{ .server = server };
 }
-
-pub const Path = switch (fairy.platform) {
-    .windows => fairy.windows.Path,
-    .linux => fairy.linux.Path,
-};
-
-pub const PathHashMap = switch (fairy.platform) {
-    .windows => fairy.windows.PathHashMap,
-    .linux => fairy.linux.PathHashMap,
-};
 
 pub const DirHandle = switch (fairy.platform) {
     .windows => w.HANDLE,
@@ -320,9 +311,9 @@ pub fn eventLoop(server: *Server, io: Io, listen_addr: Io.net.IpAddress) !void {
                                 error.Client => std.debug.panic("TODO: Client err: {s}", .{@errorName(diag.client)}),
                             };
                         };
-                        var it = actual_path.backwardsPathIterator();
+                        var it = actual_path.backwardsIterator();
                         const file_name = it.previousComponent().?;
-                        const parent_dir_path = it.previous();
+                        const parent_dir_path = it.previousPath();
                         break :blk .{ parent_dir_path, file_name };
                     };
                     switch (fairy.platform) {
@@ -605,7 +596,7 @@ const Locked = struct {
     ) error{ Client, Global, Internal }!network.FileId {
         const s = locked.server;
 
-        var it = path_unowned.pathIterator();
+        var it = path_unowned.forwardsIterator();
         var parent_file_id: ?network.FileId = null;
         // TODO: Calculate the number of components earlier
         var num_new_files = path_unowned.componentCount();
@@ -614,9 +605,7 @@ const Locked = struct {
             var parent_dir_entry = &s.db.sync_dir_entry;
             while (true) {
                 const file_id = parent_dir_entry.children_by_component.get(component) orelse {
-                    it.setDirection(.backwards);
-                    _ = it.previous();
-                    it.setDirection(.forwards);
+                    it.undoNext();
                     break;
                 };
                 const file_info = s.db.files.get(file_id).?;
@@ -651,9 +640,12 @@ const Locked = struct {
         s.db.files.ensureUnusedCapacity(s.allocator, num_new_files) catch |err| return diag.errInternal(err);
         s.db.regular_file_info.ensureUnusedCapacity(s.allocator, @intFromBool(!is_directory)) catch |err| return diag.errInternal(err);
         s.db.directory_file_info.ensureUnusedCapacity(s.allocator, num_new_files - @intFromBool(!is_directory)) catch |err| return diag.errInternal(err);
-        const history_needed_capacity = @sizeOf(network.history.Entry) +
+        const history_needed_capacity =
+            @sizeOf(network.history.Entry) +
             @sizeOf(network.history.Create) +
-            @as(usize, num_new_files) * (@sizeOf(network.FileId) + Path.component_max_len + 1);
+            @sizeOf(network.FileId) * num_new_files +
+            path.byteCount() +
+            1; // null byte at the end
         s.db.history.ensureUnusedCapacity(s.allocator, history_needed_capacity) catch |err| return diag.errInternal(err);
         if (!is_directory) s.events.sync.ensureUnusedCapacity(s.allocator, 1) catch |err| return diag.errInternal(err);
         errdefer comptime unreachable;
@@ -674,7 +666,7 @@ const Locked = struct {
             .parent = parent_file_id orelse @fromBackingInt(0x12345678),
         }, network.endian) catch unreachable;
 
-        it.replacePath(path);
+        it.slice = path.slice;
         var item = it.nextPathComponent().?;
         var parent_dir_entry = if (parent_file_id) |file_id| s.db.directory_file_info.getPtr(file_id).? else &s.db.sync_dir_entry;
         while (true) {
@@ -773,7 +765,7 @@ const Locked = struct {
     fn getReverseFileIdPath(
         locked: Locked,
         file_id: network.FileId,
-        buffer: *[fairy.max_path_components]network.FileId,
+        buffer: *[Path.max_components]network.FileId,
     ) []network.FileId {
         const s = locked.server;
 
@@ -859,7 +851,7 @@ const Locked = struct {
             children: []const network.FileId,
             index: fairy.FileCount = 0,
         };
-        var buffer: [fairy.max_path_components]Item = undefined;
+        var buffer: [Path.max_components]Item = undefined;
         var stack = std.ArrayList(Item).initBuffer(&buffer);
         stack.appendAssumeCapacity(.{ .children = s.db.directory_file_info.getPtr(root_file_id).?.children.keys() });
         while (stack.lastPtr()) |item| {
@@ -910,12 +902,12 @@ const Locked = struct {
 
             const State = enum { iterate, delete };
         };
-        var stack: [fairy.max_path_components]Item = undefined;
+        var stack: [Path.max_components]Item = undefined;
 
         const root_dir_entry = locked.server.db.directory_file_info.getEntry(file_id).?;
         stack[0] = .{ .children = root_dir_entry.value_ptr.children.keys() };
 
-        var stack_len: fairy.PathComponentCount = 1;
+        var stack_len: Path.ComponentCount = 1;
         while (stack_len > 0) {
             const item = &stack[stack_len - 1];
             if (item.index == item.children.len) {
@@ -1402,7 +1394,7 @@ pub const MessageThread = union(enum) {
             const action: network.Action = .new_file_confirm;
             host.logMessage(.outgoing, action);
 
-            var reverse_file_ids_buffer: [fairy.max_path_components]network.FileId = undefined;
+            var reverse_file_ids_buffer: [Path.max_components]network.FileId = undefined;
             const reversed_file_id_path = blk: {
                 const locked = try server.lock(io);
                 defer locked.unlock(io);

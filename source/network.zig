@@ -150,12 +150,12 @@ pub const Writer = struct {
         try writer.io.writeAll(&file_hash.blake3);
     }
 
-    pub fn sendWindowsPath(writer: Writer, path: fairy.windows.Path) Io.Writer.Error!void {
-        try writer.io.writeAll(@ptrCast(path.slice));
+    pub fn sendWindowsPath(writer: Writer, path: []const u16) Io.Writer.Error!void {
+        try writer.io.writeAll(@ptrCast(path));
     }
 
-    pub fn sendLinuxPath(writer: Writer, path: fairy.linux.Path) Io.Writer.Error!void {
-        try writer.io.writeAll(path.slice);
+    pub fn sendLinuxPath(writer: Writer, path: []const u8) Io.Writer.Error!void {
+        try writer.io.writeAll(path);
     }
 };
 
@@ -236,7 +236,7 @@ pub const Reader = struct {
         reader: Reader,
         byte_count: PathByteCount,
         buffer: *align(2) FilePathBuffer,
-    ) ReceiveWindowsPathError!fairy.windows.Path {
+    ) ReceiveWindowsPathError!fairy.Path {
         assert(byte_count % 2 == 0);
         var file_path_writer: Io.Writer = .fixed(buffer);
         reader.io.streamExact(&file_path_writer, byte_count) catch |err| switch (err) {
@@ -253,7 +253,7 @@ pub const Reader = struct {
         reader: Reader,
         byte_count: PathByteCount,
         buffer: *FilePathBuffer,
-    ) ReceiveLinuxPathError!fairy.linux.Path {
+    ) ReceiveLinuxPathError!fairy.Path {
         var file_path_writer: Io.Writer = .fixed(buffer);
         reader.io.streamExact(&file_path_writer, byte_count) catch |err| switch (err) {
             error.WriteFailed => unreachable,
